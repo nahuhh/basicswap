@@ -16,6 +16,7 @@ class Coins(IntEnum):
     LTC = 3
     # DCR = 4
     NMC = 5
+    DASH = 6
 
 
 chainparams = {
@@ -152,6 +153,38 @@ chainparams = {
             'pubkey_address': 111,
             'script_address': 196,
             'hrp': 'ncrt',
+            'bip44': 1,
+            'min_amount': 1000,
+            'max_amount': 100000 * COIN,
+        }
+    },
+    Coins.DASH: {
+        'name': 'dash',
+        'ticker': 'DASH',
+        'message_magic': 'DarkCoin Signed Message:\n',
+        'mainnet': {
+            'rpcport': 9998,
+            'pubkey_address': 76,
+            'script_address': 16,
+            'hrp': '',
+            'bip44': 5,
+            'min_amount': 1000,
+            'max_amount': 100000 * COIN,
+        },
+        'testnet': {
+            'rpcport': 19998,
+            'pubkey_address': 140,
+            'script_address': 19,
+            'hrp': '',
+            'bip44': 1,
+            'min_amount': 1000,
+            'max_amount': 100000 * COIN,
+        },
+        'regtest': {
+            'rpcport': 18332,
+            'pubkey_address': 140,
+            'script_address': 19,
+            'hrp': '',
             'bip44': 1,
             'min_amount': 1000,
             'max_amount': 100000 * COIN,

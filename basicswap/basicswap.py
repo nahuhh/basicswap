@@ -478,7 +478,7 @@ class BasicSwap():
             authcookiepath = os.path.join(self.getChainDatadirPath(coin), '.cookie')
 
             pidfilename = cc['name']
-            if cc['name'] == 'bitcoin' or cc['name'] == 'namecoin':
+            if cc['name'] == 'bitcoin' or cc['name'] == 'namecoin' or cc['name'] == 'dash':
                 pidfilename += 'd'
             pidfilepath = os.path.join(self.getChainDatadirPath(coin), pidfilename + '.pid')
             self.log.debug('Reading %s rpc credentials from auth cookie %s', coin, authcookiepath)
