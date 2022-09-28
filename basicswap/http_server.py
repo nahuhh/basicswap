@@ -47,6 +47,7 @@ from .js_server import (
     js_rates,
     js_rate,
     js_index,
+    js_generatenotification,
 )
 from .ui.util import (
     PAGE_LIMIT,
@@ -680,6 +681,7 @@ class HttpHandler(BaseHTTPRequestHandler):
                         'rate': js_rate,
                         'rates': js_rates,
                         'rateslist': js_rates_list,
+                        'generatenotification': js_generatenotification,
                     }.get(url_split[2], js_index)
                 return func(self, url_split, post_string, is_json)
             except Exception as ex:

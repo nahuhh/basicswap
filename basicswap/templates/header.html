@@ -19,34 +19,44 @@
 {% if debug_ui_mode == true %}
 <p>Debug UI mode: Active</p>
 {% endif %}
+<button id="test_btn" type="button">Add Notification</button>
 
 {% if ws_url %}
 <script>
-    var ws = new WebSocket("{{ ws_url }}"),
-        floating_div = document.createElement('div');
-        floating_div.classList.add('floatright');
-        messages = document.createElement('ul');
-        messages.setAttribute('id', 'ul_updates');
-    ws.onmessage = function (event) {
-        let json = JSON.parse(event.data);
+var ws = new WebSocket("{{ ws_url }}"),
+    floating_div = document.createElement('div');
+    floating_div.classList.add('floatright');
+    messages = document.createElement('ul');
+    messages.setAttribute('id', 'ul_updates');
+ws.onmessage = function (event) {
+    let json = JSON.parse(event.data);
 
-        let event_message = 'Unknown event';
-        if (json['event'] == 'new_offer') {
-            event_message = '<a href=/offer/' + json['offer_id'] + '>New offer</a>';
-        } else
-        if (json['event'] == 'new_bid') {
-            event_message = '<a href=/bid/' + json['bid_id'] + '>New bid</a> on offer <a href=/offer/' + json['offer_id'] + '>' + json['offer_id'] + '</a>';
-        } else
-        if (json['event'] == 'bid_accepted') {
-            event_message = '<a href=/bid/' + json['bid_id'] + '>Bid accepted</a>';
-        }
+    let event_message = 'Unknown event';
+    if (json['event'] == 'new_offer') {
+        event_message = '<a href=/offer/' + json['offer_id'] + '>New offer</a>';
+    } else
+    if (json['event'] == 'new_bid') {
+        event_message = '<a href=/bid/' + json['bid_id'] + '>New bid</a> on offer <a href=/offer/' + json['offer_id'] + '>' + json['offer_id'] + '</a>';
+    } else
+    if (json['event'] == 'bid_accepted') {
+        event_message = '<a href=/bid/' + json['bid_id'] + '>Bid accepted</a>';
+    }
 
-        let messages = document.getElementById('ul_updates'),
-            message = document.createElement('li');
-        message.innerHTML = event_message;
-        messages.appendChild(message);
-    };
-    floating_div.appendChild(messages);
-    document.body.appendChild(floating_div);
+    let messages = document.getElementById('ul_updates'),
+        message = document.createElement('li');
+    message.innerHTML = event_message;
+    messages.appendChild(message);
+};
+floating_div.appendChild(messages);
+document.body.appendChild(floating_div);
+
+const xhr_notification_debug = new XMLHttpRequest();
+function test_notification() {
+    console.log('1');
+    xhr_notification_debug.open('GET', '/json/generatenotification');
+    xhr_notification_debug.send();
+    console.log('2');
+}
+document.getElementById("test_btn").addEventListener("click", test_notification);
 </script>
 {% endif %}
