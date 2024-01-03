@@ -244,8 +244,8 @@ class BasicSwap(BaseApp):
         self._possibly_revoked_offers = collections.deque([], maxlen=48)  # TODO: improve
         self._updating_wallets_info = {}
         self._last_updated_wallets_info = 0
-        self._zmq_queue_enabled = self.settings.get('zmq_queue_enabled', False)
-        self._poll_smsg = self.settings.get('poll_smsg', True)
+        self._zmq_queue_enabled = self.settings.get('zmq_queue_enabled', True)
+        self._poll_smsg = self.settings.get('poll_smsg', False)
         self.check_smsg_seconds = self.settings.get('check_smsg_seconds', 10)
         self._last_checked_smsg = 0
 
@@ -914,28 +914,32 @@ class BasicSwap(BaseApp):
             self._is_encrypted, self._is_locked = self.ci(Coins.PART).isWalletEncryptedLocked()
 
     def unlockWallets(self, password: str, coin=None) -> None:
-        self._read_zmq_queue = False
-        for c in self.getListOfWalletCoins():
-            if coin and c != coin:
-                continue
-            self.ci(c).unlockWallet(password)
-            if c == Coins.PART:
-                self._is_locked = False
+        try:
+            self._read_zmq_queue = False
+            for c in self.getListOfWalletCoins():
+                if coin and c != coin:
+                    continue
+                self.ci(c).unlockWallet(password)
+                if c == Coins.PART:
+                    self._is_locked = False
 
-        self.loadFromDB()
-        self._read_zmq_queue = True
+            self.loadFromDB()
+        finally:
+            self._read_zmq_queue = True
 
     def lockWallets(self, coin=None) -> None:
-        self._read_zmq_queue = False
-        self.swaps_in_progress.clear()
+        try:
+            self._read_zmq_queue = False
+            self.swaps_in_progress.clear()
 
-        for c in self.getListOfWalletCoins():
-            if coin and c != coin:
-                continue
-            self.ci(c).lockWallet()
-            if c == Coins.PART:
-                self._is_locked = True
-        self._read_zmq_queue = True
+            for c in self.getListOfWalletCoins():
+                if coin and c != coin:
+                    continue
+                self.ci(c).lockWallet()
+                if c == Coins.PART:
+                    self._is_locked = True
+        finally:
+            self._read_zmq_queue = True
 
     def initialiseWallet(self, coin_type, raise_errors: bool = False) -> None:
         if coin_type == Coins.PART:
