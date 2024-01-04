@@ -914,8 +914,10 @@ class BasicSwap(BaseApp):
             self._is_encrypted, self._is_locked = self.ci(Coins.PART).isWalletEncryptedLocked()
 
     def unlockWallets(self, password: str, coin=None) -> None:
+        self.log.debug('[rm] unlockWallets')
         try:
             self._read_zmq_queue = False
+            self.log.debug('[rm] getListOfWalletCoins {}'.format(self.getListOfWalletCoins()))
             for c in self.getListOfWalletCoins():
                 if coin and c != coin:
                     continue
@@ -924,6 +926,9 @@ class BasicSwap(BaseApp):
                     self._is_locked = False
 
             self.loadFromDB()
+        except Exception as e:
+            self.log.error(f'[rm] unlockWallets failed {e}')
+            raise (e)
         finally:
             self._read_zmq_queue = True
 
