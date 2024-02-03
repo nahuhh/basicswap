@@ -329,6 +329,7 @@
                         <input placeholder="{{ w.ticker }} Amount" class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none pr-10 dark:bg-gray-500 dark:text-white border border-gray-300 dark:border-gray-400 dark:text-gray-50 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-0" type="text" name="amt_{{ w.cid }}" value="{{ w.wd_value }}">
                       </td>
                     </tr>
+                    {% if w.cid != '6' %} {# !XMR #}
                     <tr class="opacity-100 text-gray-500 dark:text-gray-100">
                       <td class="py-3 px-6 bold">Subtract Fee:</td>
                       <td class="py-3 px-6">
@@ -336,6 +337,15 @@
                       </td>
                       <td></td>
                     </tr>
+                    {% else %}
+                    <tr class="opacity-100 text-gray-500 dark:text-gray-100">
+                      <td class="py-3 px-6 bold">Sweep All:</td>
+                      <td class="py-3 px-6">
+                        <input class="hover:border-blue-500 w-5 h-5 form-check-input text-blue-600 bg-gray-50 border-gray-300 rounded focus:ring-blue-500 dark:focus:ring-blue-600 dark:ring-offset-gray-800 focus:ring-1 dark:bg-gray-500 dark:border-gray-400" type="checkbox" name="sweepall_{{ w.cid }}" {% if w.wd_sweepall==true %} checked=checked{% endif %}>
+                      </td>
+                      <td></td>
+                    </tr>
+                    {% endif %}
                     {% if w.cid == '1' %} {# PART #}
                     <tr class="opacity-100 text-gray-500 dark:text-gray-100">
                       <td class="py-3 px-6 bold">Type From -> To:</td>
