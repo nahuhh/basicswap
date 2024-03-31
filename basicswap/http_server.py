@@ -283,9 +283,11 @@ class HttpHandler(BaseHTTPRequestHandler):
                     coin_id = int(get_data_entry(form_data, 'coin_type'))
                     if coin_id in (-2, -3, -4):
                         coin_type = Coins(Coins.XMR)
+                    elif coin_id in (-6, -7, -8):
+                        coin_type = Coins(Coins.WOW)
                     elif coin_id in (-5,):
                         coin_type = Coins(Coins.LTC)
-                    elif coin_id in (-6,):
+                    elif coin_id in (-9,):
                         coin_type = Coins(Coins.DCR)
                     else:
                         coin_type = Coins(coin_id)
@@ -315,11 +317,27 @@ class HttpHandler(BaseHTTPRequestHandler):
                     else:
                         raise ValueError('Unknown XMR RPC variant')
                     result = json.dumps(rv, indent=4)
+                elif coin_type == Coins.WOW:
+                    ci = swap_client.ci(coin_type)
+                    arr = cmd.split(None, 1)
+                    method = arr[0]
+                    params = json.loads(arr[1]) if len(arr) > 1 else []
+                    if coin_id == -8:
+                        rv = ci.rpc_wallet(method, params)
+                    elif coin_id == -7:
+                        rv = ci.rpc(method, params)
+                    elif coin_id == -6:
+                        if params == []:
+                            params = None
+                        rv = ci.rpc2(method, params)
+                    else:
+                        raise ValueError('Unknown WOW RPC variant')
+                    result = json.dumps(rv, indent=4)
                 else:
                     if call_type == 'http':
                         ci = swap_client.ci(coin_type)
                         method, params = parse_cmd(cmd, type_map)
-                        if coin_id == -6:
+                        if coin_id == -9:
                             rv = ci.rpc_wallet(method, params)
                         elif coin_id == -5:
                             rv = ci.rpc_wallet_mweb(method, params)
@@ -342,16 +360,21 @@ class HttpHandler(BaseHTTPRequestHandler):
 
         coins = listAvailableCoins(swap_client, with_variants=False)
         with_xmr: bool = any(c[0] == Coins.XMR for c in coins)
-        coins = [c for c in coins if c[0] != Coins.XMR]
+        with_wow: bool = any(c[0] == Coins.WOW for c in coins)
+        coins = [c for c in coins if c[0] not in (Coins.XMR, Coins.WOW)]
 
-        if any(c[0] == Coins.DCR for c in coins):
-            coins.append((-6, 'Decred Wallet'))
         if any(c[0] == Coins.LTC for c in coins):
             coins.append((-5, 'Litecoin MWEB Wallet'))
+        if any(c[0] == Coins.DCR for c in coins):
+            coins.append((-9, 'Decred Wallet'))
         if with_xmr:
             coins.append((-2, 'Monero'))
             coins.append((-3, 'Monero JSON'))
             coins.append((-4, 'Monero Wallet'))
+        if with_wow:
+            coins.append((-6, 'Wownero'))
+            coins.append((-7, 'Wownero JSON'))
+            coins.append((-8, 'Wownero Wallet'))
 
         return self.render_template(template, {
             'messages': messages,
