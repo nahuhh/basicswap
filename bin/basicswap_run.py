@@ -59,11 +59,11 @@ def startDaemon(node_dir, bin_dir, daemon_bin, opts=[]):
 
 
 def startXmrDaemon(node_dir, bin_dir, daemon_bin, opts=[]):
-    daemon_bin = os.path.expanduser(os.path.join(bin_dir, daemon_bin))
+    daemon_path = os.path.expanduser(os.path.join(bin_dir, daemon_bin))
 
     datadir_path = os.path.expanduser(node_dir)
-    args = [daemon_bin, '--non-interactive', '--config-file=' + os.path.join(datadir_path, 'monerod.conf')] + opts
-    logging.info('Starting node {} --data-dir={}'.format(daemon_bin, node_dir))
+    args = [daemon_path, '--non-interactive', '--config-file=' + os.path.join(datadir_path, daemon_bin + '.conf')] + opts
+    logging.info('Starting node {} --data-dir={}'.format(daemon_path, node_dir))
 
     # return subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     file_stdout = open(os.path.join(datadir_path, 'core_stdout.log'), 'w')
