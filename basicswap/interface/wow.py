@@ -34,28 +34,28 @@ from basicswap.util import (
     TemporaryError)
 from basicswap.util.network import (
     is_private_ip_address)
-from basicswap.rpc_xmr import (
-    make_xmr_rpc_func,
-    make_xmr_rpc2_func)
-from basicswap.chainparams import XMR_COIN, CoinInterface, Coins
+from basicswap.rpc_wow import (
+    make_wow_rpc_func,
+    make_wow_rpc2_func)
+from basicswap.chainparams import WOW_COIN, CoinInterface, Coins
 
 
-class XMRInterface(CoinInterface):
+class WOWInterface(CoinInterface):
     @staticmethod
     def curve_type():
         return Curves.ed25519
 
     @staticmethod
     def coin_type():
-        return Coins.XMR
+        return Coins.WOW
 
     @staticmethod
     def COIN():
-        return XMR_COIN
+        return WOW_COIN
 
     @staticmethod
     def exp() -> int:
-        return 12
+        return 11
 
     @staticmethod
     def nbk() -> int:
@@ -85,7 +85,7 @@ class XMRInterface(CoinInterface):
 
         self.blocks_confirmed = coin_settings['blocks_confirmed']
         self._restore_height = coin_settings.get('restore_height', 0)
-        self.setFeePriority(coin_settings.get('fee_priority', 2))
+        self.setFeePriority(coin_settings.get('fee_priority', 0))
         self._sc = swap_client
         self._log = self._sc.log if self._sc and self._sc.log else logging
         self._wallet_password = None
@@ -107,7 +107,7 @@ class XMRInterface(CoinInterface):
                     log_str: str = ''
                     have_cc_tor_opt = 'use_tor' in chain_client_settings
                     if have_cc_tor_opt and chain_client_settings['use_tor'] is False:
-                        log_str = ' bypassing proxy (use_tor false for XMR)'
+                        log_str = ' bypassing proxy (use_tor false for WOW)'
                     elif have_cc_tor_opt is False and is_private_ip_address(rpchost):
                         log_str = ' bypassing proxy (private ip address)'
                     else:
@@ -122,11 +122,11 @@ class XMRInterface(CoinInterface):
 
         self._rpctimeout = coin_settings.get('rpctimeout', 60)
         self._walletrpctimeout = coin_settings.get('walletrpctimeout', 120)
-        self._walletrpctimeoutlong = coin_settings.get('walletrpctimeoutlong', 300)
+        self._walletrpctimeoutlong = coin_settings.get('walletrpctimeoutlong', 600)
 
-        self.rpc = make_xmr_rpc_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node(j) ')
-        self.rpc2 = make_xmr_rpc2_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node ')  # non-json endpoint
-        self.rpc_wallet = make_xmr_rpc_func(coin_settings['walletrpcport'], coin_settings['walletrpcauth'], host=coin_settings.get('walletrpchost', '127.0.0.1'), default_timeout=self._walletrpctimeout, tag='Wallet ')
+        self.rpc = make_wow_rpc_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node(j) ')
+        self.rpc2 = make_wow_rpc2_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node ')  # non-json endpoint
+        self.rpc_wallet = make_wow_rpc_func(coin_settings['walletrpcport'], coin_settings['walletrpcauth'], host=coin_settings.get('walletrpchost', '127.0.0.1'), default_timeout=self._walletrpctimeout, tag='Wallet ')
 
     def checkWallets(self) -> int:
         return 1
@@ -212,7 +212,7 @@ class XMRInterface(CoinInterface):
                 rv['known_block_count'] = self.rpc('get_block_count', timeout=self._rpctimeout)['count']
                 rv['verificationprogress'] = rv['blocks'] / rv['known_block_count']
         except Exception as e:
-            self._log.warning('XMR get_block_count failed with: %s', str(e))
+            self._log.warning('WOW get_block_count failed with: %s', str(e))
             rv['verificationprogress'] = 0.0
 
         return rv
@@ -231,7 +231,6 @@ class XMRInterface(CoinInterface):
                 raise e
 
             rv = {}
-            self.rpc_wallet('refresh')
             balance_info = self.rpc_wallet('get_balance')
 
             rv['balance'] = self.format_amount(balance_info['unlocked_balance'])
@@ -324,7 +323,6 @@ class XMRInterface(CoinInterface):
     def publishBLockTx(self, kbv: bytes, Kbs: bytes, output_amount: int, feerate: int, unlock_time: int = 0) -> bytes:
         with self._mx_wallet:
             self.openWallet(self._wallet_filename)
-            self.rpc_wallet('refresh')
 
             Kbv = self.getPubkey(kbv)
             shared_addr = xmr_util.encode_address(Kbv, Kbs, self._addr_prefix)
@@ -363,7 +361,7 @@ class XMRInterface(CoinInterface):
             # Debug
             try:
                 current_height = self.rpc_wallet('get_height')['height']
-                self._log.info('findTxB XMR current_height %d\nAddress: %s', current_height, address_b58)
+                self._log.info('findTxB WOW current_height %d\nAddress: %s', current_height, address_b58)
             except Exception as e:
                 self._log.info('rpc failed %s', str(e))
                 current_height = None  # If the transfer is available it will be deep enough
@@ -396,7 +394,7 @@ class XMRInterface(CoinInterface):
 
             try:
                 current_height = self.rpc2('get_height', timeout=self._rpctimeout)['height']
-                self._log.info('findTxnByHash XMR current_height %d\nhash: %s', current_height, txid)
+                self._log.info('findTxnByHash WOW current_height %d\nhash: %s', current_height, txid)
             except Exception as e:
                 self._log.info('rpc failed %s', str(e))
                 current_height = None  # If the transfer is available it will be deep enough
@@ -473,15 +471,15 @@ class XMRInterface(CoinInterface):
 
     def withdrawCoin(self, value, addr_to: str, sweepall: bool, estimate_fee: bool = False) -> str:
         with self._mx_wallet:
-            self.openWallet(self._wallet_filename)
-            self.rpc_wallet('refresh')
+           # self.openWallet(self._wallet_filename)
+           # self.rpc_wallet('refresh')
 
             if sweepall:
                 balance = self.rpc_wallet('get_balance')
                 if balance['balance'] != balance['unlocked_balance']:
                     raise ValueError('Balance must be fully confirmed to use sweep all.')
-                self._log.info('XMR {} sweep_all.'.format('estimate fee' if estimate_fee else 'withdraw'))
-                self._log.debug('XMR balance: {}'.format(balance['balance']))
+                self._log.info('WOW {} sweep_all.'.format('estimate fee' if estimate_fee else 'withdraw'))
+                self._log.debug('WOW balance: {}'.format(balance['balance']))
                 params = {'address': addr_to, 'do_not_relay': estimate_fee}
                 if self._fee_priority > 0:
                     params['priority'] = self._fee_priority
@@ -538,7 +536,6 @@ class XMRInterface(CoinInterface):
         with self._mx_wallet:
             self.openWallet(self._wallet_filename)
 
-            self.rpc_wallet('refresh')
             balance_info = self.rpc_wallet('get_balance')
             return balance_info['unlocked_balance']
 

@@ -35,6 +35,7 @@ known_coins = [
     'bitcoin',
     'namecoin',
     'monero',
+    'wownero',
     'pivx',
     'dash',
     'firo',
@@ -59,11 +60,11 @@ def startDaemon(node_dir, bin_dir, daemon_bin, opts=[]):
 
 
 def startXmrDaemon(node_dir, bin_dir, daemon_bin, opts=[]):
-    daemon_bin = os.path.expanduser(os.path.join(bin_dir, daemon_bin))
+    daemon_path = os.path.expanduser(os.path.join(bin_dir, daemon_bin))
 
     datadir_path = os.path.expanduser(node_dir)
-    args = [daemon_bin, '--non-interactive', '--config-file=' + os.path.join(datadir_path, 'monerod.conf')] + opts
-    logging.info('Starting node {} --data-dir={}'.format(daemon_bin, node_dir))
+    args = [daemon_path, '--non-interactive', '--config-file=' + os.path.join(datadir_path, daemon_bin + '.conf')] + opts
+    logging.info('Starting node {} --data-dir={}'.format(daemon_path, node_dir))
 
     # return subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     file_stdout = open(os.path.join(datadir_path, 'core_stdout.log'), 'w')
@@ -75,19 +76,21 @@ def startXmrWalletDaemon(node_dir, bin_dir, wallet_bin, opts=[]):
     daemon_bin = os.path.expanduser(os.path.join(bin_dir, wallet_bin))
 
     data_dir = os.path.expanduser(node_dir)
-    config_path = os.path.join(data_dir, 'monero_wallet.conf')
+    config_path = os.path.join(data_dir, wallet_bin + '.conf')
+    if wallet_bin == 'monero-wallet-rpc': # backword compat filename. rename?
+        config_path = os.path.join(data_dir, 'monero_wallet.conf')
     args = [daemon_bin, '--non-interactive', '--config-file=' + config_path] + opts
 
     # Remove old config
     needs_rewrite: bool = False
-    config_to_remove = ['daemon-address=', 'untrusted-daemon=', 'trusted-daemon=', 'proxy=']
+    config_to_remove = ['daemon-address=', 'untrusted-daemon=', 'trusted-daemon=', 'proxy=', 'daemon-ssl-allow-any-cert=', ]
     with open(config_path) as fp:
         for line in fp:
             if any(line.startswith(config_line) for config_line in config_to_remove):
-                logging.warning('Found old config in monero_wallet.conf: {}'.format(line.strip()))
+                logging.warning('Found old wallet config: {}'.format(line.strip()))
                 needs_rewrite = True
     if needs_rewrite:
-        logging.info('Rewriting monero_wallet.conf')
+        logging.info('Rewriting wallet config')
         shutil.copyfile(config_path, config_path + '.last')
         with open(config_path + '.last') as fp_from, open(config_path, 'w') as fp_to:
             for line in fp_from:
@@ -163,10 +166,10 @@ def runClient(fp, data_dir, chain, start_only_coins):
             except Exception as e:
                 logger.warning('Error getting coin display name for {}: {}'.format(c, str(e)))
                 display_name = 'Unknown'
-            if c == 'monero':
+            if c in ('monero', 'wownero'):
                 if v['manage_daemon'] is True:
                     swap_client.log.info(f'Starting {display_name} daemon')
-                    filename = 'monerod' + ('.exe' if os.name == 'nt' else '')
+                    filename = c + 'd' + ('.exe' if os.name == 'nt' else '')
                     daemons.append(startXmrDaemon(v['datadir'], v['bindir'], filename))
                     pid = daemons[-1].pid
                     swap_client.log.info('Started {} {}'.format(filename, pid))
@@ -181,7 +184,7 @@ def runClient(fp, data_dir, chain, start_only_coins):
                     proxy_host, proxy_port = swap_client.getXMRWalletProxy(coin_id, v['rpchost'])
                     if proxy_host:
                         proxy_log_str = ' through proxy'
-                        opts += ['--proxy', f'{proxy_host}:{proxy_port}', ]
+                        opts += ['--proxy', f'{proxy_host}:{proxy_port}', '--daemon-ssl-allow-any-cert', ]
 
                     swap_client.log.info('daemon-address: {} ({}){}'.format(daemon_addr, 'trusted' if trusted_daemon else 'untrusted', proxy_log_str))
 
@@ -192,7 +195,7 @@ def runClient(fp, data_dir, chain, start_only_coins):
                         opts.append(daemon_rpcuser + ':' + daemon_rpcpass)
 
                     opts.append('--trusted-daemon' if trusted_daemon else '--untrusted-daemon')
-                    filename = 'monero-wallet-rpc' + ('.exe' if os.name == 'nt' else '')
+                    filename = c + '-wallet-rpc' + ('.exe' if os.name == 'nt' else '')
                     daemons.append(startXmrWalletDaemon(v['datadir'], v['bindir'], filename, opts))
                     pid = daemons[-1].pid
                     swap_client.log.info('Started {} {}'.format(filename, pid))
