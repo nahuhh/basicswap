@@ -122,7 +122,7 @@ class XMRInterface(CoinInterface):
 
         self._rpctimeout = coin_settings.get('rpctimeout', 60)
         self._walletrpctimeout = coin_settings.get('walletrpctimeout', 120)
-        self._walletrpctimeoutlong = coin_settings.get('walletrpctimeoutlong', 600)
+        self._walletrpctimeoutlong = coin_settings.get('walletrpctimeoutlong', 300)
 
         self.rpc = make_xmr_rpc_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node(j) ')
         self.rpc2 = make_xmr_rpc2_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node ')  # non-json endpoint

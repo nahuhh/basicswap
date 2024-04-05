@@ -34,9 +34,9 @@ from basicswap.util import (
     TemporaryError)
 from basicswap.util.network import (
     is_private_ip_address)
-from basicswap.rpc_xmr import (
-    make_xmr_rpc_func,
-    make_xmr_rpc2_func)
+from basicswap.rpc_wow import (
+    make_wow_rpc_func,
+    make_wow_rpc2_func)
 from basicswap.chainparams import WOW_COIN, CoinInterface, Coins
 
 
@@ -85,7 +85,7 @@ class WOWInterface(CoinInterface):
 
         self.blocks_confirmed = coin_settings['blocks_confirmed']
         self._restore_height = coin_settings.get('restore_height', 0)
-        self.setFeePriority(coin_settings.get('fee_priority', 2))
+        self.setFeePriority(coin_settings.get('fee_priority', 0))
         self._sc = swap_client
         self._log = self._sc.log if self._sc and self._sc.log else logging
         self._wallet_password = None
@@ -124,9 +124,9 @@ class WOWInterface(CoinInterface):
         self._walletrpctimeout = coin_settings.get('walletrpctimeout', 120)
         self._walletrpctimeoutlong = coin_settings.get('walletrpctimeoutlong', 600)
 
-        self.rpc = make_xmr_rpc_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node(j) ')
-        self.rpc2 = make_xmr_rpc2_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node ')  # non-json endpoint
-        self.rpc_wallet = make_xmr_rpc_func(coin_settings['walletrpcport'], coin_settings['walletrpcauth'], host=coin_settings.get('walletrpchost', '127.0.0.1'), default_timeout=self._walletrpctimeout, tag='Wallet ')
+        self.rpc = make_wow_rpc_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node(j) ')
+        self.rpc2 = make_wow_rpc2_func(coin_settings['rpcport'], daemon_login, host=rpchost, proxy_host=proxy_host, proxy_port=proxy_port, default_timeout=self._rpctimeout, tag='Node ')  # non-json endpoint
+        self.rpc_wallet = make_wow_rpc_func(coin_settings['walletrpcport'], coin_settings['walletrpcauth'], host=coin_settings.get('walletrpchost', '127.0.0.1'), default_timeout=self._walletrpctimeout, tag='Wallet ')
 
     def checkWallets(self) -> int:
         return 1

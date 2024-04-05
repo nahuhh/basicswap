@@ -36,6 +36,7 @@ from .interface.part import PARTInterface, PARTInterfaceAnon, PARTInterfaceBlind
 from . import __version__
 from .rpc import escape_rpcauth
 from .rpc_xmr import make_xmr_rpc2_func
+from .rpc_wow import make_wow_rpc2_func
 from .ui.util import getCoinName
 from .util import (
     AutomationConstraint,
@@ -176,6 +177,19 @@ def threadPollXMRChainState(swap_client, coin_type):
             swap_client.log.warning('threadPollXMRChainState {}, error: {}'.format(ci.ticker(), str(e)))
         swap_client.chainstate_delay_event.wait(random.randrange(20, 30))  # Random to stagger updates
 
+def threadPollWOWChainState(swap_client, coin_type):
+    ci = swap_client.ci(coin_type)
+    cc = swap_client.coin_clients[coin_type]
+    while not swap_client.chainstate_delay_event.is_set():
+        try:
+            new_height = ci.getChainHeight()
+            if new_height != cc['chain_height']:
+                swap_client.log.debug('New {} block at height: {}'.format(ci.ticker(), new_height))
+                with swap_client.mxDB:
+                    cc['chain_height'] = new_height
+        except Exception as e:
+            swap_client.log.warning('threadPollWOWChainState {}, error: {}'.format(ci.ticker(), str(e)))
+        swap_client.chainstate_delay_event.wait(random.randrange(20, 30))  # Random to stagger updates
 
 def threadPollChainState(swap_client, coin_type):
     ci = swap_client.ci(coin_type)
@@ -561,8 +575,10 @@ class BasicSwap(BaseApp):
             if proxy_host:
                 self.log.info(f'Connecting through proxy at {proxy_host}.')
 
-            if coin in (Coins.WOW, Coins.XMR):
+            if coin == Coins.XMR:
                 return make_xmr_rpc2_func(rpcport, daemon_login, rpchost, proxy_host=proxy_host, proxy_port=proxy_port)
+            if coin == Coins.WOW:
+                return make_wow_rpc2_func(rpcport, daemon_login, rpchost, proxy_host=proxy_host, proxy_port=proxy_port)
 
         daemon_login = None
         if coin_settings.get('rpcuser', '') != '':
@@ -772,7 +788,14 @@ class BasicSwap(BaseApp):
                 self.log.info('%s Core version %d', ci.coin_name(), core_version)
                 self.coin_clients[c]['core_version'] = core_version
 
-                thread_func = threadPollXMRChainState if c in (Coins.WOW, Coins.XMR) else threadPollChainState
+                # thread_func = threadPollXMRChainState if c in (Coins.WOW, Coins.XMR) else threadPollChainState
+                if   c == Coins.XMR:
+                    thread_func = threadPollXMRChainState
+                elif c == Coins.WOW:
+                    thread_func = threadPollWOWChainState
+                else:
+                    thread_func = threadPollChainState
+
                 t = threading.Thread(target=thread_func, args=(self, c))
                 self.threads.append(t)
                 t.start()
