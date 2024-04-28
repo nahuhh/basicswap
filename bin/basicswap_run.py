@@ -100,7 +100,7 @@ def startXmrWalletDaemon(node_dir, bin_dir, wallet_bin, opts=[]):
     config_path = os.path.join(data_dir, wallet_bin + '.conf')
     if wallet_bin == 'monero-wallet-rpc': # backword compat filename. rename?
         config_path = os.path.join(data_dir, 'monero_wallet.conf')
-    args = [daemon_bin, '--non-interactive', '--config-file=' + config_path] + opts
+#    args = [daemon_bin, '--non-interactive', '--config-file=' + config_path] + opts
     if os.path.exists(config_path):
         args += ['--config-file=' + config_path]
         with open(config_path) as fp:
