@@ -39,7 +39,7 @@ class DASHInterface(BTCInterface):
 
     def initialiseWallet(self, key_bytes: bytes) -> None:
         if self._wallet_v20_compatible:
-            self._log.warning(f'Generating wallet compatible with v20 seed.')
+            self._log.warning('Generating wallet compatible with v20 seed.')
             words = self.entropyToMnemonic(key_bytes)
             mnemonic_passphrase = ''
             self.rpc_wallet('upgradetohd', [words, mnemonic_passphrase, self._wallet_passphrase])
