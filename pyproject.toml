@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "basicswap"
+description = "Simple atomic swap system"
+keywords = ["crypto", "cryptocurrency", "particl", "bitcoin", "monero", "wownero"]
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+# See requirements.txt
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://basicswapdex.com"
+Source = "https://github.com/basicswap/basicswap"
+
+[project.scripts]
+basicswap-prepare = "basicswap.bin.prepare:main"
+basicswap-run = "basicswap.bin.run:main"
+
+[project.optional-dependencies]
+dev = [
+    "codespell",
+    "flake8",
+    "pip-tools",
+    "pytest",
+]
+
+[tool.hatch.version]
+path = "basicswap/__init__.py"
+
+[tool.hatch.metadata]
+allow-direct-references = true
