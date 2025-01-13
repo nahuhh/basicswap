@@ -1538,6 +1538,7 @@ class Test(BaseTest):
             bid_id,
             [BidStates.BID_STALLED_FOR_TEST, BidStates.XMR_SWAP_FAILED],
             sent=True,
+            wait_for=300,
         )
 
         bid_id_hex = bid_id.hex()
