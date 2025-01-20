@@ -1,8 +1,8 @@
 {% include 'header.html' %}
 {% from 'style.html' import select_box_arrow_svg, select_box_class, circular_arrows_svg, circular_error_svg, circular_info_svg, cross_close_svg, breadcrumb_line_svg, withdraw_svg, utxo_groups_svg, create_utxo_svg, red_cross_close_svg, blue_cross_close_svg, circular_update_messages_svg, circular_error_messages_svg %}
 <script src="/static/js/libs//qrcode.js"></script>
-<div class="container mx-auto">
   <section class="p-5 mt-5">
+   <div class="container mx-auto">
     <div class="flex flex-wrap items-center -m-2">
       <div class="w-full md:w-1/2 p-2">
         <ul class="flex flex-wrap items-center gap-x-3 mb-2">
@@ -14,9 +14,10 @@
         </ul>
       </div>
     </div>
+   </div>
   </section>
   <section class="py-4">
-    <div class="container px-4 mx-auto">
+    <div class="lg:container px-6 mx-auto">
       <div class="relative py-11 px-16 bg-coolGray-900 dark:bg-blue-500 rounded-md overflow-hidden"> <img class="absolute z-10 left-4 top-4 right-4 bottom-4" src="/static/images/elements/dots-red.svg" alt="dots-red"> <img class="absolute h-64 left-1/2 top-1/2 transform -translate-x-1/2 -translate-y-1/2 object-cover" src="/static/images/elements/wave.svg" alt="wave">
         <div class="relative z-20 flex flex-wrap items-center -m-3">
           <div class="w-full md:w-1/2">
@@ -30,7 +31,7 @@
   {% include 'inc_messages.html' %}
   {% if w.updating %}
 <section class="py-4" id="messages_updating" role="alert">
-  <div class="container px-4 mx-auto">
+  <div class="lg:container px-6 mx-auto">
     <div class="p-6 text-green-800 rounded-lg bg-blue-50 border border-blue-500 dark:bg-gray-500 dark:text-blue-400 rounded-md">
       <div class="flex flex-wrap justify-between items-center -m-2">
         <div class="flex-1 p-2">
@@ -57,7 +58,7 @@
   {% if w.havedata %}
   {% if w.error %}
 <section class="py-4" id="messages_error" role="alert">
-  <div class="container px-4 mx-auto">
+  <div class="lg:container px-6 mx-auto">
     <div class="p-6 text-green-800 rounded-lg bg-red-50 border border-red-400 dark:bg-gray-500 dark:text-red-400 rounded-md">
       <div class="flex flex-wrap justify-between items-center -m-2">
         <div class="flex-1 p-2">
@@ -84,7 +85,7 @@
   {% else %}
 {% if w.cid == '18' %} {# DOGE #}
 <section class="py-4" id="messages_notice">
-  <div class="container px-4 mx-auto">
+  <div class="lg:container px-6 mx-auto">
     <div class="p-6 rounded-lg bg-coolGray-100 dark:bg-gray-500 shadow-sm">
       <div class="flex items-start">
         <svg class="w-6 h-6 text-blue-500 mt-1 mr-3 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z"></path></svg>
@@ -107,7 +108,7 @@
         <div class="pb-6 border-coolGray-100">
           <div class="flex flex-wrap items-center justify-between -m-2">
             <div class="w-full pt-2">
-              <div class="container mt-5 mx-auto">
+              <div class="lg:container mt-5 mx-auto">
                 <div class="pt-6 pb-8 bg-coolGray-100 dark:bg-gray-500 rounded-xl">
                   <div class="px-6">
                     <div class="w-full pb-6 overflow-x-auto">
@@ -226,7 +227,7 @@
       <div class="pb-6 border-coolGray-100">
         <div class="flex flex-wrap items-center justify-between -m-2">
           <div class="w-full pt-2">
-            <div class="container mt-5 mx-auto">
+            <div class="lg:container mt-5 mx-auto">
               <div class="py-6 bg-coolGray-100 dark:bg-gray-500 rounded-xl">
                 <div class="px-6">
                   {% if w.cid != '4' %} {# DCR #}
@@ -243,9 +244,11 @@
     </section>
   {% else %}
 <section class="p-6">
+ <div class="lg:container mx-auto">
   <div class="flex items-center">
     <h4 class="font-semibold text-2xl text-black dark:text-white">Deposit</h4>
   </div>
+ </div>
 </section>
 <form method="post" autocomplete="off">
   <section>
@@ -253,7 +256,7 @@
       <div class="pb-6 border-coolGray-100">
         <div class="flex flex-wrap items-center justify-between -m-2">
           <div class="w-full pt-2">
-            <div class="container mt-5 mx-auto">
+            <div class="lg:container mt-5 mx-auto">
               <div class="pb-6 bg-coolGray-100 dark:bg-gray-500 rounded-xl">
                 <div class="px-6">
                   <div class="flex flex-wrap max-w-7xl mx-auto justify-center -m-3">
@@ -480,16 +483,18 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 </script>
   <section class="p-6">
+   <div class="lg:container mx-auto">
     <div class="flex items-center">
       <h4 class="font-semibold text-2xl text-black dark:text-white">Withdraw</h4>
     </div>
-  </section>
+  </div>
+ </section>
   <section>
     <div class="px-6 py-0 h-full overflow-hidden">
       <div class="border-coolGray-100">
         <div class="flex flex-wrap items-center justify-between -m-2">
           <div class="w-full pt-2">
-            <div class="container mt-5 mx-auto">
+            <div class="lg:container mt-5 mx-auto">
               <div class="py-6 bg-coolGray-100 dark:bg-gray-500 rounded-xl">
                 <div class="px-6">
                   <div class="w-full pb-6 overflow-x-auto">
@@ -742,17 +747,17 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="pb-6 ">
         <div class="flex flex-wrap items-center justify-between -m-2">
           <div class="w-full pt-2">
-            <div class="container mx-auto">
+            <div class="lg:container mx-auto">
               <div class="py-6 bg-coolGray-100 border-t border-gray-100 dark:border-gray-400 dark:bg-gray-500 rounded-bl-xl rounded-br-xl">
                 <div class="px-6">
                   <div class="flex flex-wrap justify-end">
                     {% if w.cid in '6, 9' %}
                     {# XMR | WOW #}
-                    <div class="w-full md:w-auto p-1.5 ml-2"> <button type="submit" class="flex flex-wrap justify-center w-full px-4 py-2.5 bg-blue-500 hover:bg-blue-600 font-medium text-sm text-white border border-blue-500 rounded-md shadow-button focus:ring-0 focus:outline-none" name="estfee_{{ w.cid }}" value="Estimate Fee">Estimate {{ w.ticker }} Fee </button> </div>
+                    <div class="w-full md:w-auto p-1.5 mx-1"> <button type="submit" class="flex flex-wrap justify-center w-full px-4 py-2.5 bg-blue-500 hover:bg-blue-600 font-medium text-sm text-white border border-blue-500 rounded-md shadow-button focus:ring-0 focus:outline-none" name="estfee_{{ w.cid }}" value="Estimate Fee">Estimate {{ w.ticker }} Fee </button> </div>
                     {# / XMR | WOW #}
                     {% elif w.show_utxo_groups %}
                     {% else %}
-                    <div class="w-full md:w-auto p-1.5"> <button type="submit" class="flex flex-wrap justify-center px-4 py-2.5 bg-blue-500 hover:bg-blue-600 font-medium text-sm text-white border border-blue-500 rounded-md shadow-button focus:ring-0 focus:outline-none" id="showutxogroups" name="showutxogroups" value="Show UTXO Groups"> {{ utxo_groups_svg | safe }} Show UTXO Groups </button> </div>
+                    <div class="w-full md:w-auto p-1.5 mx-1"> <button type="submit" class="flex flex-wrap justify-center w-full px-4 py-2.5 bg-blue-500 hover:bg-blue-600 font-medium text-sm text-white border border-blue-500 rounded-md shadow-button focus:ring-0 focus:outline-none" id="showutxogroups" name="showutxogroups" value="Show UTXO Groups"> {{ utxo_groups_svg | safe }} Show UTXO Groups </button> </div>
                     {% endif %}
                     <div class="w-full md:w-auto p-1.5 mx-1"> <button type="submit" class="flex flex-wrap justify-center w-full px-4 py-2.5 bg-blue-500 hover:bg-blue-600 font-medium text-sm text-white border border-blue-500 rounded-md shadow-button focus:ring-0 focus:outline-none" name="withdraw_{{ w.cid }}" value="Withdraw" onclick="return confirmWithdrawal();">{{ withdraw_svg | safe }} Withdraw {{ w.ticker }} </button></div>
                   </div>
@@ -764,20 +769,20 @@ document.addEventListener('DOMContentLoaded', function() {
       </div>
     </div>
   </section>
-  {% if w.cid not in '6, 9' %}
-  {# !XMR | WOW #}
   {% if w.show_utxo_groups %}
   <section class="p-6">
+   <div class="lg:container mx-auto">
     <div class="flex items-center">
       <h4 class="font-semibold text-2xl text-black dark:text-white">UTXO Groups</h4>
     </div>
+   </div>
   </section>
   <section>
     <div class="px-6 py-0 h-full overflow-hidden">
       <div class="border-coolGray-100">
         <div class="flex flex-wrap items-center justify-between -m-2">
           <div class="w-full pt-2">
-            <div class="container mt-5 mx-auto">
+            <div class="lg:container mt-5 mx-auto">
               <div class="pt-6 pb-8 bg-coolGray-100 dark:bg-gray-500 rounded-xl">
                 <div class="px-6">
                   <div class="w-full pb-6 overflow-x-auto">
@@ -815,7 +820,7 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="pb-6 ">
         <div class="flex flex-wrap items-center justify-between -m-2">
           <div class="w-full pt-2">
-            <div class="container mx-auto">
+            <div class="lg:container mx-auto">
               <div class="py-6 bg-coolGray-100 border-t border-gray-100 dark:border-gray-400 dark:bg-gray-500 rounded-bl-xl rounded-br-xl">
                 <div class="px-6">
                   <div class="flex flex-wrap justify-end"> <button type="submit" class="flex flex-wrap justify-center px-4 py-2.5 bg-blue-500 hover:bg-blue-600 font-medium text-sm text-white border border-blue-500 rounded-md shadow-button focus:ring-0 focus:outline-none" id="closeutxogroups" name="closeutxogroups" value="Close UTXO Groups"> {{ utxo_groups_svg | safe }} Close UTXO Groups </button> </div>
@@ -828,7 +833,6 @@ document.addEventListener('DOMContentLoaded', function() {
     </div>
   </section>
   {% else %}
-  {% endif %}
   {% endif %}
   {% endif %}
   {% endif %}
