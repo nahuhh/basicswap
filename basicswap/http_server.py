@@ -641,11 +641,16 @@ class HttpHandler(BaseHTTPRequestHandler):
         url_split = parsed.path.split("/")
         page = url_split[1] if len(url_split) > 1 else ""
 
-        exempt_pages = ["login", "static", "json", "error", "info"]
+        exempt_pages = ["login", "static", "error", "info"]
         if page not in exempt_pages:
             if not self.is_authenticated():
-                self.send_response(302)
-                self.send_header("Location", "/login")
+                if page == "json":
+                    self.putHeaders(401, "application/json")
+                    self.wfile.write(json.dumps({"error": "Unauthorized"}).encode("utf-8"))
+                    return
+                else:
+                    self.send_response(302)
+                    self.send_header("Location", "/login")
                 clear_cookie_header = self._clear_session_cookie()
                 self.send_header(clear_cookie_header[0], clear_cookie_header[1])
                 self.end_headers()
