@@ -1,0 +1,22 @@
+name: eslint
+
+on:
+  push:
+    paths:
+#      - 'basicswap/static/js/**'
+      - '**'
+  pull_request:
+    paths:
+#      - 'basicswap/static/js/**'
+      - '**'
+jobs:
+  eslint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        npm install -g eslint
+    - name: Run ESlint
+      run: |
+        eslint || true
