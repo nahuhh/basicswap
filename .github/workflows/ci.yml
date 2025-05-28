@@ -14,8 +14,35 @@ env:
   XMR_RPC_PWD: xmr_pwd
 
 jobs:
-  ci:
+  formatting:
     runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dev dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[dev]
+        pip install djlint
+        npm install eslint -g --save-dev
+    - name: Run flake8
+      run: |
+        flake8 --ignore=E203,E501,W503 --exclude=basicswap/contrib,basicswap/interface/contrib,.eggs,.tox,bin/install_certifi.py
+    - name: Run codespell
+      run: |
+        codespell --check-filenames --disable-colors --quiet-level=7 --ignore-words=tests/lint/spelling.ignore-words.txt -S .git,.eggs,.tox,pgp,*.pyc,*basicswap/contrib,*basicswap/interface/contrib,*mnemonics.py,bin/install_certifi.py,*basicswap/static
+    - name: Run black
+      run: |
+        black --check --diff --exclude="contrib" .
+    - name: Run ESlint
+      run: |
+        eslint basicswap/static/js/ || true
+    - name: Run DJlint
+      run: |
+        djlint basicswap/templates/* || true
+  test:
+    needs: formatting
+    runs-on: ubuntu-latest
+    name: Functional tests
     strategy:
       matrix:
         python-version: ["3.12"]
@@ -37,7 +64,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y firefox
         fi
-        python -m pip install --upgrade pip
         pip install -e .[dev]
         pip install -r requirements.txt --require-hashes
     - name: Install
@@ -46,15 +72,6 @@ jobs:
         # Print the core versions to a file for caching
         basicswap-prepare --version --withcoins=bitcoin | tail -n +2 > core_versions.txt
         cat core_versions.txt
-    - name: Run flake8
-      run: |
-        flake8 --ignore=E203,E501,W503 --exclude=basicswap/contrib,basicswap/interface/contrib,.eggs,.tox,bin/install_certifi.py
-    - name: Run codespell
-      run: |
-        codespell --check-filenames --disable-colors --quiet-level=7 --ignore-words=tests/lint/spelling.ignore-words.txt -S .git,.eggs,.tox,pgp,*.pyc,*basicswap/contrib,*basicswap/interface/contrib,*mnemonics.py,bin/install_certifi.py,*basicswap/static
-    - name: Run black
-      run: |
-        black --check --diff --exclude="contrib" .
     - name: Run test_other
       run: |
         pytest tests/basicswap/test_other.py
@@ -66,7 +83,6 @@ jobs:
       with:
         path: /tmp/cached_bin
         key: cores-${{ runner.os }}-${{ hashFiles('**/core_versions.txt') }}
-
     - if: ${{ steps.cache-cores.outputs.cache-hit != 'true' }}
       name: Running basicswap-prepare
       run: |
