@@ -112,7 +112,7 @@ def parseOfferFormData(swap_client, form_data, page_data, options={}):
         errors.append("Coins from and to must be different.")
 
     try:
-        page_data["amt_from"] = round(get_data_entry(form_data, "amt_from"), 8)
+        page_data["amt_from"] = round(get_data_entry(form_data, "amt_from"), 12)
         parsed_data["amt_from"] = inputAmount(page_data["amt_from"], ci_from)
     except Exception:
         errors.append("Amount From")
