@@ -118,6 +118,13 @@ def format_wallet_data(swap_client, ci, w):
         except Exception:
             wf["electrum_connected"] = False
             wf["electrum_status"] = "error"
+        try:
+            sync_status = backend.getSyncStatus()
+            wf["electrum_synced"] = sync_status.get("synced", False)
+            wf["electrum_height"] = sync_status.get("height", 0)
+        except Exception:
+            wf["electrum_synced"] = False
+            wf["electrum_height"] = 0
 
     checkAddressesOwned(swap_client, ci, wf)
     return wf
@@ -435,8 +442,12 @@ def page_wallet(self, url_split, post_string):
                 if swap_client.debug is True:
                     swap_client.log.error(traceback.format_exc())
 
+    is_electrum_mode = (
+        swap_client.coin_clients.get(coin_id, {}).get("connection_type") == "electrum"
+    )
+
     swap_client.updateWalletsInfo(
-        force_refresh, only_coin=coin_id, wait_for_complete=True
+        force_refresh, only_coin=coin_id, wait_for_complete=not is_electrum_mode
     )
     wallets = swap_client.getCachedWalletsInfo({"coin_id": coin_id})
     wallet_data = {}

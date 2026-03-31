@@ -215,10 +215,16 @@
             <div class="bg-blue-600 dark:bg-blue-400 h-1 rounded-full" style="width: {{ w.scan_status.progress }}%"></div>
           </div>
         </div>
-        {% else %}
+        {% elif w.electrum_synced %}
         <div class="bg-green-50 dark:bg-gray-500 p-2 rounded">
           <div class="flex items-center text-xs text-green-600 dark:text-green-400">
-            Electrum Wallet Synced
+            Electrum Wallet Synced ({{ w.electrum_height }})
+          </div>
+        </div>
+        {% else %}
+        <div class="bg-yellow-50 dark:bg-gray-500 p-2 rounded">
+          <div class="flex items-center text-xs text-yellow-600 dark:text-yellow-400">
+            Waiting for Electrum Server...
           </div>
         </div>
         {% endif %}
