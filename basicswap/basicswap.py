@@ -298,6 +298,7 @@ def threadPollXMRChainState(swap_client, coin_type):
             swap_client.log.warning(
                 f"threadPollXMRChainState {ci.ticker()}, error: {e}"
             )
+            swap_client.tryXMRDaemonFailover(coin_type, e)
         swap_client.chainstate_delay_event.wait(
             random.randrange(20, 30)
         )  # Random to stagger updates
@@ -1018,55 +1019,89 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 proxy_port = self.tor_proxy_port
         return proxy_host, proxy_port
 
-    def selectXMRRemoteDaemon(self, coin):
-        self.log.info("Selecting remote XMR daemon.")
-        chain_client_settings = self.getChainClientSettings(coin)
-        remote_daemon_urls = chain_client_settings.get("remote_daemon_urls", [])
-
+    def probeXMRDaemon(self, coin, rpchost, rpcport) -> dict:
         coin_settings = self.coin_clients[coin]
-        rpchost: str = coin_settings["rpchost"]
-        rpcport: int = coin_settings["rpcport"]
-        timeout: int = coin_settings["rpctimeout"]
-
-        def get_rpc_func(rpcport, daemon_login, rpchost):
-
-            proxy_host, proxy_port = self.getXMRWalletProxy(coin, rpchost)
-            if proxy_host:
-                self.log.info(f"Connecting through proxy at {proxy_host}.")
-
-            if coin in self.xmr_based_coins:
-                return make_xmr_rpc2_func(
-                    rpcport,
-                    daemon_login,
-                    rpchost,
-                    proxy_host=proxy_host,
-                    proxy_port=proxy_port,
-                )
-
         daemon_login = None
         if coin_settings.get("rpcuser", "") != "":
             daemon_login = (
                 coin_settings.get("rpcuser", ""),
                 coin_settings.get("rpcpassword", ""),
             )
+        proxy_host, proxy_port = self.getXMRWalletProxy(coin, rpchost)
+        if proxy_host:
+            self.log.debug(
+                f"Probing {getCoinName(coin)} daemon through proxy at {proxy_host}."
+            )
+        timeout: int = self.getChainClientSettings(coin).get(
+            "daemon_select_timeout", 10
+        )
+        rpc2 = make_xmr_rpc2_func(
+            int(rpcport),
+            daemon_login,
+            rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+        )
+        start_time = time.time()
+        try:
+            _ = rpc2("get_height", timeout=timeout)["height"]
+            latency_ms = int(round((time.time() - start_time) * 1000))
+            return {"reachable": True, "latency_ms": latency_ms}
+        except Exception as e:
+            self.log.warning(
+                f"{getCoinName(coin)} daemon {rpchost}:{rpcport} unreachable: {e}"
+            )
+            return {"reachable": False, "error": str(e)}
+
+    def isXMRDaemonReachable(self, coin, rpchost, rpcport) -> bool:
+        return self.probeXMRDaemon(coin, rpchost, rpcport)["reachable"]
+
+    @staticmethod
+    def normaliseRemoteDaemonUrls(entries) -> list:
+        # Legacy "host:port" strings normalise to failover-enabled dicts.
+        normalised = []
+        seen = set()
+        for entry in entries or []:
+            if isinstance(entry, str):
+                url = entry.strip()
+                failover = True
+            elif isinstance(entry, dict):
+                url = str(entry.get("url", "")).strip()
+                failover = bool(entry.get("failover", True))
+            else:
+                continue
+            if url == "" or url in seen:
+                continue
+            seen.add(url)
+            normalised.append({"url": url, "failover": failover})
+        return normalised
+
+    def getFailoverDaemonUrls(self, coin) -> list:
+        # URLs of the nodes marked for automatic failover/selection. Nodes kept in
+        # the list with failover disabled are only used for manual selection.
+        nodes = self.normaliseRemoteDaemonUrls(
+            self.getChainClientSettings(coin).get("remote_daemon_urls", [])
+        )
+        return [n["url"] for n in nodes if n["failover"]]
+
+    def selectXMRRemoteDaemon(self, coin):
+        self.log.info("Selecting remote XMR daemon.")
+        failover_urls = self.getFailoverDaemonUrls(coin)
+
+        coin_settings = self.coin_clients[coin]
+        rpchost: str = coin_settings["rpchost"]
+        rpcport: int = coin_settings["rpcport"]
+
         current_daemon_url = f"{rpchost}:{rpcport}"
-        if current_daemon_url in remote_daemon_urls:
+        if current_daemon_url in failover_urls:
             self.log.info(f"Trying last used url {rpchost}:{rpcport}.")
-            try:
-                rpc2 = get_rpc_func(rpcport, daemon_login, rpchost)
-                _ = rpc2("get_height", timeout=timeout)["height"]
+            if self.isXMRDaemonReachable(coin, rpchost, rpcport):
                 return True
-            except Exception as e:
-                self.log.warning(
-                    f"Failed to set XMR remote daemon to {rpchost}:{rpcport}, {e}"
-                )
-        random.shuffle(remote_daemon_urls)
-        for url in remote_daemon_urls:
+        random.shuffle(failover_urls)
+        for url in failover_urls:
             self.log.info(f"Trying url {url}.")
-            try:
-                rpchost, rpcport = url.rsplit(":", 1)
-                rpc2 = get_rpc_func(rpcport, daemon_login, rpchost)
-                _ = rpc2("get_height", timeout=timeout)["height"]
+            rpchost, rpcport = url.rsplit(":", 1)
+            if self.isXMRDaemonReachable(coin, rpchost, rpcport):
                 coin_settings["rpchost"] = rpchost
                 coin_settings["rpcport"] = rpcport
                 data = {
@@ -1075,10 +1110,60 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 }
                 self.editSettings(self.coin_clients[coin]["name"], data)
                 return True
-            except Exception as e:
-                self.log.warning(f"Failed to set XMR remote daemon to {url}, {e}")
 
         raise ValueError("Failed to select a working XMR daemon url.")
+
+    def tryXMRDaemonFailover(self, coin_type, exc) -> bool:
+        # Error-driven failover: switch to another remote_daemon_urls entry via set_daemon.
+        if coin_type not in (Coins.XMR, Coins.WOW):
+            return False
+        if not self.isCoinActive(coin_type):
+            return False
+        chain_client_settings = self.getChainClientSettings(coin_type)
+        if not chain_client_settings.get("automatically_select_daemon", False):
+            return False
+        if len(self.getFailoverDaemonUrls(coin_type)) < 1:
+            return False
+
+        ci = self.ci(coin_type)
+        if not ci.is_transient_error(exc):
+            return False
+        self.log.warning(f"{ci.coin_name()} daemon error, attempting failover: {exc}")
+        try:
+            self.selectXMRRemoteDaemon(coin_type)
+            return True
+        except Exception as e:
+            self.log.error(f"{ci.coin_name()} daemon failover failed: {e}")
+            return False
+
+    def setXMRWalletDaemon(self, coin) -> bool:
+        # set_daemon needs an open wallet; retried a few times for a not-yet-ready node.
+        ci = self.ci(coin)
+        auto_select = self.getChainClientSettings(coin).get(
+            "automatically_select_daemon", False
+        )
+        for i in range(3):
+            try:
+                rpchost = self.coin_clients[coin]["rpchost"]
+                rpcport = self.coin_clients[coin]["rpcport"]
+                # Confirm the daemon answers before set_daemon; fail over if it's down.
+                if auto_select and not self.isXMRDaemonReachable(
+                    coin, rpchost, rpcport
+                ):
+                    self.selectXMRRemoteDaemon(coin)
+                    rpchost = self.coin_clients[coin]["rpchost"]
+                    rpcport = self.coin_clients[coin]["rpcport"]
+                ci.setDaemonAddress(rpchost, rpcport)
+                self.log.debug(
+                    f"set_daemon for {ci.coin_name()} succeeded, daemon set to {rpchost}:{rpcport}"
+                )
+                return True
+            except Exception as e:
+                self.log.warning(
+                    f"set_daemon for {ci.coin_name()} failed (attempt {i + 1}): {e}"
+                )
+                self.delay_event.wait(2)
+        return False
 
     def isCoinActive(self, coin):
         use_coinid = coin
@@ -1404,7 +1489,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                         self.log.warning(
                             f"Can't open {ci.coin_name()} wallet, could be locked."
                         )
+                        # Wallet isn't open, so skip set_daemon.
                         continue
+                    self.setXMRWalletDaemon(c)
                 elif c == Coins.LTC:
                     ci_mweb = self.ci(Coins.LTC_MWEB)
                     is_encrypted, _ = self.getLockedState()
@@ -1948,6 +2035,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
             if coin is None or coin == Coins.PART:
                 self._is_locked = False
+
+            # Encrypted wallets skip the startup set_daemon (locked); send it now.
+            for c in self.activeCoins():
+                if c in (Coins.XMR, Coins.WOW) and (coin is None or coin == c):
+                    self.setXMRWalletDaemon(c)
 
             self.loadFromDB()
 
@@ -14807,6 +14899,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                             cc["chain_lookups"] = data["lookups"]
                             break
 
+            is_xmr_like = coin_name in ("monero", "wownero")
+            daemon_settings_changed = False
+            # Set when host/port changed, so the live apply points straight at it.
+            rpc_target_changed = False
             for setting in (
                 "manage_daemon",
                 "rpchost",
@@ -14817,20 +14913,47 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     continue
                 if settings_cc.get(setting) != data[setting]:
                     settings_changed = True
-                    suggest_reboot = True
                     settings_cc[setting] = data[setting]
+                    if is_xmr_like and setting in (
+                        "rpchost",
+                        "rpcport",
+                        "automatically_select_daemon",
+                    ):
+                        daemon_settings_changed = True
+                        if setting in ("rpchost", "rpcport"):
+                            rpc_target_changed = True
+                    else:
+                        suggest_reboot = True
 
-            if "remotedaemonurls" in data:
-                remotedaemonurls_in = data["remotedaemonurls"].split("\n")
-                remotedaemonurls = set()
-                for url in remotedaemonurls_in:
-                    if url.count(":") > 0:
-                        remotedaemonurls.add(url.strip())
-
-                if set(settings_cc.get("remote_daemon_urls", [])) != remotedaemonurls:
-                    settings_cc["remote_daemon_urls"] = list(remotedaemonurls)
+            # Node list changes. The settings page posts remote_daemon_nodes (a
+            # list of {"url", "failover"} dicts); the legacy API still accepts
+            # remotedaemonurls (newline-separated "host:port", all failover-on).
+            new_nodes = None
+            if "remote_daemon_nodes" in data:
+                new_nodes = self.normaliseRemoteDaemonUrls(data["remote_daemon_nodes"])
+            elif "remotedaemonurls" in data:
+                new_nodes = self.normaliseRemoteDaemonUrls(
+                    [
+                        line.strip()
+                        for line in data["remotedaemonurls"].split("\n")
+                        if line.count(":") > 0
+                    ]
+                )
+            if new_nodes is not None:
+                existing_nodes = self.normaliseRemoteDaemonUrls(
+                    settings_cc.get("remote_daemon_urls", [])
+                )
+                # Compare url+failover membership only, so a purely cosmetic
+                # reorder of the node list is not treated as a settings change.
+                if {(n["url"], n["failover"]) for n in existing_nodes} != {
+                    (n["url"], n["failover"]) for n in new_nodes
+                }:
+                    settings_cc["remote_daemon_urls"] = new_nodes
                     settings_changed = True
-                    suggest_reboot = True
+                    if is_xmr_like:
+                        daemon_settings_changed = True
+                    else:
+                        suggest_reboot = True
 
             # Ensure remote_daemon_urls appears in settings if automatically_select_daemon is present
             if (
@@ -14945,7 +15068,52 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     json.dump(settings_copy, fp, indent=4)
                 shutil.move(settings_path_new, settings_path)
                 self.settings = settings_copy
+
+        # Apply XMR/WOW daemon changes via set_daemon, outside the mxDB lock.
+        if daemon_settings_changed:
+            coin_id = self.getCoinIdFromName(coin_name)
+            if not self.isCoinActive(coin_id):
+                suggest_reboot = True
+            else:
+                try:
+                    new_cc = self.settings["chainclients"][coin_name]
+                    if rpc_target_changed:
+                        self.ci(coin_id).setDaemonAddress(
+                            new_cc["rpchost"], new_cc["rpcport"]
+                        )
+                    elif new_cc.get("automatically_select_daemon", False):
+                        # Auto-select or list changed: selectXMRRemoteDaemon applies via set_daemon.
+                        self.selectXMRRemoteDaemon(coin_id)
+                except Exception as e:
+                    self.log.error(
+                        f"Applying daemon settings for {coin_name} failed: {e}"
+                    )
+                    suggest_reboot = True
+
         return settings_changed, suggest_reboot, migration_message
+
+    def saveRemoteDaemonNodes(self, coin_name: str, nodes) -> bool:
+        new_nodes = self.normaliseRemoteDaemonUrls(nodes)
+        settings_copy = copy.deepcopy(self.settings)
+        with self.mxDB:
+            settings_cc = settings_copy["chainclients"][coin_name]
+            existing_nodes = self.normaliseRemoteDaemonUrls(
+                settings_cc.get("remote_daemon_urls", [])
+            )
+            if {(n["url"], n["failover"]) for n in existing_nodes} == {
+                (n["url"], n["failover"]) for n in new_nodes
+            }:
+                return False
+            settings_cc["remote_daemon_urls"] = new_nodes
+            self._normalizeSettingsPaths(settings_copy)
+            settings_path = os.path.join(self.data_dir, cfg.CONFIG_FILENAME)
+            settings_path_new = settings_path + ".new"
+            shutil.copyfile(settings_path, settings_path + ".last")
+            with open(settings_path_new, "w") as fp:
+                json.dump(settings_copy, fp, indent=4)
+            shutil.move(settings_path_new, settings_path)
+            self.settings = settings_copy
+        return True
 
     def enableCoin(self, coin_name: str) -> None:
         self.log.info(f"Enabling coin {coin_name}.")

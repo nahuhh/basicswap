@@ -5,6 +5,7 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 import html
+import json
 
 from .util import (
     getCoinName,
@@ -125,9 +126,18 @@ def page_settings(self, url_split, post_string):
                         data["rpcport"] = int(
                             get_data_entry(form_data, "rpcport_" + name)
                         )
-                        data["remotedaemonurls"] = get_data_entry_or(
-                            form_data, "remotedaemonurls_" + name, ""
-                        )
+                        # Node list posted as JSON by the page JS; "" = cleared,
+                        # malformed = ignored (don't wipe the saved list).
+                        nodes_json = get_data_entry_or(
+                            form_data, "remotedaemonnodes_" + name, ""
+                        ).strip()
+                        if nodes_json == "":
+                            data["remote_daemon_nodes"] = []
+                        else:
+                            try:
+                                data["remote_daemon_nodes"] = json.loads(nodes_json)
+                            except ValueError:
+                                pass
                         data["automatically_select_daemon"] = (
                             True
                             if get_data_entry(form_data, "autosetdaemon_" + name)
@@ -305,8 +315,9 @@ def page_settings(self, url_split, post_string):
             )
             chains_formatted[-1]["rpchost"] = c.get("rpchost", "localhost")
             chains_formatted[-1]["rpcport"] = int(c.get("rpcport", 18081))
-            chains_formatted[-1]["remotedaemonurls"] = "\n".join(
-                c.get("remote_daemon_urls", [])
+            # Normalised {url, failover} list (legacy "host:port" strings => failover-on).
+            chains_formatted[-1]["remote_daemon_nodes"] = (
+                swap_client.normaliseRemoteDaemonUrls(c.get("remote_daemon_urls", []))
             )
             chains_formatted[-1]["autosetdaemon"] = c.get(
                 "automatically_select_daemon", False

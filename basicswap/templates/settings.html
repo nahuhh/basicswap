@@ -55,7 +55,7 @@
  </section>
 
  <div class="container px-4 mx-auto">
-  
+
   <div class="tab-content" id="coins" role="tabpanel" aria-labelledby="coins-tab">
    <form method="post" id="coins-form">
     <div class="space-y-6">
@@ -99,7 +99,7 @@
 
       <div class="coin-details hidden" id="details-{{ c.name }}">
        <div class="px-6 py-6">
-        
+
         {% if c.connection_type %}
         <div class="mb-6">
          <h4 class="text-sm font-medium text-gray-900 dark:text-white mb-4">
@@ -336,6 +336,8 @@
 
           </div>
 
+          <p id="daemon-error-{{ c.name }}" class="hidden text-sm text-red-500 mb-4" role="alert"></p>
+
           <div class="mb-4">
            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Automatically Select Daemon</label>
            <div class="relative">
@@ -351,10 +353,25 @@
            </div>
           </div>
 
-          <div>
-           <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Trusted Public Nodes</label>
-           <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">List trusted public nodes to use if "Automatically Select Daemon" is enabled (one per line)</p>
-           <textarea class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" placeholder="node.xmr.to:18081&#10;node2.xmr.to:18081" name="remotedaemonurls_{{ c.name }}" rows="4">{{ c.remotedaemonurls }}</textarea>
+          <div class="daemon-nodes" data-coin="{{ c.name }}">
+           <div class="flex items-center justify-between mb-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Nodes</label>
+            <button type="button" class="daemon-check-all inline-flex items-center text-xs font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 disabled:opacity-50" data-coin="{{ c.name }}">
+             <svg class="daemon-check-all-icon w-3.5 h-3.5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+             <span class="daemon-check-all-label">Check all</span>
+            </button>
+           </div>
+           <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">Click a node to health-check it (queries get_height, shows latency). Tick <span class="font-medium">Failover</span> to include a node in automatic selection; unticked nodes stay saved for manual use. <span class="font-medium">Use</span> points the wallet at that node.</p>
+
+           <ul class="daemon-node-list space-y-2 mb-2" data-coin="{{ c.name }}"></ul>
+           <p class="daemon-node-empty hidden text-xs text-gray-400 dark:text-gray-500 italic mb-2">No nodes configured.</p>
+
+           <div class="flex gap-2">
+            <input type="text" class="daemon-node-add-input hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" placeholder="node.xmr.to:18081" data-coin="{{ c.name }}">
+            <button type="button" class="daemon-node-add-btn whitespace-nowrap px-4 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500" data-coin="{{ c.name }}">Add</button>
+           </div>
+
+           <input type="hidden" name="remotedaemonnodes_{{ c.name }}" class="daemon-nodes-hidden" data-coin="{{ c.name }}" value='{{ c.remote_daemon_nodes | tojson }}'>
           </div>
          </div>
         </div>
@@ -428,7 +445,7 @@
         </div>
 
         <div class="flex justify-end space-x-3 pt-4 ">
-         <button name="apply_{{ c.name }}" value="Apply" type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg transition-colors focus:outline-none">
+         <button name="apply_{{ c.name }}" value="Apply" type="submit" data-coin="{{ c.name }}" class="apply-coin-btn bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg transition-colors focus:outline-none">
           Apply Changes
          </button>
          {% if c.can_disable == true %}

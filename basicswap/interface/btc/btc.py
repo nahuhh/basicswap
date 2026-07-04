@@ -494,7 +494,11 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                 self._backend.getBlockHeight()
                 return
             raise ValueError(f"No electrum backend available for {self.coin_name()}")
-        self.rpc_wallet("getwalletinfo" if with_wallet else "getblockchaininfo")
+        # Use a longer timeout than the default: at startup the daemon can be slow
+        # to answer while it loads/rescans the wallet.
+        self.rpc_wallet(
+            "getwalletinfo" if with_wallet else "getblockchaininfo", timeout=30
+        )
 
     def getDaemonVersion(self):
         if self._core_version is None:
