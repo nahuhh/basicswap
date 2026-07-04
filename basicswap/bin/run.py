@@ -465,48 +465,9 @@ def runClient(
 
                 if v["manage_wallet_daemon"] is True:
                     swap_client.log.info(f"Starting {display_name} wallet daemon")
-                    daemon_addr = "{}:{}".format(v["rpchost"], v["rpcport"])
-                    trusted_daemon: bool = swap_client.getXMRTrustedDaemon(
-                        coin_id, v["rpchost"]
-                    )
-                    wallet_opts = [
-                        "--trusted-daemon" if trusted_daemon else "--untrusted-daemon",
-                        "--daemon-address",
-                        daemon_addr,
-                    ]
-                    daemon_rpcuser = v.get("rpcuser", "")
-                    daemon_rpcpass = v.get("rpcpassword", "")
-                    if daemon_rpcuser != "":
-                        wallet_opts += [
-                            "--daemon-login",
-                            daemon_rpcuser + ":" + daemon_rpcpass,
-                        ]
-
-                    proxy_log_str = ""
-                    proxy_host, proxy_port = swap_client.getXMRWalletProxy(
-                        coin_id, v["rpchost"]
-                    )
-                    if proxy_host:
-                        proxy_log_str = " through proxy"
-                        wallet_opts += [
-                            "--proxy",
-                            f"{proxy_host}:{proxy_port}",
-                            "--daemon-ssl-allow-any-cert",
-                        ]
-
-                    swap_client.log.info(
-                        "daemon-address: {} ({}){}".format(
-                            daemon_addr,
-                            "trusted" if trusted_daemon else "untrusted",
-                            proxy_log_str,
-                        )
-                    )
-
                     filename: str = getWalletBinName(coin_id, v, c + "-wallet-rpc")
                     daemons.append(
-                        startXmrWalletDaemon(
-                            v["datadir"], v["bindir"], filename, wallet_opts
-                        )
+                        startXmrWalletDaemon(v["datadir"], v["bindir"], filename)
                     )
                     pid = daemons[-1].handle.pid
                     swap_client.log.info(f"Started {filename} {pid}")
