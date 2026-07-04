@@ -163,16 +163,39 @@ def test_settings(driver):
         btn_apply_chart.click()
         time.sleep(1)
 
-    # Apply XMR settings with blank nodes list
+    # Drive the interactive Monero daemon node list
     try:
-        driver.find_element(By.ID, "coins-tab").click()
-        time.sleep(1)
 
+        def open_coins_tab():
+            driver.find_element(By.ID, "coins-tab").click()
+            time.sleep(1)
+
+        def monero_nodes():
+            return driver.find_element(
+                By.CSS_SELECTOR, '.daemon-nodes[data-coin="monero"]'
+            )
+
+        def remove_all_nodes():
+            for btn in monero_nodes().find_elements(
+                By.CSS_SELECTOR, ".daemon-node-remove"
+            ):
+                btn.click()
+
+        def add_node(url):
+            container = monero_nodes()
+            add_input = container.find_element(
+                By.CSS_SELECTOR, ".daemon-node-add-input"
+            )
+            add_input.clear()
+            add_input.send_keys(url)
+            container.find_element(By.CSS_SELECTOR, ".daemon-node-add-btn").click()
+
+        # Apply with an empty node list
+        open_coins_tab()
         btn_apply_monero = wait.until(
             EC.element_to_be_clickable((By.NAME, "apply_monero"))
         )
-        el = driver.find_element(By.NAME, "remotedaemonurls_monero")
-        el.clear()
+        remove_all_nodes()
         btn_apply_monero.click()
         time.sleep(1)
 
@@ -180,12 +203,13 @@ def test_settings(driver):
             settings = json.load(fs)
         assert len(settings["chainclients"]["monero"]["remote_daemon_urls"]) == 0
 
+        # Add two nodes and apply
+        open_coins_tab()
         btn_apply_monero = wait.until(
             EC.element_to_be_clickable((By.NAME, "apply_monero"))
         )
-        el = driver.find_element(By.NAME, "remotedaemonurls_monero")
-        el.clear()
-        el.send_keys("node.xmr.to:18081\nnode1.xmr.to:18082")
+        add_node("node.xmr.to:18081")
+        add_node("node1.xmr.to:18082")
         btn_apply_monero.click()
         time.sleep(1)
 
@@ -193,12 +217,18 @@ def test_settings(driver):
             settings = json.load(fs)
         remotedaemonurls = settings["chainclients"]["monero"]["remote_daemon_urls"]
         assert len(remotedaemonurls) == 2
+        assert {n["url"] for n in remotedaemonurls} == {
+            "node.xmr.to:18081",
+            "node1.xmr.to:18082",
+        }
+        assert all(n["failover"] is True for n in remotedaemonurls)
 
+        # Remove all nodes and apply
+        open_coins_tab()
         btn_apply_monero = wait.until(
             EC.element_to_be_clickable((By.NAME, "apply_monero"))
         )
-        el = driver.find_element(By.NAME, "remotedaemonurls_monero")
-        el.clear()
+        remove_all_nodes()
         btn_apply_monero.click()
         time.sleep(1)
 
