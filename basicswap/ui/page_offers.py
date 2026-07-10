@@ -837,6 +837,8 @@ def page_offer(self, url_split: List[str], post_string: str) -> bytes:
 
     extend_data = {
         "nb_validmins": 10,
+        "nb_destination_address": "",
+        "nb_destination_address_locked": False,
     }
     messages = []
     err_messages = []
@@ -850,7 +852,24 @@ def page_offer(self, url_split: List[str], post_string: str) -> bytes:
     ci_from = swap_client.ci(Coins(offer.coin_from))
     ci_to = swap_client.ci(Coins(offer.coin_to))
 
+    # Prefill from the per-coin destination address when set and scoped to bids; the
+    # field is then locked read-only so it can't be changed on the form.
+    configured_destination_address = swap_client.getCustomDestinationAddress(
+        ci_from, for_role="bids"
+    )
+    if configured_destination_address:
+        extend_data["nb_destination_address"] = configured_destination_address
+        extend_data["nb_destination_address_locked"] = True
+
     reverse_bid: bool = True if offer.bid_reversed else False
+
+    # The ADS lock spend pays getScriptForPubkeyHash, which accepts fewer address
+    # types than the getDestForAddress used everywhere else.
+    destination_mode = (
+        "dest_af"
+        if offer.swap_type == SwapTypes.XMR_SWAP and not reverse_bid
+        else "redeem"
+    )
 
     debugind = -1
     bid_amount = ci_from.format_amount(offer.amount_from)
@@ -928,6 +947,14 @@ def page_offer(self, url_split: List[str], post_string: str) -> bytes:
                 if have_data_entry(form_data, "bypass_fee_checks"):
                     extra_options["bypass_fee_validation"] = True
 
+                if have_data_entry(form_data, "destination_address"):
+                    destination_address = get_data_entry(
+                        form_data, "destination_address"
+                    ).strip()
+                    extend_data["nb_destination_address"] = destination_address
+                    if destination_address != "":
+                        extra_options["destination_address"] = destination_address
+
                 sent_bid_id = swap_client.postBid(
                     offer_id,
                     amount_from,
@@ -961,6 +988,8 @@ def page_offer(self, url_split: List[str], post_string: str) -> bytes:
         "state": strOfferState(offer.state),
         "coin_from": ci_from.coin_name(),
         "coin_to": ci_to.coin_name(),
+        "destination_coin_id": int(ci_from.interface_type()),
+        "destination_mode": destination_mode,
         "coin_from_ind": int(ci_from.coin_type()),
         "coin_to_ind": int(ci_to.coin_type()),
         "coin_from_exp": ci_from.exp(),

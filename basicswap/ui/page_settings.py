@@ -253,6 +253,20 @@ def page_settings(self, url_split, post_string):
                             except ValueError:
                                 pass
 
+                    data["destination_address"] = get_data_entry_or(
+                        form_data, "destination_address_" + name, ""
+                    ).strip()
+                    if have_data_entry(
+                        form_data, "destination_address_stealth_" + name
+                    ):
+                        data["destination_address_stealth"] = get_data_entry_or(
+                            form_data, "destination_address_stealth_" + name, ""
+                        ).strip()
+                    if have_data_entry(form_data, "destination_address_scope_" + name):
+                        data["destination_address_scope"] = get_data_entry_or(
+                            form_data, "destination_address_scope_" + name, "both"
+                        )
+
                     settings_changed, suggest_reboot, migration_message = (
                         swap_client.editSettings(name, data)
                     )
@@ -318,6 +332,15 @@ def page_settings(self, url_split, post_string):
         except Exception:
             display_name = name
 
+        # Blank when inactive, disabling the advisory validation on the field.
+        try:
+            coin_id = swap_client.getCoinIdFromName(name)
+            destination_coin_id = (
+                int(coin_id) if swap_client.isCoinActive(coin_id) else ""
+            )
+        except Exception:
+            destination_coin_id = ""
+
         clearnet_servers = c.get("electrum_clearnet_servers", None)
         onion_servers = c.get("electrum_onion_servers", None)
 
@@ -348,6 +371,14 @@ def page_settings(self, url_split, post_string):
                 "clearnet_servers_text": clearnet_text,
                 "onion_servers_text": onion_text,
                 "address_gap_limit": c.get("address_gap_limit", 50),
+                "destination_address": c.get("destination_address", ""),
+                "destination_address_stealth": c.get("destination_address_stealth", ""),
+                "destination_address_scope": c.get("destination_address_scope", "both"),
+                "destination_coin_id": destination_coin_id,
+                "supports_stealth": name == "particl",
+                "stealth_coin_id": (
+                    int(Coins.PART_ANON) if destination_coin_id != "" else ""
+                ),
             }
         )
         if name in ("monero", "wownero"):

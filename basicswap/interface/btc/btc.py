@@ -4906,6 +4906,12 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
             return {"txid": txid_hex, "amount": 0, "height": rv["blockheight"]}
         return None
 
+    def canConfirmExternalTxn(self) -> bool:
+        return self._connection_type == "electrum"
+
+    def findTxnByHashInChain(self, txid_hex: str):
+        return self._findConfirmedTxnByHashElectrum(txid_hex)
+
     def _findConfirmedTxnByHashElectrum(self, txid_hex: str):
         backend = self.getBackend()
         if not backend:

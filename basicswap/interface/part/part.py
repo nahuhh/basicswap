@@ -29,6 +29,7 @@ from basicswap.util.script import (
     getWitnessElementLen,
 )
 from basicswap.util.address import (
+    decodeAddress,
     encodeStealthAddress,
 )
 from basicswap.interface.btc.btc import (
@@ -187,6 +188,16 @@ class PARTInterface(BTCInterface):
         prefix_byte = chainparams[self.coin_type()][self._network]["stealth_key_prefix"]
 
         return encodeStealthAddress(prefix_byte, scan_pubkey, spend_pubkey)
+
+    def isStealthAddress(self, address: str) -> bool:
+        try:
+            addr_data = decodeAddress(address)
+            prefix_byte = chainparams[self.coin_type()][self._network][
+                "stealth_key_prefix"
+            ]
+            return addr_data is not None and addr_data[0] == prefix_byte
+        except Exception as e:  # noqa: F841
+            return False
 
     def getWitnessStackSerialisedLength(self, witness_stack) -> int:
         length: int = 0

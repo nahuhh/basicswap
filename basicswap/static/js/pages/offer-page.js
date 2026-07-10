@@ -1,6 +1,9 @@
 (function() {
   'use strict';
 
+  // Shared validator (basicswap/static/js/modules/address-validation.js).
+  const AddressValidation = window.AddressValidation;
+
   const OfferPage = {
     xhr_rates: null,
     xhr_bid_params: null,
@@ -14,6 +17,19 @@
       this.setupXHRHandlers();
       this.setupEventListeners();
       this.handleBidsPageAddress();
+      this.setupDestinationValidation();
+    },
+
+    destinationAddressValid: function() {
+      // Unknown (null) does not block; the server rejects a bad address anyway.
+      return !this.destinationValid || this.destinationValid() !== false;
+    },
+
+    setupDestinationValidation: function() {
+      const input = document.getElementById('destination_address');
+      const feedback = document.getElementById('destination_address_feedback');
+      if (!input || !AddressValidation) return;
+      this.destinationValid = AddressValidation.attach(input, feedback, 'mt-1 text-xs');
     },
 
     setupXHRHandlers: function() {
@@ -326,6 +342,10 @@
         this.showErrorModal('Validation Error', 'Please enter valid amounts for both sending and receiving.');
         return false;
       }
+      if (!this.destinationAddressValid()) {
+        this.showErrorModal('Validation Error', 'The destination address is not a valid address for this coin.');
+        return false;
+      }
       let subfee = false;
       const checkbox = document.getElementById('subfee_bid');
       if (checkbox) {
@@ -434,6 +454,9 @@
     cleanup: function() {
     }
   };
+
+  // Skip DOM wiring when loaded outside a browser (node-based unit tests).
+  if (typeof document === 'undefined' || typeof window === 'undefined') return;
 
   document.addEventListener('DOMContentLoaded', function() {
     OfferPage.init();
