@@ -29,10 +29,11 @@ from basicswap.basicswap import (
     SwapTypes,
 )
 from basicswap.base import BaseApp
+from basicswap.chainparams import chainparams
 from basicswap.contrib.mnemonic import Mnemonic
 from basicswap.db import create_db_, DBMethods, KnownIdentity
 from basicswap.util import h2b
-from basicswap.util.address import decodeAddress, toWIF
+from basicswap.util.address import decodeAddress, encodeAddress, toWIF
 from basicswap.util.crypto import ripemd160, hash160, blake256
 from basicswap.util.extkey import ExtKeyPair
 from basicswap.util.integer import encode_varint, decode_varint
@@ -50,6 +51,8 @@ from basicswap.util_xmr import (
 )
 from basicswap.interface.btc.btc import BTCInterface
 from basicswap.util.logging import BSXLogger
+from basicswap.interface.dcr.dcr import DCRInterface
+from basicswap.interface.part.part import PARTInterface
 from basicswap.interface.xmr.xmr import XMRInterface
 from tests.basicswap.util.mnemonics import mnemonics
 from tests.basicswap.util.common import (
@@ -1660,6 +1663,251 @@ class Test(unittest.TestCase):
         host = "https://127.0.0.1"
         url = Jsonrpc.constructUrl(auth, host, port, "new_wallet")
         assert url == "https://user:p%40ss@127.0.0.1:1234/wallet/new_wallet"
+
+    def test_interfaces_have_isValidAddress(self):
+        # postXmrBid, postBid and editSettings validate user supplied addresses
+        # with ci.isValidAddress. DCRInterface does not derive from BTCInterface,
+        # and CoinInterface has no permissive default, so it must define its own.
+        for cls in (BTCInterface, XMRInterface, DCRInterface):
+            assert callable(getattr(cls, "isValidAddress", None))
+
+    def test_isValidSwapDestAddress(self):
+        # createSCLockSpendTx pays getScriptForPubkeyHash(dest_af), discarding the
+        # address type, so only an address whose own output script matches is safe.
+        class FakeBTC(BTCInterface):
+            def __init__(self):
+                self._network = "mainnet"
+
+            @staticmethod
+            def coin_type():
+                return Coins.BTC
+
+        class FakePART(PARTInterface):
+            def __init__(self):
+                self._network = "mainnet"
+
+            @staticmethod
+            def coin_type():
+                return Coins.PART
+
+        check = BasicSwap.isValidSwapDestAddress
+
+        # BTC redeems to p2wpkh.
+        ci = FakeBTC()
+        assert check(None, ci, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4") is True
+        assert check(None, ci, "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2") is False
+        assert check(None, ci, "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy") is False
+        assert check(None, ci, "not_an_address") is False
+
+        # Particl redeems to p2pkh, so the accepted type is the other way around.
+        ci = FakePART()
+        assert check(None, ci, "PZdYWHgyhuG7NHVCzEkkx3dcLKurTpvmo6") is True
+        assert check(None, ci, "pw1qw508d6qejxtdg4y5r3zarvary0c5xw7k8txr0n") is False
+
+    def test_part_isStealthAddress(self):
+        # An anon/blind redeem pays a stealth address; a plain address must not
+        # pass as a swap destination for PART_ANON.
+        class FakePART(PARTInterface):
+            def __init__(self):
+                self._network = "regtest"
+
+            @staticmethod
+            def coin_type():
+                return Coins.PART
+
+        ci = FakePART()
+        stealth = "TetXU1bNXEn4obs3iaDt5uup4gXz1XCwgButPoDZFcxkv7nD6S6o6vkqDNDQMmGz2MC9BMy4r3QrRKSb4RgzKQi2HSG1rYuBXSYc8A"
+        # Checksum-valid plain address: rejected on its prefix, not its checksum.
+        plain = encodeAddress(
+            bytes((chainparams[Coins.PART]["regtest"]["pubkey_address"],)) + bytes(20)
+        )
+        assert decodeAddress(plain) is not None
+        assert ci.isStealthAddress(stealth) is True
+        assert ci.isStealthAddress(plain) is False
+        assert ci.isStealthAddress("not_an_address") is False
+
+    @staticmethod
+    def _part_addresses():
+        stealth = "TetXU1bNXEn4obs3iaDt5uup4gXz1XCwgButPoDZFcxkv7nD6S6o6vkqDNDQMmGz2MC9BMy4r3QrRKSb4RgzKQi2HSG1rYuBXSYc8A"
+        plain = encodeAddress(
+            bytes((chainparams[Coins.PART]["regtest"]["pubkey_address"],)) + bytes(20)
+        )
+        return plain, stealth
+
+    @staticmethod
+    def _fake_part_ci(interface_type):
+        ci = PARTInterface.__new__(PARTInterface)
+        ci._network = "regtest"
+        ci.coin_type = staticmethod(lambda: Coins.PART)
+        ci.interface_type = lambda: interface_type
+        return ci
+
+    @staticmethod
+    def _fake_xmr_ci(coin):
+        ci = XMRInterface.__new__(XMRInterface)
+        ci._log = logger
+        cp = chainparams[coin]["mainnet"]
+        ci._addr_prefix = cp["address_prefix"]
+        ci._subaddr_prefix = cp["subaddress_prefix"]
+        ci.interface_type = lambda: coin
+        ci.coin_name = lambda: coin.name
+        ci.ticker = lambda: coin.name
+        return ci
+
+    def test_checkDestinationAddress_monero(self):
+        # The offer form and settings page validate through this, so a rejection
+        # here is a rejection in the browser.
+        xmr_main = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
+        xmr_sub = "84zPbCjb38gBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGMwZRBo"
+        xmr_integrated = "4EhD2RyFToP2pvWUuqdETP3Whp9imF6fCWbp1pcWppFdhY5D8SaF4Tj2pvWUuqdETP3Whp9imF6fCWbp1pcWppFdUMetxoU"
+        wow_main = "Wo3eC2Gbq3sFG48UgzBQ6nKZsS61Frm3uF4QYWdnSbQZ4y5Vv8B2NBTMyGDzpURYXJebpJM3UQ12niCet8pUJVcZ1X9L33Qzr"
+        wow_sub = "WW2mSErfMBKFG48UgzBQ6nKZsS61Frm3uF4QYWdnSbQZ4y5Vv8B2NBTMyGDzpURYXJebpJM3UQ12niCet8pUJVcZ1X9NRR7uz"
+
+        class FakeSC:
+            log = logger
+
+        fake = FakeSC()
+        check = BasicSwap.checkDestinationAddress
+
+        # Wownero's 2-byte prefix varint gives a 70 byte payload against Monero's 69.
+        for coin, accepted, rejected in (
+            (Coins.XMR, (xmr_main, xmr_sub), (wow_main, wow_sub, xmr_integrated)),
+            (Coins.WOW, (wow_main, wow_sub), (xmr_main, xmr_sub, "notanaddress")),
+        ):
+            ci = self._fake_xmr_ci(coin)
+            for address in accepted:
+                assert check(fake, ci, address) is None, f"{coin.name} {address}"
+            for address in rejected:
+                assert check(fake, ci, address) is not None, f"{coin.name} {address}"
+
+    def test_getCustomDestinationAddress_stealth(self):
+        # coin_clients[PART_ANON] and [PART_BLIND] are the same dict as coin_clients[PART],
+        # so plain and anon/blind destinations live under separate keys.
+        plain, stealth = self._part_addresses()
+
+        class FakeSC:
+            log = logger
+
+        fake = FakeSC()
+        get = BasicSwap.getCustomDestinationAddress
+
+        fake.coin_clients = {
+            Coins.PART: {
+                "destination_address": plain,
+                "destination_address_stealth": stealth,
+            }
+        }
+        for interface_type, expected in (
+            (Coins.PART, plain),
+            (Coins.PART_ANON, stealth),
+            (Coins.PART_BLIND, stealth),
+        ):
+            ci = self._fake_part_ci(interface_type)
+            assert get(fake, ci) == expected, interface_type.name
+
+        # A wrong address type under either key is ignored, not paid to.
+        for interface_type, settings in (
+            (Coins.PART, {"destination_address": stealth}),
+            (Coins.PART_ANON, {"destination_address_stealth": plain}),
+            (Coins.PART_BLIND, {"destination_address_stealth": plain}),
+            (Coins.PART_ANON, {"destination_address": stealth}),
+        ):
+            fake.coin_clients = {Coins.PART: settings}
+            ci = self._fake_part_ci(interface_type)
+            assert get(fake, ci) is None, interface_type.name
+
+    def test_checkDestinationAddress(self):
+        plain, stealth = self._part_addresses()
+
+        class FakeSC:
+            log = logger
+            isValidSwapDestAddress = BasicSwap.isValidSwapDestAddress
+
+        fake = FakeSC()
+        check = BasicSwap.checkDestinationAddress
+
+        def ci_for(interface_type):
+            ci = self._fake_part_ci(interface_type)
+            ci.isValidAddress = lambda addr: True
+            ci.ticker = lambda: "PART"
+            ci.coin_name = lambda: interface_type.name
+            return ci
+
+        assert check(fake, ci_for(Coins.PART), plain) is None
+        assert check(fake, ci_for(Coins.PART), stealth) is not None
+        assert check(fake, ci_for(Coins.PART_ANON), stealth) is None
+        assert check(fake, ci_for(Coins.PART_ANON), plain) is not None
+        assert check(fake, ci_for(Coins.PART_BLIND), stealth) is None
+        assert check(fake, ci_for(Coins.PART_BLIND), stealth, "dest_af") is not None
+        assert check(fake, ci_for(Coins.PART), "") is not None
+        assert check(fake, ci_for(Coins.PART), plain, "bogus") is not None
+
+    def test_isValidSwapDestAddress_rejects_stealth(self):
+        # Both sides of the round-trip build the same oversized script from a
+        # stealth address, so the comparison alone would accept it.
+        plain, stealth = self._part_addresses()
+        ci = self._fake_part_ci(Coins.PART)
+        check = BasicSwap.isValidSwapDestAddress
+        assert check(None, ci, plain) is True
+        assert check(None, ci, stealth) is False
+
+    def test_getExternalBLockRedeemAddress_prefers_persisted(self):
+        # Clearing the setting mid-swap must not send checkXmrBidState to the wallet branch.
+        class FakeBid:
+            withdraw_to_addr = None
+
+        class FakeSwap:
+            dest_bl = None
+
+        class FakeSC:
+            log = logger
+            coin_clients = {Coins.PART: {}}
+            getCustomDestinationAddress = BasicSwap.getCustomDestinationAddress
+
+        fake = FakeSC()
+        ci = self._fake_part_ci(Coins.PART)
+        get = BasicSwap.getExternalBLockRedeemAddress
+        bid, swap = FakeBid(), FakeSwap()
+
+        # No destination anywhere -> wallet branch.
+        assert get(fake, ci, bid, swap, False, None) is None
+
+        # Configured per-coin address, then cleared mid-swap.
+        plain, _ = self._part_addresses()
+        fake.coin_clients = {Coins.PART: {"destination_address": plain}}
+        assert get(fake, ci, bid, swap, False, None) == plain
+        bid.withdraw_to_addr = plain  # recorded by redeemXmrBidCoinBLockTx
+        fake.coin_clients = {Coins.PART: {}}  # operator clears the setting
+        assert get(fake, ci, bid, swap, False, None) == plain
+
+        # dest_bl (per-bid, persisted) still wins over the per-coin setting.
+        bid.withdraw_to_addr = None
+        swap.dest_bl = "dest-bl-address"
+        fake.coin_clients = {Coins.PART: {"destination_address": plain}}
+        assert get(fake, ci, bid, swap, False, None) == "dest-bl-address"
+
+    def test_destination_field_escaped(self):
+        # The reflected destination_address field must be HTML-escaped: the Jinja
+        # env in http_server.py is created without autoescape, so the template must
+        # apply | e to avoid reflected XSS.
+        import basicswap
+        from jinja2 import Environment
+
+        env = Environment()  # autoescape defaults to False, like http_server
+        tmpl = env.from_string('value="{{ data.nb_destination_address | e }}"')
+        out = tmpl.render(
+            data={"nb_destination_address": '"><script>alert(1)</script>'}
+        )
+        assert "<script>" not in out
+        assert "&lt;script&gt;" in out
+
+        offer_html = os.path.join(
+            os.path.dirname(basicswap.__file__), "templates", "offer.html"
+        )
+        with open(offer_html, "r") as fp:
+            src = fp.read()
+        assert "{{ data.nb_destination_address | e }}" in src
+        assert "{{ data.nb_destination_address }}" not in src
 
 
 if __name__ == "__main__":
