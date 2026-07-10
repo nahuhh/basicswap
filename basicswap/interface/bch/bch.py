@@ -197,6 +197,13 @@ class BCHInterface(BTCInterface):
         # Return P2PKH
         return CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
 
+    def getDestForAddress(self, address: str) -> bytes:
+        addr = Address.from_string(address)
+        payload = bytes(addr.payload)
+        if addr.version.startswith("P2PKH"):
+            return CScript([OP_DUP, OP_HASH160, payload, OP_EQUALVERIFY, OP_CHECKSIG])
+        return CScript([OP_HASH160, payload, OP_EQUAL])
+
     def encodeScriptDest(self, script_dest: bytes) -> str:
         # Extract hash from script
         script_hash = script_dest[2:-1]

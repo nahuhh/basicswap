@@ -47,6 +47,8 @@ from basicswap.util_xmr import (
     encode_address as xmr_encode_address,
 )
 from basicswap.interface.btc.btc import BTCInterface
+from basicswap.interface.dcr.dcr import DCRInterface
+from basicswap.interface.part.part import PARTInterface
 from basicswap.interface.xmr.xmr import XMRInterface
 from tests.basicswap.mnemonics import mnemonics
 from tests.basicswap.util import REQUIRED_SETTINGS
@@ -988,6 +990,69 @@ class Test(unittest.TestCase):
         host = "https://127.0.0.1"
         url = Jsonrpc.constructUrl(auth, host, port, "new_wallet")
         assert url == "https://user:p%40ss@127.0.0.1:1234/wallet/new_wallet"
+
+    def test_interfaces_have_isValidAddress(self):
+        # postXmrBid, postBid and editSettings validate user supplied addresses
+        # with ci.isValidAddress. DCRInterface does not derive from BTCInterface,
+        # and CoinInterface has no permissive default, so it must define its own.
+        for cls in (BTCInterface, XMRInterface, DCRInterface):
+            assert callable(getattr(cls, "isValidAddress", None))
+
+    def test_isValidSwapDestAddress(self):
+        # createSCLockSpendTx pays getScriptForPubkeyHash(dest_af), discarding the
+        # address type, so only an address whose own output script matches is safe.
+        class FakeBTC(BTCInterface):
+            def __init__(self):
+                self._network = "mainnet"
+
+            @staticmethod
+            def coin_type():
+                return Coins.BTC
+
+        class FakePART(PARTInterface):
+            def __init__(self):
+                self._network = "mainnet"
+
+            @staticmethod
+            def coin_type():
+                return Coins.PART
+
+        check = BasicSwap.isValidSwapDestAddress
+
+        # BTC redeems to p2wpkh.
+        ci = FakeBTC()
+        assert check(None, ci, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4") is True
+        assert check(None, ci, "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2") is False
+        assert check(None, ci, "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy") is False
+        assert check(None, ci, "not_an_address") is False
+
+        # Particl redeems to p2pkh, so the accepted type is the other way around.
+        ci = FakePART()
+        assert check(None, ci, "PZdYWHgyhuG7NHVCzEkkx3dcLKurTpvmo6") is True
+        assert check(None, ci, "pw1qw508d6qejxtdg4y5r3zarvary0c5xw7k8txr0n") is False
+
+    def test_destination_field_escaped(self):
+        # The reflected destination_address field must be HTML-escaped: the Jinja
+        # env in http_server.py is created without autoescape, so the template must
+        # apply | e to avoid reflected XSS.
+        import basicswap
+        from jinja2 import Environment
+
+        env = Environment()  # autoescape defaults to False, like http_server
+        tmpl = env.from_string('value="{{ data.nb_destination_address | e }}"')
+        out = tmpl.render(
+            data={"nb_destination_address": '"><script>alert(1)</script>'}
+        )
+        assert "<script>" not in out
+        assert "&lt;script&gt;" in out
+
+        offer_html = os.path.join(
+            os.path.dirname(basicswap.__file__), "templates", "offer.html"
+        )
+        with open(offer_html, "r") as fp:
+            src = fp.read()
+        assert "{{ data.nb_destination_address | e }}" in src
+        assert "{{ data.nb_destination_address }}" not in src
 
 
 if __name__ == "__main__":

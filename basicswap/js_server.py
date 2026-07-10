@@ -714,17 +714,14 @@ def js_bids(self, url_split, post_string: str, is_json: bool) -> bytes:
                     get_data_entry(post_data, "bypass_fee_checks")
                 )
             if have_data_entry(post_data, "destination_address"):
-                if reverse_bid:
-                    extra_options["dest_bl"] = get_data_entry(
-                        post_data, "destination_address"
-                    )
-                else:
-                    extra_options["dest_af"] = ci_from.decodeAddress(
-                        get_data_entry(post_data, "destination_address")
-                    )
+                extra_options["destination_address"] = get_data_entry(
+                    post_data, "destination_address"
+                )
             if have_data_entry(post_data, "destination_script"):
                 if reverse_bid:
-                    raise ValueError("TODO")
+                    raise ValueError(
+                        "destination_script is not supported for reversed bids, use destination_address"
+                    )
                 extra_options["dest_af"] = bytes.fromhex(
                     get_data_entry(post_data, "destination_script")
                 )

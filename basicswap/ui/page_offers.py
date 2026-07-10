@@ -11,6 +11,7 @@ import time
 from typing import List
 from urllib import parse
 from .util import (
+    getAddressValidationParams,
     getCoinType,
     get_data_entry,
     get_data_entry_or,
@@ -828,6 +829,8 @@ def page_offer(self, url_split: List[str], post_string: str) -> bytes:
 
     extend_data = {
         "nb_validmins": 10,
+        "nb_destination_address": "",
+        "nb_destination_address_locked": False,
     }
     messages = []
     err_messages = []
@@ -841,7 +844,24 @@ def page_offer(self, url_split: List[str], post_string: str) -> bytes:
     ci_from = swap_client.ci(Coins(offer.coin_from))
     ci_to = swap_client.ci(Coins(offer.coin_to))
 
+    # Prefill from the per-coin destination address when set and scoped to bids; the
+    # field is then locked read-only so it can't be changed on the form.
+    coin_from_settings = swap_client.coin_clients[ci_from.coin_type()]
+    configured_destination_address = coin_from_settings.get("destination_address", "")
+    destination_address_scope = coin_from_settings.get(
+        "destination_address_scope", "both"
+    )
+    if configured_destination_address and destination_address_scope in ("bids", "both"):
+        extend_data["nb_destination_address"] = configured_destination_address
+        extend_data["nb_destination_address_locked"] = True
+
     reverse_bid: bool = True if offer.bid_reversed else False
+
+    # Scripted swaps redeem with getDestForAddress, so any address type is payable.
+    if offer.swap_type != SwapTypes.XMR_SWAP:
+        destination_validation_mode = "any"
+    else:
+        destination_validation_mode = "dest_bl" if reverse_bid else "dest_af"
 
     debugind = -1
     bid_amount = ci_from.format_amount(offer.amount_from)
@@ -914,6 +934,14 @@ def page_offer(self, url_split: List[str], post_string: str) -> bytes:
                 if have_data_entry(form_data, "bypass_fee_checks"):
                     extra_options["bypass_fee_validation"] = True
 
+                if have_data_entry(form_data, "destination_address"):
+                    destination_address = get_data_entry(
+                        form_data, "destination_address"
+                    ).strip()
+                    extend_data["nb_destination_address"] = destination_address
+                    if destination_address != "":
+                        extra_options["destination_address"] = destination_address
+
                 sent_bid_id = swap_client.postBid(
                     offer_id,
                     amount_from,
@@ -947,6 +975,9 @@ def page_offer(self, url_split: List[str], post_string: str) -> bytes:
         "state": strOfferState(offer.state),
         "coin_from": ci_from.coin_name(),
         "coin_to": ci_to.coin_name(),
+        "destination_validation": getAddressValidationParams(
+            ci_from, destination_validation_mode
+        ),
         "coin_from_ind": int(ci_from.coin_type()),
         "coin_to_ind": int(ci_to.coin_type()),
         "coin_from_exp": ci_from.exp(),

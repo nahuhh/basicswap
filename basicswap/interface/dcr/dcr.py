@@ -333,6 +333,13 @@ class DCRInterface(FeeValidator, Secp256k1Interface):
     def decodeAddress(self, address: str) -> bytes:
         return self.decode_address(address)[2:]
 
+    def isValidAddress(self, address: str) -> bool:
+        try:
+            return self.decode_address(address) is not None
+        except Exception as e:  # noqa: F841
+            self._log.debug(f"Invalid {self.ticker()} address: {address}")
+        return False
+
     def testDaemonRPC(self, with_wallet=True) -> None:
         if with_wallet:
             self.rpc_wallet("walletislocked")

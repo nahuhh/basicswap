@@ -7,6 +7,7 @@
 import html
 
 from .util import (
+    getAddressValidationParams,
     getCoinName,
     get_data_entry,
     have_data_entry,
@@ -201,6 +202,14 @@ def page_settings(self, url_split, post_string):
                             except ValueError:
                                 pass
 
+                    data["destination_address"] = get_data_entry_or(
+                        form_data, "destination_address_" + name, ""
+                    ).strip()
+                    if have_data_entry(form_data, "destination_address_scope_" + name):
+                        data["destination_address_scope"] = get_data_entry_or(
+                            form_data, "destination_address_scope_" + name, "both"
+                        )
+
                     settings_changed, suggest_reboot, migration_message = (
                         swap_client.editSettings(name, data)
                     )
@@ -266,6 +275,13 @@ def page_settings(self, url_split, post_string):
         except Exception:
             display_name = name
 
+        try:
+            destination_validation = getAddressValidationParams(
+                swap_client.ci(swap_client.getCoinIdFromName(name))
+            )
+        except Exception:
+            destination_validation = "{}"
+
         clearnet_servers = c.get("electrum_clearnet_servers", None)
         onion_servers = c.get("electrum_onion_servers", None)
 
@@ -296,6 +312,9 @@ def page_settings(self, url_split, post_string):
                 "clearnet_servers_text": clearnet_text,
                 "onion_servers_text": onion_text,
                 "address_gap_limit": c.get("address_gap_limit", 50),
+                "destination_address": c.get("destination_address", ""),
+                "destination_address_scope": c.get("destination_address_scope", "both"),
+                "destination_validation": destination_validation,
             }
         )
         if name in ("monero", "wownero"):
