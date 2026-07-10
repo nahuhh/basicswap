@@ -16,6 +16,16 @@
       this.setupNotificationSettings();
       this.setupMigrationIndicator();
       this.setupServerDiscovery();
+      this.setupDestinationValidation();
+    },
+
+    setupDestinationValidation: function() {
+      const AddressValidation = window.AddressValidation;
+      if (!AddressValidation) return;
+      document.querySelectorAll('.destination-address-input').forEach((input) => {
+        const feedback = input.parentNode.querySelector('.destination-address-feedback');
+        AddressValidation.attach(input, feedback, 'destination-address-feedback mt-1 text-xs');
+      });
     },
 
     setupTabs: function() {
