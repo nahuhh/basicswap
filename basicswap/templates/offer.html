@@ -445,6 +445,26 @@
     </div>
   </td>
 </tr>
+<tr class="opacity-100 text-gray-500 dark:text-gray-100 hover:bg-coolGray-200 dark:hover:bg-gray-600">
+  <td class="py-3 px-6 bold">Destination Address ({{ data.tla_from }})</td>
+  <td class="py-3 px-6">
+    <div class="w-full md:flex-1">
+      <input type="text"
+             class="bg-gray-50 text-gray-900 appearance-none dark:bg-gray-500 dark:text-white border border-gray-300 dark:border-gray-400 dark:text-gray-50 dark:placeholder-gray-50 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-0{% if data.nb_destination_address_locked %} cursor-not-allowed opacity-70{% endif %}"
+             id="destination_address"
+             name="destination_address"
+             autocomplete="off"
+             spellcheck="false"
+             data-validation="{{ data.destination_validation | e }}"
+             placeholder="Optional: external address to receive {{ data.tla_from }} (blank = this wallet)"
+             value="{{ data.nb_destination_address | e }}"{% if data.nb_destination_address_locked %} readonly{% endif %}>
+      <p id="destination_address_feedback" class="mt-1 text-xs hidden"></p>
+      {% if data.nb_destination_address_locked %}
+      <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Set in <a href="/settings" class="text-blue-500 hover:underline">Settings</a> for {{ data.coin_from }}; clear it there to use a per-bid address.</p>
+      {% endif %}
+    </div>
+  </td>
+</tr>
 <!-- Address handling functionality moved to external JS -->
 {% if data.amount_negotiable == true %}
 <tr class="opacity-100 text-gray-500 dark:text-gray-100 hover:bg-coolGray-200 dark:hover:bg-gray-600">
@@ -722,6 +742,7 @@
   </div>
 </div>
 
+<script src="/static/js/modules/address-validation.js"></script>
 <script src="/static/js/pages/offer-page.js"></script>
 
 {% else %}

@@ -77,6 +77,12 @@ class CoinInterface:
             return coin_chainparams["display_name"]
         return coin_chainparams["name"].capitalize()
 
+    def canConfirmExternalTxn(self) -> bool:
+        return False
+
+    def findTxnByHashInChain(self, txid: str):
+        raise NotImplementedError()
+
     def ticker(self) -> str:
         ticker = chainparams[self.coin_type()]["ticker"]
         if self._network == "testnet":

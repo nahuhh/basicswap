@@ -903,6 +903,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             "electrum_host",
             "electrum_port",
             "electrum_ssl",
+            "destination_address",
+            "destination_address_scope",
         ):
             if setting_name in chain_client_settings:
                 self.coin_clients[coin][setting_name] = chain_client_settings[
@@ -4056,6 +4058,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             return True
         return False
 
+    def isValidSwapDestAddress(self, ci, address: str) -> bool:
+        # The redeem pays getScriptForPubkeyHash(dest_af), discarding the address
+        # type. An address whose own output script differs (p2sh, or legacy p2pkh
+        # on a segwit coin) would be paid to a script the recipient cannot spend.
+        try:
+            return ci.getDestForAddress(address) == ci.getScriptForPubkeyHash(
+                ci.decodeAddress(address)
+            )
+        except Exception as e:  # noqa: F841
+            return False
+
     def ensureWalletCanSend(
         self, ci, swap_type, ensure_balance: int, estimated_fee: int, for_offer=True
     ) -> None:
@@ -4976,6 +4989,27 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self.setStringKV(db_key, main_address, cursor)
         return main_address
 
+    def getCustomDestinationAddress(self, ci, for_role=None, cursor=None):
+        # Not validated here, so a transient wallet RPC error can't strand an
+        # in-progress redeem.
+        coin_settings = self.coin_clients[ci.coin_type()]
+        address = coin_settings.get("destination_address", None)
+        if address is None or address == "":
+            return None
+        if for_role is not None:
+            scope = coin_settings.get("destination_address_scope", "both")
+            if scope != "both" and scope != for_role:
+                return None
+        self.log.debug(f"Using custom destination address for {ci.coin_name()}")
+        return address
+
+    def getExternalBLockRedeemAddress(self, ci_to, xmr_swap, reverse_bid, cursor):
+        if xmr_swap.dest_bl is not None and len(xmr_swap.dest_bl):
+            return xmr_swap.dest_bl
+        return self.getCustomDestinationAddress(
+            ci_to, for_role="bids" if reverse_bid else "offers", cursor=cursor
+        )
+
     def checkWalletSeed(self, c) -> bool:
         ci = self.ci(c)
         if c == Coins.PART:
@@ -5632,6 +5666,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 chain_b_height_start=ci_to.getChainHeight(),
                 message_nets=bid_message_nets,
             )
+
+            destination_address = extra_options.get("destination_address", None)
+            if destination_address:
+                # Bidder external address for coin_from; reject bad ones now, not at redeem.
+                ensure(
+                    ci_from.isValidAddress(destination_address),
+                    f"Swap destination must be a valid {ci_from.ticker()} address",
+                )
+                bid.withdraw_to_addr = destination_address
 
             pkhash_buyer_to = ci_to.pkh(contract_pubkey)
             if pkhash_buyer_to != bid.pkhash_buyer:
@@ -6376,6 +6419,28 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             ci_to = self.ci(coin_to)
             reverse_bid: bool = self.is_reverse_ads_bid(coin_from, coin_to)
 
+            destination_address = extra_options.get("destination_address", None)
+            if destination_address:
+                # The bidder receives coin_from: dest_bl for a reverse bid, else dest_af.
+                ensure(
+                    isinstance(destination_address, str),
+                    "Swap destination must be string",
+                )
+                ensure(
+                    ci_from.isValidAddress(destination_address),
+                    f"Swap destination must be a valid {ci_from.ticker()} address",
+                )
+                if not reverse_bid:
+                    ensure(
+                        coin_from != Coins.PART_BLIND,
+                        f"External destination address is not supported for {ci_from.coin_name()}, "
+                        "leave it blank to receive to your wallet.",
+                    )
+                    ensure(
+                        self.isValidSwapDestAddress(ci_from, destination_address),
+                        f"Unsupported destination address type for {ci_from.coin_name()}",
+                    )
+
             self.checkCoinsReady(coin_from, coin_to)
 
             ci_from.validateFeeRate(
@@ -6457,16 +6522,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 xmr_swap = XmrSwap()
                 xmr_swap.contract_count = self.getNewContractId(cursor)
                 self.setMsgSplitInfo(xmr_swap)
-                if "dest_bl" in extra_options:
-                    xmr_swap.dest_bl = extra_options["dest_bl"]
-                    ensure(
-                        isinstance(xmr_swap.dest_bl, str),
-                        "Swap destination must be string",
-                    )
-                    ensure(
-                        ci_from.isValidAddress(xmr_swap.dest_bl),
-                        f"Swap destination must be a valid {ci_from.ticker()} address",
-                    )
+                if destination_address:
+                    xmr_swap.dest_bl = destination_address
                     self.log.info("Using supplied destination")
                     self.log.debug(f"Destination {xmr_swap.dest_bl}")
 
@@ -6545,6 +6602,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 )
                 self.log.info("Using supplied destination")
                 self.log.debug(f"Destination {xmr_swap.dest_af.hex()}")
+            elif destination_address:
+                xmr_swap.dest_af = ci_from.decodeAddress(destination_address)
+                self.log.info("Using supplied destination")
+                self.log.debug(f"Destination {destination_address}")
             else:
                 address_out = self.getReceiveAddressFromPool(
                     coin_from, offer_id, TxTypes.XMR_SWAP_A_LOCK, cursor=cursor
@@ -7478,16 +7539,26 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ensure(amount_out > 0, "Amount out <= 0")
 
         if addr_redeem_out is None:
-            addr_redeem_out = self.getReceiveAddressFromPool(
-                coin_type,
-                bid.bid_id,
-                (
-                    TxTypes.PTX_REDEEM
-                    if for_txn_type == "participate"
-                    else TxTypes.ITX_REDEEM
-                ),
-                cursor,
-            )
+            # Redeem destination: bid-supplied address (ITX redeem only), then a
+            # per-coin configured address, else a new wallet address.
+            if for_txn_type != "participate" and bid.withdraw_to_addr:
+                addr_redeem_out = bid.withdraw_to_addr
+            else:
+                destination_role = "bids" if for_txn_type != "participate" else "offers"
+                addr_redeem_out = self.getCustomDestinationAddress(
+                    ci, for_role=destination_role, cursor=cursor
+                )
+            if addr_redeem_out is None:
+                addr_redeem_out = self.getReceiveAddressFromPool(
+                    coin_type,
+                    bid.bid_id,
+                    (
+                        TxTypes.PTX_REDEEM
+                        if for_txn_type == "participate"
+                        else TxTypes.ITX_REDEEM
+                    ),
+                    cursor,
+                )
         assert addr_redeem_out is not None
 
         self.log.debug(f"addr_redeem_out {addr_redeem_out}")
@@ -8747,7 +8818,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             elif state == BidStates.XMR_SWAP_NOSCRIPT_TX_REDEEMED:
                 txid_hex = bid.xmr_b_lock_tx.spend_txid.hex()
 
-                found_tx = ci_to.findTxnByHash(txid_hex)
+                # An external redeem is invisible to the wallet, look it up on chain.
+                redeem_addr = self.getExternalBLockRedeemAddress(
+                    ci_to, xmr_swap, reverse_bid, cursor
+                )
+                if redeem_addr and not ci_to.isAddressMine(redeem_addr):
+                    found_tx = ci_to.findTxnByHashInChain(txid_hex)
+                else:
+                    found_tx = ci_to.findTxnByHash(txid_hex)
                 if found_tx is not None:
                     self.log.info(
                         f"Found coin b lock spend tx bid {self.log.id(bid_id)}"
@@ -12666,22 +12744,25 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             )
             vkbs = ci_to.sumKeys(kbsl, kbsf)
 
-            if xmr_swap.dest_bl is not None and len(xmr_swap.dest_bl):
-                address_to = xmr_swap.dest_bl
+            address_to = self.getExternalBLockRedeemAddress(
+                ci_to, xmr_swap, reverse_bid, cursor
+            )
+            if address_to is None:
+                if coin_to in self.xmr_based_coins:
+                    address_to = self.getCachedMainWalletAddress(ci_to, cursor)
+                elif coin_to in (Coins.PART_BLIND, Coins.PART_ANON):
+                    address_to = self.getCachedStealthAddressForCoin(coin_to, cursor)
+                else:
+                    address_to = self.getReceiveAddressFromPool(
+                        coin_to, bid_id, TxTypes.XMR_SWAP_B_LOCK_SPEND, cursor
+                    )
+            else:
                 is_redeem_address_owned = ci_to.isAddressMine(address_to)
                 self.log.info(
                     "To provided address"
                     + ("" if is_redeem_address_owned else " (external)")
                 )
                 self.log.debug(f"Address: {address_to}")
-            elif coin_to in self.xmr_based_coins:
-                address_to = self.getCachedMainWalletAddress(ci_to, cursor)
-            elif coin_to in (Coins.PART_BLIND, Coins.PART_ANON):
-                address_to = self.getCachedStealthAddressForCoin(coin_to, cursor)
-            else:
-                address_to = self.getReceiveAddressFromPool(
-                    coin_to, bid_id, TxTypes.XMR_SWAP_B_LOCK_SPEND, cursor
-                )
 
             lock_tx_vout = bid.getLockTXBVout()
             txid = ci_to.spendBLockTx(
@@ -12742,7 +12823,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         if bid.xmr_b_lock_tx:
             bid.xmr_b_lock_tx.setState(TxStates.TX_REDEEMED)
 
-        if not is_redeem_address_owned:
+        if not is_redeem_address_owned and not ci_to.canConfirmExternalTxn():
+            # The spend can't be seen by the wallet and can't be looked up on chain.
             bid.setState(BidStates.SWAP_COMPLETED)
             self.notify(NT.SWAP_COMPLETED, {"bid_id": bid_id.hex()})
 
@@ -14562,6 +14644,40 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     for coin, cc in self.coin_clients.items():
                         if cc["name"] == coin_name:
                             cc["electrum_onion_servers"] = new_onion
+                            break
+
+            if "destination_address" in data:
+                new_destination_address = data["destination_address"].strip()
+                if new_destination_address != "":
+                    coin_id = self.getCoinIdFromName(coin_name)
+                    if self.isCoinActive(coin_id):
+                        ensure(
+                            self.ci(coin_id).isValidAddress(new_destination_address),
+                            f"Invalid destination address for {getCoinName(coin_id)}",
+                        )
+                if (
+                    settings_cc.get("destination_address", "")
+                    != new_destination_address
+                ):
+                    settings_changed = True
+                    settings_cc["destination_address"] = new_destination_address
+                    for coin, cc in self.coin_clients.items():
+                        if cc["name"] == coin_name:
+                            cc["destination_address"] = new_destination_address
+                            break
+
+            if "destination_address_scope" in data:
+                new_scope = data["destination_address_scope"]
+                ensure(
+                    new_scope in ("bids", "offers", "both"),
+                    "Invalid destination address scope",
+                )
+                if settings_cc.get("destination_address_scope", "both") != new_scope:
+                    settings_changed = True
+                    settings_cc["destination_address_scope"] = new_scope
+                    for coin, cc in self.coin_clients.items():
+                        if cc["name"] == coin_name:
+                            cc["destination_address_scope"] = new_scope
                             break
 
             if settings_changed:

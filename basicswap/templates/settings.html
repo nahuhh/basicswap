@@ -55,7 +55,7 @@
  </section>
 
  <div class="container px-4 mx-auto">
-  
+
   <div class="tab-content" id="coins" role="tabpanel" aria-labelledby="coins-tab">
    <form method="post" id="coins-form">
     <div class="space-y-6">
@@ -99,7 +99,7 @@
 
       <div class="coin-details hidden" id="details-{{ c.name }}">
        <div class="px-6 py-6">
-        
+
         {% if c.connection_type %}
         <div class="mb-6">
          <h4 class="text-sm font-medium text-gray-900 dark:text-white mb-4">
@@ -422,6 +422,28 @@
             <input type="number" class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" name="rct_ring_size_{{ c.name }}" min="3" max="32" value="{{ c.anon_tx_ring_size }}" placeholder="12">
            </div>
            {% endif %}
+
+           <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">External Destination Address</label>
+            <input type="text" autocomplete="off" spellcheck="false" class="destination-address-input hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" name="destination_address_{{ c.name }}" value="{{ c.destination_address | e }}" data-validation="{{ c.destination_validation | e }}" placeholder="Optional: default {{ c.display_name }} address to receive swap proceeds (blank = this wallet)">
+            <p class="destination-address-feedback mt-1 text-xs hidden"></p>
+           </div>
+
+           <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Use Destination Address For</label>
+            <div class="relative">
+             <select class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" name="destination_address_scope_{{ c.name }}">
+              <option value="both"{% if c.destination_address_scope == 'both' %} selected{% endif %}>Both bids and offers</option>
+              <option value="bids"{% if c.destination_address_scope == 'bids' %} selected{% endif %}>Bids only (when taking)</option>
+              <option value="offers"{% if c.destination_address_scope == 'offers' %} selected{% endif %}>Offers only (when making)</option>
+             </select>
+             <div class="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none">
+              <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+              </svg>
+             </div>
+            </div>
+           </div>
 
           </div>
          </div>
@@ -874,6 +896,7 @@
   </div>
 </div>
 
+<script src="/static/js/modules/address-validation.js"></script>
 <script src="/static/js/pages/settings-page.js"></script>
 
 {% include 'footer.html' %}

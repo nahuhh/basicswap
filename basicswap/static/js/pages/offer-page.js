@@ -1,6 +1,9 @@
 (function() {
   'use strict';
 
+  // Shared validator (basicswap/static/js/modules/address-validation.js).
+  const AddressValidation = window.AddressValidation;
+
   const OfferPage = {
     xhr_rates: null,
     xhr_bid_params: null,
@@ -14,6 +17,57 @@
       this.setupXHRHandlers();
       this.setupEventListeners();
       this.handleBidsPageAddress();
+      this.setupDestinationValidation();
+    },
+
+    destinationValidationParams: function(input) {
+      try {
+        return JSON.parse(input.dataset.validation || '{}');
+      } catch (e) {
+        return {};
+      }
+    },
+
+    destinationAddressValid: function() {
+      const input = document.getElementById('destination_address');
+      if (!input) return true;
+      const value = input.value.trim();
+      if (value === '') return true;
+      const result = AddressValidation.isValidAddressForCoin(value, this.destinationValidationParams(input));
+      return result !== false;
+    },
+
+    setupDestinationValidation: function() {
+      const input = document.getElementById('destination_address');
+      const feedback = document.getElementById('destination_address_feedback');
+      if (!input) return;
+      const params = this.destinationValidationParams(input);
+      const coin = params.coin || 'coin';
+      const render = () => {
+        const value = input.value.trim();
+        const result = AddressValidation.isValidAddressForCoin(value, params);
+        input.style.borderColor = '';
+        if (feedback) {
+          feedback.classList.add('hidden');
+          feedback.textContent = '';
+        }
+        if (value === '' || result === null) return;
+        if (result === true) {
+          input.style.borderColor = '#22c55e'; // green-500
+          if (feedback) {
+            feedback.textContent = '✓ Valid ' + coin + ' address';
+            feedback.className = 'mt-1 text-xs text-green-500';
+          }
+        } else {
+          input.style.borderColor = '#ef4444'; // red-500
+          if (feedback) {
+            feedback.textContent = '✗ Not a valid ' + coin + ' address';
+            feedback.className = 'mt-1 text-xs text-red-500';
+          }
+        }
+      };
+      input.addEventListener('blur', render);
+      input.addEventListener('input', render);
     },
 
     setupXHRHandlers: function() {
@@ -278,6 +332,10 @@
         this.showErrorModal('Validation Error', 'Please enter valid amounts for both sending and receiving.');
         return false;
       }
+      if (!this.destinationAddressValid()) {
+        this.showErrorModal('Validation Error', 'The destination address is not a valid address for this coin.');
+        return false;
+      }
       let subfee = false;
       const checkbox = document.getElementById('subfee_bid');
       if (checkbox) {
@@ -386,6 +444,9 @@
     cleanup: function() {
     }
   };
+
+  // Skip DOM wiring when loaded outside a browser (node-based unit tests).
+  if (typeof document === 'undefined' || typeof window === 'undefined') return;
 
   document.addEventListener('DOMContentLoaded', function() {
     OfferPage.init();

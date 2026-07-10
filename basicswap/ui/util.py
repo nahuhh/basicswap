@@ -45,6 +45,42 @@ def getCoinType(coin_type_ind):
         return getCoinIdFromTicker(coin_type_ind)
 
 
+def getAddressValidationParams(ci, mode: str = "any") -> str:
+    # Params for the advisory client-side address validator, as a JSON string.
+    # mode "dest_af" additionally restricts to the address type the ADS redeem tx
+    # can pay, mirroring BasicSwap.isValidSwapDestAddress.
+    params = {"coin": ci.coin_name(), "mode": mode}
+    try:
+        cp = ci.chainparams_network()
+    except Exception:
+        return json.dumps(params)
+
+    hrp = cp.get("hrp", "") or ""
+    if hrp:
+        params["hrp"] = hrp
+    versions = [
+        cp[k]
+        for k in ("pubkey_address", "script_address", "script_address2")
+        if k in cp
+    ]
+    if versions:
+        params["versions"] = versions
+    prefixes = [cp[k] for k in ("address_prefix", "subaddress_prefix") if k in cp]
+    if prefixes:
+        params["prefixes"] = prefixes
+
+    try:
+        script = bytes(ci.getScriptForPubkeyHash(bytes(20)))
+        if script.startswith(bytes((0x00, 0x14))):
+            params["script_type"] = "p2wpkh"
+        elif script.startswith(bytes((0x76, 0xA9, 0x14))):
+            params["script_type"] = "p2pkh"
+    except Exception:
+        pass
+
+    return json.dumps(params)
+
+
 def validateAmountString(amount, ci):
     if not isinstance(amount, str):
         return

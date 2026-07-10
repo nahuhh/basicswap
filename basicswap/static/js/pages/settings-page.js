@@ -15,6 +15,51 @@
       this.setupNotificationSettings();
       this.setupMigrationIndicator();
       this.setupServerDiscovery();
+      this.setupDestinationValidation();
+    },
+
+    setupDestinationValidation: function() {
+      // Client-side per-coin destination-address validation (advisory; editSettings
+      // validates authoritatively server-side). Uses the shared validator in
+      // modules/address-validation.js.
+      const AddressValidation = window.AddressValidation;
+      if (!AddressValidation) return;
+      document.querySelectorAll('.destination-address-input').forEach((input) => {
+        const feedback = input.parentNode.querySelector('.destination-address-feedback');
+        let params;
+        try {
+          params = JSON.parse(input.dataset.validation || '{}');
+        } catch (e) {
+          params = {};
+        }
+        const coin = params.coin || 'coin';
+        const render = () => {
+          const value = input.value.trim();
+          const result = AddressValidation.isValidAddressForCoin(value, params);
+          input.style.borderColor = '';
+          if (feedback) {
+            feedback.classList.add('hidden');
+            feedback.textContent = '';
+          }
+          if (value === '' || result === null) return;
+          if (result === true) {
+            input.style.borderColor = '#22c55e'; // green-500
+            if (feedback) {
+              feedback.textContent = '✓ Valid ' + coin + ' address';
+              feedback.className = 'destination-address-feedback mt-1 text-xs text-green-500';
+            }
+          } else {
+            input.style.borderColor = '#ef4444'; // red-500
+            if (feedback) {
+              feedback.textContent = '✗ Not a valid ' + coin + ' address';
+              feedback.className = 'destination-address-feedback mt-1 text-xs text-red-500';
+            }
+          }
+        };
+        input.addEventListener('blur', render);
+        input.addEventListener('input', render);
+        render(); // validate any stored value on load
+      });
     },
 
     setupTabs: function() {
