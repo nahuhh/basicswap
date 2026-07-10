@@ -630,7 +630,6 @@ class XMRInterface(CoinInterface):
             return rv
 
     def findConfirmedTxnByHash(self, txid: str):
-        # TODO: Use get_transfer_by_txid and sending wallet when destination address is not owned
         with self._mx_wallet:
             self.openWallet(self._wallet_filename)
             self.rpc_wallet("refresh")
@@ -662,6 +661,25 @@ class XMRInterface(CoinInterface):
                             "height": transfer["block_height"],
                         }
             return None
+
+    def canConfirmExternalTxn(self) -> bool:
+        return True
+
+    def findTxnByHashInChain(self, txid: str):
+        current_height: int = self.getChainHeight()
+        rv = self.rpc2("get_transactions", {"txs_hashes": [txid]})
+        self._log.info(
+            f"findTxnByHashInChain {self.ticker_str()} current_height {current_height}\nhash: {txid}"
+        )
+        for tx in rv.get("txs", []):
+            if tx.get("in_pool", False):
+                continue
+            block_height = tx.get("block_height")
+            if block_height is None:
+                continue
+            if current_height - block_height > self.blocks_confirmed:
+                return {"txid": txid, "height": block_height}
+        return None
 
     def spendBLockTx(
         self,
