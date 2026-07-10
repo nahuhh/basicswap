@@ -634,6 +634,41 @@ class Test(BaseTest):
             assert txin["txid"] == txin_after["txid"]
             assert txin["vout"] == txin_after["vout"]
 
+    def test_07_blind_external_destination_rejected(self):
+        # dest_af for blind is the address's pubkey, read from our own wallet with
+        # getaddressinfo, so an external address must be rejected cleanly here
+        # rather than failing later with KeyError: 'pubkey'.
+        logging.info("---------- Test PARTct external destination rejected")
+        swap_clients = self.swap_clients
+        self.ensure_balance(self.test_coin_from, 0, 100.0)
+
+        amt_swap = make_int(random.uniform(0.1, 2.0), scale=8, r=1)
+        rate_swap = make_int(random.uniform(0.2, 20.0), scale=12, r=1)
+        offer_id = swap_clients[0].postOffer(
+            self.test_coin_from,
+            Coins.XMR,
+            amt_swap,
+            rate_swap,
+            amt_swap,
+            SwapTypes.XMR_SWAP,
+        )
+        wait_for_offer(test_delay_event, swap_clients[1], offer_id)
+        offer = swap_clients[1].listOffers(filters={"offer_id": offer_id})[0]
+        external = swap_clients[1].ci(Coins.PART).getNewAddress(True)
+
+        err = None
+        try:
+            swap_clients[1].postXmrBid(
+                offer_id,
+                offer.amount_from,
+                extra_options={"destination_address": external},
+            )
+        except Exception as e:
+            err = str(e)
+        assert (
+            err is not None and "not supported" in err.lower()
+        ), f"blind external destination must be rejected, got: {err}"
+
 
 if __name__ == "__main__":
     unittest.main()
