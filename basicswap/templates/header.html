@@ -86,37 +86,37 @@
   <script src="/static/js/libs/popper.js"></script>
   <script src="/static/js/libs/tippy.js"></script>
   <!-- UI Components -->
-  <script src="/static/js/ui/tabs.js"></script>
-  <script src="/static/js/ui/dropdown.js"></script>
+  <script src="/static/js/ui/tabs.js?v={{ static_v }}"></script>
+  <script src="/static/js/ui/dropdown.js?v={{ static_v }}"></script>
   <!-- Core functionality -->
-  <script src="/static/js/modules/error-handler.js"></script>
-  <script src="/static/js/modules/dom-cache.js"></script>
-  <script src="/static/js/modules/event-handlers.js"></script>
-  <script src="/static/js/modules/form-validator.js"></script>
-  <script src="/static/js/modules/coin-utils.js"></script>
-  <script src="/static/js/modules/coin-manager.js"></script>
-  <script src="/static/js/modules/config-manager.js"></script>
-  <script src="/static/js/modules/cache-manager.js"></script>
-  <script src="/static/js/modules/cleanup-manager.js"></script>
-  <script src="/static/js/modules/websocket-manager.js"></script>
-  <script src="/static/js/modules/network-manager.js"></script>
-  <script src="/static/js/modules/api-manager.js"></script>
-  <script src="/static/js/modules/price-manager.js"></script>
-  <script src="/static/js/modules/tooltips-manager.js"></script>
-  <script src="/static/js/modules/notification-manager.js"></script>
-  <script src="/static/js/modules/balance-updates.js"></script>
-  <script src="/static/js/modules/identity-manager.js"></script>
-  <script src="/static/js/modules/summary-manager.js"></script>
-  <script src="/static/js/modules/wallet-amount.js"></script>
-  <script src="/static/js/pages/amm-counter.js"></script>
+  <script src="/static/js/modules/error-handler.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/dom-cache.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/event-handlers.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/form-validator.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/coin-utils.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/coin-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/config-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/cache-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/cleanup-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/websocket-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/network-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/api-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/price-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/tooltips-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/notification-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/balance-updates.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/identity-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/summary-manager.js?v={{ static_v }}"></script>
+  <script src="/static/js/modules/wallet-amount.js?v={{ static_v }}"></script>
+  <script src="/static/js/pages/amm-counter.js?v={{ static_v }}"></script>
   {% if current_page == 'wallets' or current_page == 'wallet' %}
-  <script src="/static/js/modules/wallet-manager.js"></script>
+  <script src="/static/js/modules/wallet-manager.js?v={{ static_v }}"></script>
   {% endif %}
   <!-- Memory management -->
-  <script src="/static/js/modules/memory-manager.js"></script>
+  <script src="/static/js/modules/memory-manager.js?v={{ static_v }}"></script>
   <!-- Main application script -->
-  <script src="/static/js/global.js"></script>
-  <script src="/static/js/pages/bids-tab-navigation.js"></script>
+  <script src="/static/js/global.js?v={{ static_v }}"></script>
+  <script src="/static/js/pages/bids-tab-navigation.js?v={{ static_v }}"></script>
 
 </head>
 <body class="dark:bg-gray-700">
@@ -176,6 +176,14 @@
                 font-semibold ml-3 mr-2 px-2.5 py-1 font-small text-white bg-blue-500 rounded-full">
                 {{ summary.num_network_offers }}
               </span>
+            </a>
+          </li>
+
+          <!-- Smart buy -->
+          <li>
+            <a class="flex mr-10 items-center py-3 text-sm {% if current_page == 'smartbuy' %}text-white font-semibold{% else %}text-gray-50 hover:text-gray-100{% endif %}"
+              href="/smartbuy">
+              <span>Smart Buy</span>
             </a>
           </li>
 
