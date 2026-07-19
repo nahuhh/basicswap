@@ -609,6 +609,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self._max_check_loop_blocks = self.settings.get("max_check_loop_blocks", 100000)
         self._force_db_upgrade = self.settings.get("force_db_upgrade", False)
         self._bid_expired_leeway = 5
+        self._plan_leg_timeout = self.settings.get("plan_leg_timeout", 5 * 60)
 
         self.swaps_in_progress = dict()
         self._connect_request_times = []
@@ -5858,6 +5859,66 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             self.loadBidTxns(bid, cursor)
         return bid, xmr_swap
 
+    def getPlanLegs(self, plan_id: bytes, cursor):
+        legs = list(self.query(Bid, cursor, {"plan_id": plan_id, "active_ind": 1}))
+        for leg in legs:
+            self.loadBidTxns(leg, cursor)
+            # A retry is its own batch cohort; earlier placements default to the
+            # plan itself, so only retried legs carry a stored cohort.
+            raw_cohort = self.getStringKV(f"bid_cohort:{leg.bid_id.hex()}", cursor)
+            leg.cohort = bytes.fromhex(raw_cohort) if raw_cohort else plan_id
+            # Coin A seen anywhere (mempool or chain), so it is progressing and
+            # must not be dropped, only waited for.
+            leg.coin_a_seen = (
+                leg.xmr_a_lock_tx is not None
+                and leg.xmr_a_lock_tx.state
+                in (
+                    TxStates.TX_IN_MEMPOOL,
+                    TxStates.TX_IN_CHAIN,
+                    TxStates.TX_CONFIRMED,
+                )
+            )
+            # Only adaptor-sig legs take part in the coin B lock batch.
+            leg.is_adaptor = (
+                self.queryOne(XmrSwap, cursor, {"bid_id": leg.bid_id}) is not None
+            )
+        return legs
+
+    def getCoinALockChainInfo(self, bid, xmr_swap, ci_from):
+        """Live-check the leader's coin A lock tx against the node. Returns
+        (chain_info, double_check_value): chain_info is the node's view of the tx
+        (None if not yet on chain or in the mempool), double_check_value says
+        whether that view carries a verified value/index to validate against."""
+        a_lock_tx_addr = ci_from.getSCLockScriptAddress(xmr_swap.a_lock_tx_script)
+        double_check_value: bool = (
+            ci_from.get_connection_type() == "rpc"
+            and ci_from.interface_type() != Coins.PART_BLIND
+        )
+        lock_tx_chain_info = ci_from.getLockTxHeight(
+            bid.xmr_a_lock_tx.txid,
+            a_lock_tx_addr,
+            bid.amount,
+            bid.chain_a_height_start,
+            vout=bid.xmr_a_lock_tx.vout,
+            find_index=double_check_value,
+        )
+        return lock_tx_chain_info, double_check_value
+
+    def coinALockSeen(self, bid, cursor) -> bool:
+        """Whether the leader's coin A lock for this leg is on chain or in the
+        mempool right now, checked live against the node rather than trusting the
+        persisted tx state, so a leg is not abandoned the instant its lock lands."""
+        if bid.xmr_a_lock_tx is None or bid.xmr_a_lock_tx.txid is None:
+            return False
+        xmr_swap = self.queryOne(XmrSwap, cursor, {"bid_id": bid.bid_id})
+        offer, _ = self.getXmrOfferFromSession(cursor, bid.offer_id)
+        if xmr_swap is None or offer is None:
+            return False
+        reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
+        ci_from = self.ci(offer.coin_to if reverse_bid else offer.coin_from)
+        lock_tx_chain_info, _ = self.getCoinALockChainInfo(bid, xmr_swap, ci_from)
+        return lock_tx_chain_info is not None
+
     def getXmrBid(self, bid_id: bytes, cursor=None):
         try:
             use_cursor = self.openDB(cursor)
@@ -8637,9 +8698,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
                 # TODO: Timeout waiting for transactions
                 bid_changed: bool = False
-                a_lock_tx_addr = ci_from.getSCLockScriptAddress(
-                    xmr_swap.a_lock_tx_script
-                )
                 # Lock TX A should have been verified already
                 if (
                     bid.xmr_a_lock_tx is None
@@ -8649,20 +8707,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 ):
                     raise ValueError("Lock TX A details missing.")
 
-                double_check_value: bool = True
-                if ci_from.get_connection_type() != "rpc":
-                    double_check_value = False
-                if ci_from.interface_type() == Coins.PART_BLIND:
-                    double_check_value = False
-                lock_tx_chain_info = ci_from.getLockTxHeight(
-                    bid.xmr_a_lock_tx.txid,
-                    a_lock_tx_addr,
-                    bid.amount,
-                    bid.chain_a_height_start,
-                    vout=bid.xmr_a_lock_tx.vout,
-                    find_index=double_check_value,
+                lock_tx_chain_info, double_check_value = self.getCoinALockChainInfo(
+                    bid, xmr_swap, ci_from
                 )
                 if lock_tx_chain_info is None:
+                    # A plan leg stuck here is dropped by plan_batch_decision once
+                    # a ready sibling has been held waiting, not on its own timer.
                     return rv
                 # Double check index and amount
                 if double_check_value and (
@@ -12549,6 +12599,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
 
+    def setBidBLockTx(self, bid, xmr_swap, b_lock_tx_id: bytes, cursor, vout=None):
+        bid.xmr_b_lock_tx = SwapTx(
+            bid_id=bid.bid_id,
+            tx_type=TxTypes.XMR_SWAP_B_LOCK,
+            txid=b_lock_tx_id,
+            vout=vout,
+        )
+        bid.xmr_b_lock_tx.setState(TxStates.TX_SENT)
+        xmr_swap.b_lock_tx_id = b_lock_tx_id
+        self.logBidEvent(bid.bid_id, EventLogTypes.LOCK_TX_B_PUBLISHED, "", cursor)
+
     def sendXmrBidCoinBLockTx(self, bid_id: bytes, cursor) -> None:
         # Follower sending coin B lock tx
         self.log.debug(
@@ -12574,7 +12635,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         if bid.xmr_b_lock_tx:
             self.log.warning(
-                f"Coin B lock tx {self.log.id(bid.xmr_b_lock_tx.b_lock_tx_id)} exists for adaptor-sig bid {self.log.id(bid_id)}."
+                f"Coin B lock tx {self.log.id(bid.xmr_b_lock_tx.txid)} exists for adaptor-sig bid {self.log.id(bid_id)}."
             )
             return
 
@@ -12626,6 +12687,48 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             cursor=cursor,
         )
 
+        batch = []
+        if bid.plan_id and prefunded_tx is None and hasattr(ci_to, "publishBLockTxs"):
+            from .multibid import plan_batch_decision
+
+            # The buy can set its own leg timeout; fall back to the node default.
+            ready_timeout = self._plan_leg_timeout
+            stored_timeout = self.getStringKV(
+                f"plan_leg_timeout:{bid.plan_id.hex()}", cursor
+            )
+            if stored_timeout:
+                ready_timeout = int(stored_timeout)
+
+            plan = plan_batch_decision(
+                self.getPlanLegs(bid.plan_id, cursor),
+                bid_id,
+                cap=ci_to.max_batched_lock_outputs(),
+                now=self.getTime(),
+                ready_timeout=ready_timeout,
+            )
+            for leg in plan.drop:
+                leg_bid, _ = self.getXmrBidFromSession(cursor, leg.bid_id)
+                # Re-check live: the persisted seen flag can lag the leader's
+                # lock landing, and abandoning a funded leg would waste it.
+                if leg_bid is None or self.coinALockSeen(leg_bid, cursor):
+                    continue
+                self.log.info(
+                    f"Abandoning plan leg {self.log.id(leg.bid_id)}, coin A lock unseen while a ready leg waited {self._plan_leg_timeout} seconds."
+                )
+                self.deactivateBidForReason(
+                    leg.bid_id, BidStates.BID_ABANDONED, cursor=cursor
+                )
+            if plan.wait:
+                delay = self.get_delay_event_seconds()
+                self.log.info(
+                    f"Holding the coin B lock for bid {self.log.id(bid_id)}, the rest of its cohort is not locked yet."
+                )
+                self.createActionInSession(
+                    delay, ActionTypes.SEND_XMR_SWAP_LOCK_TX_B, bid_id, cursor
+                )
+                return
+            batch = plan.batch
+
         try:
             b_lock_vout = None
             if prefunded_tx:
@@ -12639,6 +12742,23 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 )
                 b_lock_tx = ci_to.signTxWithWallet(b_lock_tx)
                 b_lock_tx_id = bytes.fromhex(ci_to.publishTx(b_lock_tx))
+            elif batch:
+                leg_swaps = [
+                    (leg, self.queryOne(XmrSwap, cursor, {"bid_id": leg.bid_id}))
+                    for leg in batch
+                ]
+                b_lock_tx_id = ci_to.publishBLockTxs(
+                    [(xmr_swap.vkbv, xmr_swap.pkbs, bid.amount_to)]
+                    + [
+                        (leg_swap.vkbv, leg_swap.pkbs, leg.amount_to)
+                        for leg, leg_swap in leg_swaps
+                    ],
+                    b_fee_rate,
+                    unlock_time=unlock_time,
+                )
+                for leg, leg_swap in leg_swaps:
+                    self.setBidBLockTx(leg, leg_swap, b_lock_tx_id, cursor)
+                    self.saveBidInSession(leg.bid_id, leg, cursor, leg_swap)
             else:
                 result = ci_to.publishBLockTx(
                     xmr_swap.vkbv,
@@ -12704,15 +12824,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self.log.debug(
             f"Submitted lock txn {self.logIDT(b_lock_tx_id)} to {ci_to.coin_name()} chain for bid {self.log.id(bid_id)}."
         )
-        bid.xmr_b_lock_tx = SwapTx(
-            bid_id=bid_id,
-            tx_type=TxTypes.XMR_SWAP_B_LOCK,
-            txid=b_lock_tx_id,
-            vout=b_lock_vout,
-        )
-        xmr_swap.b_lock_tx_id = b_lock_tx_id
-        bid.xmr_b_lock_tx.setState(TxStates.TX_SENT)
-        self.logBidEvent(bid.bid_id, EventLogTypes.LOCK_TX_B_PUBLISHED, "", cursor)
+        self.setBidBLockTx(bid, xmr_swap, b_lock_tx_id, cursor, vout=b_lock_vout)
         if bid.debug_ind == DebugTypes.BID_STOP_AFTER_COIN_B_LOCK:
             self.log.debug(
                 f"Adaptor-sig bid {self.log.id(bid_id)}: Stalling bid for testing: {bid.debug_ind}."
@@ -15626,7 +15738,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             query_str: str = (
                 "SELECT "
                 + "bids.created_at, bids.expire_at, bids.bid_id, bids.offer_id, bids.amount, bids.state, bids.was_received, "
-                + "tx1.state, tx2.state, offers.coin_from, bids.rate, bids.bid_addr, offers.bid_reversed, bids.amount_to, offers.coin_to "
+                + "tx1.state, tx2.state, offers.coin_from, bids.rate, bids.bid_addr, offers.bid_reversed, bids.amount_to, offers.coin_to, "
+                + "bids.plan_id "
                 + "FROM bids "
                 + "LEFT JOIN offers ON offers.offer_id = bids.offer_id "
                 + "LEFT JOIN transactions AS tx1 ON tx1.bid_id = bids.bid_id AND tx1.tx_type = CASE WHEN offers.swap_type = :ads_swap THEN :al_type ELSE :itx_type END "
@@ -16127,6 +16240,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ]
 
         xmr_swap.a_lock_refund_swipe_tx = ci.setTxSignature(spend_tx, witness_stack)
+
+    def setBidPlan(self, bid_id: bytes, plan_id: bytes) -> None:
+        """Mark a bid as one leg of the multi-offer buy identified by plan_id."""
+        bid = self.getBid(bid_id)
+        ensure(bid, f"Bid not found: {self.log.id(bid_id)}.")
+
+        bid.plan_id = plan_id
+        self.saveBid(bid_id, bid)
 
     def setBidDebugInd(self, bid_id: bytes, debug_ind, add_to_bid: bool = True) -> None:
         self.log.debug(f"Bid {self.log.id(bid_id)} Setting debug flag: {debug_ind}.")

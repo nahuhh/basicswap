@@ -12,7 +12,7 @@ import time
 from enum import IntEnum, auto
 from typing import Optional
 
-CURRENT_DB_VERSION = 37
+CURRENT_DB_VERSION = 38
 CURRENT_DB_DATA_VERSION = 9
 
 
@@ -265,6 +265,9 @@ class Bid(Table, StateRows):
     chain_b_height_start = Column("integer")
 
     reject_code = Column("integer")
+
+    # Shared by the bids placed together by one multi-offer buy, else null.
+    plan_id = Column("blob")
 
     initiate_tx = None
     participate_tx = None

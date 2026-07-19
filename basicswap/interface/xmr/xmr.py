@@ -541,6 +541,36 @@ class XMRInterface(CoinInterface):
             tx_hash: bytes = bytes.fromhex(rv["tx_hash"])
             return tx_hash
 
+    def max_batched_lock_outputs(self) -> int:
+        # Monero caps a tx at 16 outputs (BULLETPROOF_MAX_OUTPUTS); one is change.
+        return 15
+
+    def publishBLockTxs(self, locks, feerate: int = 0, unlock_time: int = 0) -> bytes:
+        """Lock for several swaps at once, so their change is not chained."""
+        with self._mx_wallet:
+            self.openWallet(self._wallet_filename)
+            self.rpc_wallet("refresh")
+
+            destinations = [
+                {
+                    "amount": output_amount,
+                    "address": xmr_util.encode_address(
+                        self.getPubkey(kbv), Kbs, self._addr_prefix
+                    ),
+                }
+                for kbv, Kbs, output_amount in locks
+            ]
+            params = {"destinations": destinations, "unlock_time": unlock_time}
+            if self._fee_priority > 0:
+                params["priority"] = self._fee_priority
+            rv = self.rpc_wallet("transfer", params)
+            self._log.info(
+                "publishBLockTxs {} to {} lock addresses".format(
+                    self._log.id(rv["tx_hash"]), len(destinations)
+                )
+            )
+            return bytes.fromhex(rv["tx_hash"])
+
     def findTxB(
         self,
         kbv,
