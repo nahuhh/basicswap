@@ -46,6 +46,14 @@ class BalanceTypes(IntEnum):
     ANON = 3
 
 
+def findStealthOutput(tx, sx_addr: str):
+    # A batched lock tx pays several swaps, so the output may not be the first.
+    for output in tx["outputs"]:
+        if output.get("stealth_address") == sx_addr:
+            return output
+    return None
+
+
 class PARTInterface(BTCInterface):
     @staticmethod
     def coin_type():
@@ -1193,6 +1201,39 @@ class PARTInterfaceBlind(PARTInterface):
         txid = self.rpc_wallet("sendtypeto", params)
         return bytes.fromhex(txid)
 
+    def max_batched_lock_outputs(self) -> int:
+        # TODO: Confirm the real limit; Particl bounds a tx by size, not output count.
+        return 15
+
+    def publishBLockTxs(self, locks, feerate: int, unlock_time: int = 0) -> bytes:
+        """Lock several swaps in one transaction, so their change is not chained."""
+        outputs = [
+            {
+                "address": self.formatStealthAddress(self.getPubkey(vkbv), Kbs),
+                "amount": self.format_amount(output_amount),
+            }
+            for vkbv, Kbs, output_amount in locks
+        ]
+        params = [
+            "blind",
+            "blind",
+            outputs,
+            "",
+            "",
+            self._anon_tx_ring_size,
+            1,
+            False,
+            {"conf_target": self._conf_target, "blind_watchonly_visible": True},
+        ]
+
+        txid = self.rpc_wallet("sendtypeto", params)
+        self._log.info(
+            "publishBLockTxs {} to {} lock addresses".format(
+                self._log.id(txid), len(outputs)
+            )
+        )
+        return bytes.fromhex(txid)
+
     def findTxB(
         self,
         kbv,
@@ -1223,14 +1264,15 @@ class PARTInterfaceBlind(PARTInterface):
         found_invalid_txid_hex: str = None
         for tx in txns:
             txid_hex: str = tx["txid"]
-            if tx["outputs"][0]["stealth_address"] != sx_addr:
+            output = findStealthOutput(tx, sx_addr)
+            if output is None:
                 # Should not be possible
                 self._log.warning(
                     f"Skipping tx {txid_hex} received on different stealth address"
                 )
                 continue
-            ensure(tx["outputs"][0]["type"] == "blind", "Output is not blind")
-            tx_amount = self.make_int(tx["outputs"][0]["amount"])
+            ensure(output["type"] == "blind", "Output is not blind")
+            tx_amount = self.make_int(output["amount"])
             if bid_sender:
                 tx_amount *= -1
             if tx_amount == cb_swap_value or check_amount is False:
@@ -1238,7 +1280,7 @@ class PARTInterfaceBlind(PARTInterface):
                 if tx["confirmations"] > 0:
                     chain_height = self.rpc("getblockcount")
                     height = chain_height - (tx["confirmations"] - 1)
-                vout: int = tx["outputs"][0]["vout"]
+                vout: int = output["vout"]
 
                 return {
                     "txid": tx["txid"],
@@ -1503,6 +1545,39 @@ class PARTInterfaceAnon(PARTInterface):
         txid = self.rpc_wallet("sendtypeto", params)
         return bytes.fromhex(txid)
 
+    def max_batched_lock_outputs(self) -> int:
+        # TODO: Confirm the real limit; Particl bounds a tx by size, not output count.
+        return 15
+
+    def publishBLockTxs(self, locks, feerate: int, unlock_time: int = 0) -> bytes:
+        """Lock several swaps in one transaction, so their change is not chained."""
+        outputs = [
+            {
+                "address": self.formatStealthAddress(self.getPubkey(kbv), Kbs),
+                "amount": self.format_amount(output_amount),
+            }
+            for kbv, Kbs, output_amount in locks
+        ]
+        params = [
+            "anon",
+            "anon",
+            outputs,
+            "",
+            "",
+            self._anon_tx_ring_size,
+            1,
+            False,
+            {"conf_target": self._conf_target, "blind_watchonly_visible": True},
+        ]
+
+        txid = self.rpc_wallet("sendtypeto", params)
+        self._log.info(
+            "publishBLockTxs {} to {} lock addresses".format(
+                self._log.id(txid), len(outputs)
+            )
+        )
+        return bytes.fromhex(txid)
+
     def findTxB(
         self,
         kbv,
@@ -1533,14 +1608,15 @@ class PARTInterfaceAnon(PARTInterface):
         found_invalid_txid_hex: str = None
         for tx in txns:
             txid_hex: str = tx["txid"]
-            if tx["outputs"][0]["stealth_address"] != sx_addr:
+            output = findStealthOutput(tx, sx_addr)
+            if output is None:
                 # Should not be possible
                 self._log.warning(
                     f"Skipping tx {txid_hex} received on different stealth address"
                 )
                 continue
-            ensure(tx["outputs"][0]["type"] == "anon", "Output is not anon")
-            tx_amount: int = self.make_int(tx["outputs"][0]["amount"])
+            ensure(output["type"] == "anon", "Output is not anon")
+            tx_amount: int = self.make_int(output["amount"])
             if bid_sender:
                 tx_amount *= -1
             if tx_amount == cb_swap_value or check_amount is False:
@@ -1548,7 +1624,7 @@ class PARTInterfaceAnon(PARTInterface):
                 if tx["confirmations"] > 0:
                     chain_height = self.rpc("getblockcount")
                     height = chain_height - (tx["confirmations"] - 1)
-                vout: int = tx["outputs"][0]["vout"]
+                vout: int = output["vout"]
                 return {
                     "txid": tx["txid"],
                     "amount": tx_amount,
