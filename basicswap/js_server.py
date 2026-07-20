@@ -2087,6 +2087,132 @@ def js_electrum_discover(self, url_split, post_string, is_json) -> bytes:
     )
 
 
+def js_testxmrdaemon(self, url_split, post_string, is_json) -> bytes:
+    swap_client = self.server.swap_client
+    post_data = {} if post_string == "" else getFormData(post_string, is_json)
+
+    coin_str = get_data_entry(post_data, "coin")
+    try:
+        coin_type = Coins(int(coin_str))
+    except (ValueError, TypeError):
+        try:
+            coin_type = getCoinIdFromName(coin_str)
+        except ValueError:
+            coin_type = getCoinType(coin_str)
+
+    if coin_type not in (Coins.XMR, Coins.WOW):
+        return bytes(
+            json.dumps(
+                {
+                    "reachable": False,
+                    "error": "Daemon test is only supported for Monero/Wownero.",
+                }
+            ),
+            "UTF-8",
+        )
+
+    rpchost = get_data_entry(post_data, "rpchost")
+    rpcport = get_data_entry(post_data, "rpcport")
+    try:
+        probe = swap_client.probeXMRDaemon(coin_type, rpchost, rpcport)
+    except Exception as e:
+        return bytes(json.dumps({"reachable": False, "error": str(e)}), "UTF-8")
+
+    rv = {"reachable": probe["reachable"]}
+    if probe["reachable"]:
+        rv["latency_ms"] = probe.get("latency_ms")
+    else:
+        rv["error"] = f"Daemon {rpchost}:{rpcport} is not reachable."
+    return bytes(json.dumps(rv), "UTF-8")
+
+
+def js_setxmrdaemon(self, url_split, post_string, is_json) -> bytes:
+    # Validate reachability, then persist/live-apply via editSettings (set_daemon).
+    swap_client = self.server.swap_client
+    post_data = {} if post_string == "" else getFormData(post_string, is_json)
+
+    coin_str = get_data_entry(post_data, "coin")
+    try:
+        coin_type = Coins(int(coin_str))
+    except (ValueError, TypeError):
+        try:
+            coin_type = getCoinIdFromName(coin_str)
+        except ValueError:
+            coin_type = getCoinType(coin_str)
+
+    if coin_type not in (Coins.XMR, Coins.WOW):
+        return bytes(
+            json.dumps(
+                {
+                    "success": False,
+                    "error": "Only supported for Monero/Wownero.",
+                }
+            ),
+            "UTF-8",
+        )
+
+    rpchost = get_data_entry(post_data, "rpchost")
+    rpcport = get_data_entry(post_data, "rpcport")
+    try:
+        probe = swap_client.probeXMRDaemon(coin_type, rpchost, rpcport)
+        if not probe["reachable"]:
+            return bytes(
+                json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Daemon {rpchost}:{rpcport} is not reachable.",
+                    }
+                ),
+                "UTF-8",
+            )
+        coin_name = swap_client.coin_clients[coin_type]["name"]
+        swap_client.editSettings(
+            coin_name, {"rpchost": rpchost, "rpcport": int(rpcport)}
+        )
+    except Exception as e:
+        return bytes(json.dumps({"success": False, "error": str(e)}), "UTF-8")
+
+    rv = {"success": True, "rpchost": rpchost, "rpcport": int(rpcport)}
+    if probe.get("latency_ms") is not None:
+        rv["latency_ms"] = probe["latency_ms"]
+    return bytes(json.dumps(rv), "UTF-8")
+
+
+def js_savexmrdaemonnodes(self, url_split, post_string, is_json) -> bytes:
+    # Persist the node list live; does not change or re-select the active daemon.
+    swap_client = self.server.swap_client
+    post_data = {} if post_string == "" else getFormData(post_string, is_json)
+
+    coin_str = get_data_entry(post_data, "coin")
+    try:
+        coin_type = Coins(int(coin_str))
+    except (ValueError, TypeError):
+        try:
+            coin_type = getCoinIdFromName(coin_str)
+        except ValueError:
+            coin_type = getCoinType(coin_str)
+
+    if coin_type not in (Coins.XMR, Coins.WOW):
+        return bytes(
+            json.dumps(
+                {
+                    "success": False,
+                    "error": "Only supported for Monero/Wownero.",
+                }
+            ),
+            "UTF-8",
+        )
+
+    nodes = get_data_entry(post_data, "nodes")
+    try:
+        coin_name = swap_client.coin_clients[coin_type]["name"]
+        swap_client.saveRemoteDaemonNodes(coin_name, nodes)
+    except Exception as e:
+        return bytes(json.dumps({"success": False, "error": str(e)}), "UTF-8")
+
+    return bytes(json.dumps({"success": True}), "UTF-8")
+
+
 def js_getsubfeebidtx(self, url_split, post_string, is_json) -> bytes:
     swap_client = self.server.swap_client
     swap_client.checkSystemStatus()
@@ -2149,6 +2275,9 @@ endpoints = {
     "coinhistory": js_coinhistory,
     "messageroutes": js_messageroutes,
     "electrumdiscover": js_electrum_discover,
+    "testxmrdaemon": js_testxmrdaemon,
+    "setxmrdaemon": js_setxmrdaemon,
+    "savexmrdaemonnodes": js_savexmrdaemonnodes,
     "modeswitchinfo": js_modeswitchinfo,
     "getsubfeebidtx": js_getsubfeebidtx,
 }

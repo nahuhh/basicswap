@@ -122,12 +122,15 @@ class XMRInterface(CoinInterface):
         self._wallet_filename = coin_settings.get("wallet_name", "swap_wallet")
         self._cached_main_wallet_address = None
 
+        self._coin_settings = coin_settings
+
         daemon_login = None
         if coin_settings.get("rpcuser", "") != "":
             daemon_login = (
                 coin_settings.get("rpcuser", ""),
                 coin_settings.get("rpcpassword", ""),
             )
+        self._daemon_login = daemon_login
 
         rpchost = coin_settings.get("rpchost", "127.0.0.1")
         proxy_host = None
@@ -169,24 +172,9 @@ class XMRInterface(CoinInterface):
         self._num_chaininfo_retries = coin_settings.get("numchaininforetries", 20)
         self._chaininfo_retry_delay = coin_settings.get("chaininforetrydelay", 1)
 
-        self.rpc = make_xmr_rpc_func(
-            coin_settings["rpcport"],
-            daemon_login,
-            host=rpchost,
-            proxy_host=proxy_host,
-            proxy_port=proxy_port,
-            default_timeout=self._rpctimeout,
-            tag="Node(j) ",
+        self._buildDaemonRpcFuncs(
+            rpchost, coin_settings["rpcport"], proxy_host, proxy_port
         )
-        self.rpc2 = make_xmr_rpc2_func(
-            coin_settings["rpcport"],
-            daemon_login,
-            host=rpchost,
-            proxy_host=proxy_host,
-            proxy_port=proxy_port,
-            default_timeout=self._rpctimeout,
-            tag="Node ",
-        )  # non-json endpoint
         self.rpc_wallet = make_xmr_rpc_func(
             coin_settings["walletrpcport"],
             coin_settings["walletrpcauth"],
@@ -194,6 +182,80 @@ class XMRInterface(CoinInterface):
             default_timeout=self._walletrpctimeout,
             tag="Wallet ",
         )
+
+    def _buildDaemonRpcFuncs(self, rpchost, rpcport, proxy_host, proxy_port) -> None:
+        # (Re)build the direct-daemon conns; rebound on a runtime daemon switch.
+        self._rpchost = rpchost
+        self._rpcport = rpcport
+        self.rpc = make_xmr_rpc_func(
+            rpcport,
+            self._daemon_login,
+            host=rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            default_timeout=self._rpctimeout,
+            tag="Node(j) ",
+        )
+        self.rpc2 = make_xmr_rpc2_func(
+            rpcport,
+            self._daemon_login,
+            host=rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            default_timeout=self._rpctimeout,
+            tag="Node ",
+        )  # non-json endpoint
+
+    def setDaemonAddress(self, rpchost: str, rpcport) -> None:
+        # set_daemon the wallet-rpc and rebuild the direct-daemon connections.
+        rpcport = int(rpcport)
+        with self._mx_wallet:
+            trusted: bool = True
+            proxy_host = None
+            proxy_port = None
+            if self._sc is not None:
+                trusted = self._sc.getXMRTrustedDaemon(self.coin_type(), rpchost)
+                proxy_host, proxy_port = self._sc.getXMRWalletProxy(
+                    self.coin_type(), rpchost
+                )
+
+            params = {
+                "address": f"{rpchost}:{rpcport}",
+                "trusted": trusted,
+            }
+            if self._daemon_login is not None:
+                params["username"] = self._daemon_login[0]
+                params["password"] = self._daemon_login[1]
+            if proxy_host:
+                params["proxy"] = f"{proxy_host}:{proxy_port}"
+                params["ssl_support"] = "autodetect"
+                params["ssl_allow_any_cert"] = True
+
+            try:
+                self.rpc_wallet("set_daemon", params)
+            except Exception as e:
+                if "proxy" not in params:
+                    raise
+                # Wownero's older wallet-rpc may not accept the 'proxy' argument.
+                self._log.warning(
+                    f"{self.coin_name()} set_daemon failed ({e}); retrying without proxy arg."
+                )
+                params.pop("proxy", None)
+                self.rpc_wallet("set_daemon", params)
+
+            self._log.info(
+                "Set {} daemon to {}:{} ({}){}.".format(
+                    self.coin_name(),
+                    rpchost,
+                    rpcport,
+                    "trusted" if trusted else "untrusted",
+                    " through proxy" if proxy_host else "",
+                )
+            )
+
+            self._buildDaemonRpcFuncs(rpchost, rpcport, proxy_host, proxy_port)
+            self._coin_settings["rpchost"] = rpchost
+            self._coin_settings["rpcport"] = rpcport
 
     def setFeePriority(self, new_priority):
         ensure(new_priority >= 0 and new_priority < 4, "Invalid fee_priority value")

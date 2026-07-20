@@ -15,6 +15,8 @@
       this.setupNotificationSettings();
       this.setupMigrationIndicator();
       this.setupServerDiscovery();
+      this.setupDaemonValidation();
+      this.setupDaemonNodes();
     },
 
     setupTabs: function() {
@@ -874,6 +876,386 @@
       button.innerHTML = originalHtml;
       button.disabled = false;
     });
+  };
+
+  SettingsPage.setupDaemonValidation = function() {
+    const buttons = document.querySelectorAll('.apply-coin-btn');
+    buttons.forEach(button => {
+      const coin = button.dataset.coin;
+      const hostInput = document.querySelector(`[name="rpchost_${coin}"]`);
+      const portInput = document.querySelector(`[name="rpcport_${coin}"]`);
+      // Only Monero/Wownero render daemon host/port fields.
+      if (!hostInput || !portInput) return;
+
+      button.addEventListener('click', (e) => {
+        if (button.dataset.daemonChecked === '1') {
+          button.dataset.daemonChecked = '';
+          return;
+        }
+        // Only validate when the host/port changed; auto-select probes server-side.
+        const hostChanged = hostInput.value.trim() !== hostInput.defaultValue.trim()
+          || portInput.value.trim() !== portInput.defaultValue.trim();
+        if (!hostChanged) return;
+
+        e.preventDefault();
+        this.validateDaemon(coin, hostInput.value.trim(), portInput.value.trim(), button);
+      });
+    });
+  };
+
+  SettingsPage.validateDaemon = function(coin, host, port, button) {
+    const errorEl = document.getElementById(`daemon-error-${coin}`);
+    const form = button.closest('form');
+    const originalHtml = button.innerHTML;
+    if (errorEl) { errorEl.classList.add('hidden'); errorEl.textContent = ''; }
+    button.disabled = true;
+    button.innerHTML = `<svg class="w-3.5 h-3.5 mr-1 animate-spin inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>Testing node...`;
+
+    const restore = () => { button.disabled = false; button.innerHTML = originalHtml; };
+    const showError = (msg) => {
+      if (errorEl) { errorEl.textContent = msg; errorEl.classList.remove('hidden'); }
+    };
+
+    fetch('/json/testxmrdaemon', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ coin: coin, rpchost: host, rpcport: port })
+    })
+    .then(response => response.json())
+    .then(data => {
+      if (data.reachable) {
+        restore();
+        button.dataset.daemonChecked = '1';
+        if (form.requestSubmit) {
+          form.requestSubmit(button);
+        } else {
+          const hidden = document.createElement('input');
+          hidden.type = 'hidden';
+          hidden.name = button.name;
+          hidden.value = button.value;
+          form.appendChild(hidden);
+          form.submit();
+        }
+      } else {
+        showError(data.error || `Daemon ${host}:${port} is not reachable.`);
+        restore();
+      }
+    })
+    .catch(err => {
+      showError(`Failed to test daemon: ${err.message}`);
+      restore();
+    });
+  };
+
+  // Rows are the source of truth, serialised to a hidden JSON field the form submits.
+  SettingsPage.setupDaemonNodes = function() {
+    const containers = document.querySelectorAll('.daemon-nodes');
+    containers.forEach(container => this.initDaemonNodeList(container));
+  };
+
+  SettingsPage.initDaemonNodeList = function(container) {
+    const coin = container.dataset.coin;
+    const hidden = container.querySelector('.daemon-nodes-hidden');
+    const listEl = container.querySelector('.daemon-node-list');
+    const emptyEl = container.querySelector('.daemon-node-empty');
+    const addInput = container.querySelector('.daemon-node-add-input');
+    const addBtn = container.querySelector('.daemon-node-add-btn');
+    const checkAllBtn = container.querySelector('.daemon-check-all');
+    const hostInput = document.querySelector(`[name="rpchost_${coin}"]`);
+    const portInput = document.querySelector(`[name="rpcport_${coin}"]`);
+    if (!hidden || !listEl) return;
+
+    let nodes = [];
+    try {
+      const parsed = JSON.parse(hidden.value || '[]');
+      if (Array.isArray(parsed)) {
+        nodes = parsed
+          .map(n => ({
+            url: String((n && n.url) || '').trim(),
+            failover: !(n && n.failover === false),
+            status: 'unknown',
+            latency: null
+          }))
+          .filter(n => n.url !== '');
+      }
+    } catch (e) {
+      nodes = [];
+    }
+
+    const serialize = () => {
+      hidden.value = JSON.stringify(nodes.map(n => ({ url: n.url, failover: !!n.failover })));
+    };
+
+    const splitUrl = (url) => {
+      const idx = url.lastIndexOf(':');
+      return idx < 0 ? [url, ''] : [url.slice(0, idx), url.slice(idx + 1)];
+    };
+
+    const SPINNER = '<svg class="w-3.5 h-3.5 mr-1 animate-spin inline-block" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>';
+
+    const errorEl = document.getElementById(`daemon-error-${coin}`);
+    const showError = (msg) => {
+      if (errorEl) { errorEl.textContent = msg; errorEl.classList.remove('hidden'); }
+    };
+    const clearError = () => {
+      if (errorEl) { errorEl.classList.add('hidden'); errorEl.textContent = ''; }
+    };
+
+    // Persist the node list live; does not switch daemon.
+    const saveNodes = () => {
+      return fetch('/json/savexmrdaemonnodes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ coin: coin, nodes: nodes.map(n => ({ url: n.url, failover: !!n.failover })) })
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (!(data && data.success)) showError((data && data.error) || 'Failed to save node list.');
+        })
+        .catch(() => showError('Failed to save node list.'));
+    };
+
+    // The url the wallet is currently pointed at (the manual host/port fields).
+    const currentDaemonUrl = () => {
+      const h = hostInput ? hostInput.value.trim() : '';
+      const p = portInput ? portInput.value.trim() : '';
+      return (h === '' && p === '') ? '' : `${h}:${p}`;
+    };
+
+    const healthDotClass = (statusVal) => {
+      let color = 'bg-gray-300 dark:bg-gray-500';
+      if (statusVal === 'ok') color = 'bg-green-500';
+      else if (statusVal === 'bad') color = 'bg-red-500';
+      return 'daemon-node-dot shrink-0 w-2 h-2 rounded-full ' + color;
+    };
+
+    const applyProbeVisual = (row, node) => {
+      const dot = row.querySelector('.daemon-node-dot');
+      const status = row.querySelector('.daemon-node-status');
+      if (dot) dot.className = healthDotClass(node.status);
+      if (node.status === 'ok') {
+        status.className = 'daemon-node-status shrink-0 text-xs font-medium text-green-600 dark:text-green-400';
+        status.textContent = node.latency + ' ms';
+      } else if (node.status === 'bad') {
+        status.className = 'daemon-node-status shrink-0 text-xs font-medium text-red-500';
+        status.textContent = 'unreachable';
+      } else {
+        status.className = 'daemon-node-status shrink-0 text-xs text-gray-400 dark:text-gray-500';
+        status.textContent = '';
+      }
+    };
+
+    const statusRank = (n) => (n.status === 'ok' ? 0 : (n.status === 'unknown' ? 1 : 2));
+    const reorder = () => {
+      nodes.sort((a, b) => {
+        const r = statusRank(a) - statusRank(b);
+        if (r !== 0) return r;
+        if (a.status === 'ok' && b.status === 'ok') return (a.latency || 0) - (b.latency || 0);
+        return 0;
+      });
+    };
+
+    const probeNode = (node, row) => {
+      const [host, port] = splitUrl(node.url);
+      const probeBtn = row.querySelector('.daemon-node-probe');
+      const status = row.querySelector('.daemon-node-status');
+      if (probeBtn) probeBtn.disabled = true;
+      status.className = 'daemon-node-status shrink-0 text-xs text-gray-400 dark:text-gray-500';
+      status.textContent = 'checking…';
+      const controller = new AbortController();
+      const to = setTimeout(() => controller.abort(), 20000);
+      return fetch('/json/testxmrdaemon', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ coin: coin, rpchost: host, rpcport: port }),
+        signal: controller.signal
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (data.reachable) {
+            node.status = 'ok';
+            node.latency = (typeof data.latency_ms === 'number') ? data.latency_ms : null;
+          } else {
+            node.status = 'bad';
+            node.latency = null;
+          }
+        })
+        .catch(() => { node.status = 'bad'; node.latency = null; })
+        .finally(() => {
+          clearTimeout(to);
+          if (probeBtn) probeBtn.disabled = false;
+          applyProbeVisual(row, node);
+        });
+    };
+
+    // Point the wallet at a node and persist it live via /json/setxmrdaemon, so
+    // the selection is saved without a full page reload.
+    const useNode = (node, useBtn) => {
+      const [host, port] = splitUrl(node.url);
+      clearError();
+      useBtn.disabled = true;
+      useBtn.innerHTML = SPINNER + 'Applying…';
+      const controller = new AbortController();
+      const to = setTimeout(() => controller.abort(), 20000);
+      fetch('/json/setxmrdaemon', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ coin: coin, rpchost: host, rpcport: port }),
+        signal: controller.signal
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (data && data.success) {
+            if (hostInput) { hostInput.value = host; hostInput.defaultValue = host; }
+            if (portInput) { portInput.value = port; portInput.defaultValue = port; }
+            node.status = 'ok';
+            if (typeof data.latency_ms === 'number') node.latency = data.latency_ms;
+            render();
+          } else {
+            showError((data && data.error) || `Failed to apply ${node.url}.`);
+            useBtn.disabled = false;
+            useBtn.textContent = 'Use';
+          }
+        })
+        .catch(() => {
+          showError(`Failed to apply ${node.url}.`);
+          useBtn.disabled = false;
+          useBtn.textContent = 'Use';
+        })
+        .finally(() => { clearTimeout(to); });
+    };
+
+    const buildRow = (node) => {
+      const isSelected = node.url !== '' && node.url === currentDaemonUrl();
+      const li = document.createElement('li');
+      li.className = 'daemon-node flex items-center gap-2 flex-wrap rounded-lg border p-2 ' +
+        (isSelected
+          ? 'border-blue-500 ring-1 ring-blue-500 bg-white dark:bg-gray-800'
+          : 'border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800');
+      li.dataset.url = node.url;
+
+      const probeBtn = document.createElement('button');
+      probeBtn.type = 'button';
+      probeBtn.className = 'daemon-node-probe flex items-center gap-2 min-w-0 grow text-left cursor-pointer';
+      probeBtn.title = 'Health-check this node';
+      const dot = document.createElement('span');
+      dot.className = healthDotClass(node.status);
+      const urlSpan = document.createElement('span');
+      urlSpan.className = 'daemon-node-url truncate font-mono text-sm text-gray-900 dark:text-white';
+      urlSpan.textContent = node.url;
+      const statusSpan = document.createElement('span');
+      statusSpan.className = 'daemon-node-status shrink-0 text-xs text-gray-400 dark:text-gray-500';
+      probeBtn.appendChild(dot);
+      probeBtn.appendChild(urlSpan);
+      probeBtn.appendChild(statusSpan);
+      probeBtn.addEventListener('click', () => { probeNode(node, li).then(() => { reorder(); render(); }); });
+
+      const actions = document.createElement('div');
+      actions.className = 'daemon-node-actions flex items-center gap-1 shrink-0';
+
+      const foLabel = document.createElement('label');
+      foLabel.className = 'flex items-center gap-1 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap cursor-pointer mr-1';
+      const foCb = document.createElement('input');
+      foCb.type = 'checkbox';
+      foCb.className = 'daemon-node-failover w-4 h-4 text-blue-600 rounded border-gray-300';
+      foCb.checked = !!node.failover;
+      foCb.addEventListener('change', () => { node.failover = foCb.checked; serialize(); saveNodes(); });
+      foLabel.appendChild(foCb);
+      foLabel.appendChild(document.createTextNode('Failover'));
+
+      let useControl;
+      if (isSelected) {
+        useControl = document.createElement('span');
+        useControl.className = 'daemon-node-selected inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg bg-blue-100 text-blue-700 dark:bg-blue-800 dark:text-white';
+        useControl.innerHTML = '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>Selected';
+        useControl.title = 'The wallet is currently pointed at this node';
+      } else {
+        useControl = document.createElement('button');
+        useControl.type = 'button';
+        useControl.className = 'daemon-node-use inline-flex items-center px-2.5 py-1.5 text-xs font-medium rounded-lg border border-blue-500 text-blue-600 dark:text-blue-400 hover:bg-blue-500 hover:text-white focus:outline-none focus:ring-2 focus:ring-blue-500';
+        useControl.textContent = 'Use';
+        useControl.title = 'Point the wallet at this node and save';
+        useControl.addEventListener('click', () => useNode(node, useControl));
+      }
+
+      const rmBtn = document.createElement('button');
+      rmBtn.type = 'button';
+      rmBtn.setAttribute('aria-label', 'Remove node');
+      rmBtn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>';
+      if (isSelected) {
+        rmBtn.disabled = true;
+        rmBtn.title = "Can't remove the node the wallet is currently using";
+        rmBtn.className = 'daemon-node-remove inline-flex items-center justify-center w-9 h-9 rounded-lg text-gray-300 dark:text-gray-500 cursor-not-allowed';
+      } else {
+        rmBtn.title = 'Remove node';
+        rmBtn.className = 'daemon-node-remove inline-flex items-center justify-center w-9 h-9 rounded-lg text-gray-400 hover:text-red-600 hover:bg-gray-100 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-red-500';
+        rmBtn.addEventListener('click', () => {
+          SettingsPage.showConfirmDialog(
+            'Remove node',
+            `Remove ${node.url} from the node list?`,
+            () => { nodes = nodes.filter(n => n !== node); render(); saveNodes(); }
+          );
+        });
+      }
+
+      actions.appendChild(foLabel);
+      actions.appendChild(useControl);
+      actions.appendChild(rmBtn);
+
+      li.appendChild(probeBtn);
+      li.appendChild(actions);
+      applyProbeVisual(li, node);
+      return li;
+    };
+
+    const render = () => {
+      listEl.innerHTML = '';
+      if (emptyEl) emptyEl.classList.toggle('hidden', nodes.length !== 0);
+      nodes.forEach(node => listEl.appendChild(buildRow(node)));
+      serialize();
+    };
+
+    const addNode = () => {
+      const raw = (addInput.value || '').trim();
+      if (raw === '') return;
+      if (raw.indexOf(':') < 0) { addInput.classList.add('border-red-500'); return; }
+      addInput.classList.remove('border-red-500');
+      if (nodes.some(n => n.url === raw)) { addInput.value = ''; return; }
+      nodes.push({ url: raw, failover: true, status: 'unknown', latency: null });
+      addInput.value = '';
+      render();
+      saveNodes();
+    };
+
+    if (addBtn) addBtn.addEventListener('click', addNode);
+    if (addInput) addInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); addNode(); }
+    });
+
+    if (checkAllBtn) checkAllBtn.addEventListener('click', () => {
+      if (nodes.length === 0) return;
+      const label = checkAllBtn.querySelector('.daemon-check-all-label');
+      const icon = checkAllBtn.querySelector('.daemon-check-all-icon');
+      const origLabel = label ? label.textContent : '';
+      checkAllBtn.disabled = true;
+      if (label) label.textContent = 'Checking…';
+      if (icon) icon.classList.add('animate-spin');
+      const rows = Array.from(listEl.querySelectorAll('.daemon-node'));
+      // Probe sequentially so nodes are queried one at a time (10s each server-side).
+      const seq = nodes.reduce((p, node, i) => p.then(() => {
+        const row = rows[i];
+        return row ? probeNode(node, row) : Promise.resolve();
+      }), Promise.resolve());
+      seq.finally(() => {
+        checkAllBtn.disabled = false;
+        if (label) label.textContent = origLabel || 'Check all';
+        if (icon) icon.classList.remove('animate-spin');
+        reorder();
+        render();
+      });
+    });
+
+    render();
   };
 
   SettingsPage.cleanup = function() {
