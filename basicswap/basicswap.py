@@ -12944,9 +12944,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             chain_height: int = ci_to.getChainHeight()
             lock_tx_depth: int = chain_height - bid.xmr_b_lock_tx.chain_height
             if lock_tx_depth < ci_to.depth_spendable():
-                raise TemporaryError(
-                    f"Chain B lock tx still confirming {lock_tx_depth} / {ci_to.depth_spendable()}."
+                delay: int = self.get_delay_retry_seconds()
+                self.log.debug(
+                    f"Chain B lock tx confirming {lock_tx_depth} / {ci_to.depth_spendable()} for bid {self.log.id(bid_id)}, "
+                    f"retrying spend in {delay} seconds."
                 )
+                self.createActionInSession(
+                    delay, ActionTypes.REDEEM_XMR_SWAP_LOCK_TX_B, bid_id, cursor
+                )
+                return
 
             if TxTypes.BCH_MERCY in bid.txns:
                 self.log.info("Using keyshare from mercy tx.")
@@ -13121,9 +13127,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             chain_height: int = ci_to.getChainHeight()
             lock_tx_depth: int = chain_height - bid.xmr_b_lock_tx.chain_height
             if lock_tx_depth < ci_to.depth_spendable():
-                raise TemporaryError(
-                    f"Chain B lock tx still confirming {lock_tx_depth} / {ci_to.depth_spendable()}."
+                delay: int = self.get_delay_retry_seconds()
+                self.log.debug(
+                    f"Chain B lock tx confirming {lock_tx_depth} / {ci_to.depth_spendable()} for bid {self.log.id(bid_id)}, "
+                    f"retrying refund in {delay} seconds."
                 )
+                self.createActionInSession(
+                    delay, ActionTypes.RECOVER_XMR_SWAP_LOCK_TX_B, bid_id, cursor
+                )
+                return
 
             if offer.coin_to in self.xmr_based_coins:
                 address_to = self.getCachedMainWalletAddress(ci_to, cursor)
