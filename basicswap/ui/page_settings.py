@@ -5,6 +5,7 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 import html
+import json
 
 from .util import (
     getCoinName,
@@ -42,6 +43,9 @@ def page_settings(self, url_split, post_string):
                 data = {
                     "debug": toBool(get_data_entry(form_data, "debugmode")),
                     "debug_ui": toBool(get_data_entry(form_data, "debugui")),
+                    "expire_unused_offers": toBool(
+                        get_data_entry(form_data, "expire_unused_offers")
+                    ),
                     "expire_db_records": toBool(
                         get_data_entry(form_data, "expire_db_records")
                     ),
@@ -174,9 +178,18 @@ def page_settings(self, url_split, post_string):
                         data["rpcport"] = int(
                             get_data_entry(form_data, "rpcport_" + name)
                         )
-                        data["remotedaemonurls"] = get_data_entry_or(
-                            form_data, "remotedaemonurls_" + name, ""
-                        )
+                        # Node list posted as JSON by the page JS; "" = cleared,
+                        # malformed = ignored (don't wipe the saved list).
+                        nodes_json = get_data_entry_or(
+                            form_data, "remotedaemonnodes_" + name, ""
+                        ).strip()
+                        if nodes_json == "":
+                            data["remote_daemon_nodes"] = []
+                        else:
+                            try:
+                                data["remote_daemon_nodes"] = json.loads(nodes_json)
+                            except ValueError:
+                                pass
                         data["automatically_select_daemon"] = (
                             True
                             if get_data_entry(form_data, "autosetdaemon_" + name)
@@ -354,14 +367,25 @@ def page_settings(self, url_split, post_string):
             )
             chains_formatted[-1]["rpchost"] = c.get("rpchost", "localhost")
             chains_formatted[-1]["rpcport"] = int(c.get("rpcport", 18081))
-            chains_formatted[-1]["remotedaemonurls"] = "\n".join(
-                c.get("remote_daemon_urls", [])
+            # Normalised {url, failover} list (legacy "host:port" strings => failover-on).
+            chains_formatted[-1]["remote_daemon_nodes"] = (
+                swap_client.normaliseRemoteDaemonUrls(c.get("remote_daemon_urls", []))
             )
             chains_formatted[-1]["autosetdaemon"] = c.get(
                 "automatically_select_daemon", False
             )
         else:
             chains_formatted[-1]["conf_target"] = c.get("conf_target", 2)
+
+        try:
+            chains_formatted[-1]["altruistic"] = swap_client.ci(
+                swap_client.getCoinIdFromName(name)
+            ).altruistic()
+        except Exception:
+            # Disabled coins have no interface to read the resolved setting from
+            chains_formatted[-1]["altruistic"] = c.get(
+                "altruistic", swap_client.getBaseAltruistic()
+            )
 
         if name == "particl":
             chains_formatted[-1]["anon_tx_ring_size"] = c.get("anon_tx_ring_size", 12)
@@ -383,6 +407,7 @@ def page_settings(self, url_split, post_string):
     general_settings = {
         "debug": swap_client.debug,
         "debug_ui": swap_client.debug_ui,
+        "expire_unused_offers": swap_client._expire_unused_offers,
         "expire_db_records": swap_client._expire_db_records,
         "check_updates": swap_client.settings.get("check_updates", True),
     }

@@ -8,6 +8,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 
+from .util import TemporaryError
+
 
 class WalletBackend(ABC):
 
@@ -160,6 +162,7 @@ class ElectrumBackend(WalletBackend):
         chain="mainnet",
         proxy_host=None,
         proxy_port=None,
+        cert_pins=None,
     ):
         from basicswap.interface.electrumx import ElectrumServer
         from basicswap.chainparams import Coins, chainparams
@@ -188,6 +191,7 @@ class ElectrumBackend(WalletBackend):
             log=log,
             proxy_host=proxy_host,
             proxy_port=proxy_port,
+            cert_pins=cert_pins,
         )
 
         self._realtime_callback = None
@@ -213,15 +217,11 @@ class ElectrumBackend(WalletBackend):
     def _call(self, method: str, params: list = None, timeout: int = 10):
         if self._background_mode and hasattr(self._server, "call_background"):
             return self._server.call_background(method, params, timeout)
-        if hasattr(self._server, "call_user"):
-            return self._server.call_user(method, params, timeout)
         return self._server.call(method, params, timeout)
 
     def _call_batch(self, calls: list, timeout: int = 15):
         if self._background_mode and hasattr(self._server, "call_batch_background"):
             return self._server.call_batch_background(calls, timeout)
-        if hasattr(self._server, "call_batch_user"):
-            return self._server.call_batch_user(calls, timeout)
         return self._server.call_batch(calls, timeout)
 
     def _is_server_stopping(self) -> bool:
@@ -758,57 +758,40 @@ class ElectrumBackend(WalletBackend):
         except Exception:
             return []
 
-    def getBatchBalance(self, scripthashes: List[str]) -> Dict[str, int]:
-        result = {}
-        for sh in scripthashes:
-            result[sh] = 0
-
-        try:
-            calls = [("blockchain.scripthash.get_balance", [sh]) for sh in scripthashes]
-            responses = self._call_batch(calls)
-            for sh, balance in zip(scripthashes, responses):
-                if balance:
-                    confirmed = balance.get("confirmed", 0)
-                    unconfirmed = balance.get("unconfirmed", 0)
-                    result[sh] = confirmed + unconfirmed
-        except Exception as e:
-            self._log.warning(f"ElectrumBackend.getBatchBalance error: {e}")
-
-        return result
-
     def getBatchUnspent(
         self, scripthashes: List[str], min_confirmations: int = 0
     ) -> Dict[str, List[dict]]:
+        # A partial or failed result must never read as "no UTXOs": callers size
+        # spends against this and would treat it as an empty wallet.
+        if not scripthashes:
+            return {}
+
+        current_height = self.getBlockHeight()
+        responses = self._split_batch_call(
+            scripthashes, "blockchain.scripthash.listunspent"
+        )
+        if len(responses) != len(scripthashes):
+            raise TemporaryError(
+                f"listunspent returned {len(responses)} of {len(scripthashes)} results"
+            )
+
         result = {}
-        for sh in scripthashes:
+        for sh, utxos in zip(scripthashes, responses):
+            if utxos is None:
+                raise TemporaryError(f"listunspent failed for scripthash {sh}")
             result[sh] = []
-
-        try:
-            current_height = self.getBlockHeight()
-
-            calls = [("blockchain.scripthash.listunspent", [sh]) for sh in scripthashes]
-            responses = self._call_batch(calls)
-            for sh, utxos in zip(scripthashes, responses):
-                if utxos:
-                    for utxo in utxos:
-                        height = utxo.get("height", 0)
-                        if height <= 0:
-                            confirmations = 0
-                        else:
-                            confirmations = current_height - height + 1
-
-                        if confirmations >= min_confirmations:
-                            result[sh].append(
-                                {
-                                    "txid": utxo.get("tx_hash"),
-                                    "vout": utxo.get("tx_pos"),
-                                    "value": utxo.get("value", 0),
-                                    "confirmations": confirmations,
-                                }
-                            )
-        except Exception as e:
-            self._log.warning(f"ElectrumBackend.getBatchUnspent error: {e}")
-
+            for utxo in utxos:
+                height = utxo.get("height", 0)
+                confirmations = 0 if height <= 0 else current_height - height + 1
+                if confirmations >= min_confirmations:
+                    result[sh].append(
+                        {
+                            "txid": utxo.get("tx_hash"),
+                            "vout": utxo.get("tx_pos"),
+                            "value": utxo.get("value", 0),
+                            "confirmations": confirmations,
+                        }
+                    )
         return result
 
     def enableRealtimeNotifications(self, callback) -> None:

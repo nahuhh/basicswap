@@ -28,6 +28,7 @@ from basicswap.basicswap import (
     BasicSwap,
     SwapTypes,
 )
+from basicswap.base import BaseApp
 from basicswap.contrib.mnemonic import Mnemonic
 from basicswap.db import create_db_, DBMethods, KnownIdentity
 from basicswap.util import h2b
@@ -48,6 +49,7 @@ from basicswap.util_xmr import (
     encode_address as xmr_encode_address,
 )
 from basicswap.interface.btc.btc import BTCInterface
+from basicswap.util.logging import BSXLogger
 from basicswap.interface.xmr.xmr import XMRInterface
 from tests.basicswap.util.mnemonics import mnemonics
 from tests.basicswap.util.common import (
@@ -55,7 +57,11 @@ from tests.basicswap.util.common import (
     PREFIX_SECRET_KEY_REGTEST,
 )
 
-from basicswap.basicswap_util import TxLockTypes
+from basicswap.config import DEFAULT_ALTRUISTIC
+from basicswap.basicswap_util import (
+    ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER,
+    TxLockTypes,
+)
 from basicswap.util import (
     make_int,
     SerialiseNum,
@@ -68,7 +74,9 @@ from basicswap.messages_npb import (
     BidMessage,
 )
 from basicswap.contrib.test_framework.script import (
+    CScript,
     hash160 as hash160_btc,
+    OP_CHECKMULTISIG,
     SegwitV0SignatureHash,
     SIGHASH_ALL,
 )
@@ -83,19 +91,93 @@ from basicswap.contrib.test_framework.messages import (
 logger = logging.getLogger()
 
 
+class _FakeSwapClient:
+    # Use the real lookup, BaseApp can't be instantiated without a datadir
+    getBaseAltruistic = BaseApp.getBaseAltruistic
+
+    def __init__(self, settings=None):
+        self.settings = {"chainclients": {}}
+        if settings:
+            self.settings.update(settings)
+        self.log = BSXLogger("test")
+
+    def getChainClientSettings(self, coin):
+        return {}
+
+
 class Test(unittest.TestCase):
 
     @staticmethod
     def ci_btc():
         btc_coin_settings = {"rpcport": 0, "rpcauth": "none"}
         btc_coin_settings.update(REQUIRED_SETTINGS)
-        return BTCInterface(btc_coin_settings, "regtest")
+        ci = BTCInterface(btc_coin_settings, "regtest")
+        # Without a swap client _log is the logging module, which has no id()
+        ci._log = BSXLogger("test")
+        return ci
 
     @staticmethod
     def ci_xmr():
         xmr_coin_settings = {"rpcport": 0, "walletrpcport": 0, "walletrpcauth": "none"}
         xmr_coin_settings.update(REQUIRED_SETTINGS)
         return XMRInterface(xmr_coin_settings, "regtest")
+
+    def test_altruistic_setting(self):
+        def ci_btc_with(coin_setting=None, swap_client=None):
+            coin_settings = {"rpcport": 0, "rpcauth": "none"}
+            coin_settings.update(REQUIRED_SETTINGS)
+            if coin_setting is not None:
+                coin_settings["altruistic"] = coin_setting
+            ci = BTCInterface(coin_settings, "regtest", swap_client=swap_client)
+            ci._log = BSXLogger("test")
+            return ci
+
+        sc_unset = _FakeSwapClient()
+        sc_on = _FakeSwapClient({"altruistic": True})
+        sc_off = _FakeSwapClient({"altruistic": False})
+
+        # No swap client or base unset, no coin key → the shared default
+        assert ci_btc_with()._altruistic is DEFAULT_ALTRUISTIC
+        assert ci_btc_with(swap_client=sc_unset)._altruistic is DEFAULT_ALTRUISTIC
+
+        # Base off, no coin key → off
+        assert ci_btc_with(swap_client=sc_off)._altruistic is False
+
+        # Base on, no coin key → on
+        assert ci_btc_with(swap_client=sc_on)._altruistic is True
+
+        # Coin key wins over base, both directions
+        assert ci_btc_with(False, sc_on)._altruistic is False
+        assert ci_btc_with(True, sc_off)._altruistic is True
+
+    def test_altruistic_coin_setting_passthrough(self):
+        logging.info("---------- Test altruistic coin setting passthrough")
+        basicswap_dir = "/tmp/bsx_test_other"
+        if not os.path.exists(basicswap_dir):
+            os.makedirs(basicswap_dir)
+
+        k = PrivateKey()
+        settings = {
+            "network_key": toWIF(PREFIX_SECRET_KEY_REGTEST, k.secret),
+            "network_pubkey": k.public_key.format().hex(),
+            "chainclients": {
+                "bitcoin": {"altruistic": True},
+                "decred": {"altruistic": False},
+            },
+        }
+
+        sc = BasicSwap(
+            basicswap_dir,
+            settings,
+            "regtest",
+            log_name="bsx_test_other",
+        )
+        # setCoinConnectParams must forward the key, the interfaces read coin_clients
+        assert sc.coin_clients[Coins.BTC]["altruistic"] is True
+        assert sc.coin_clients[Coins.DCR]["altruistic"] is False
+        assert "altruistic" not in sc.coin_clients[Coins.LTC]
+
+        del sc
 
     def test_serialise_num(self):
         def test_case(v, nb=None):
@@ -135,6 +217,210 @@ class Test(unittest.TestCase):
         encoded = ci.getExpectedSequence(TxLockTypes.SEQUENCE_LOCK_BLOCKS, blocks_val)
         decoded = ci.decodeSequence(encoded)
         assert decoded == blocks_val
+
+    def test_csv_lock_remaining(self):
+        ci = self.ci_btc()
+
+        parent_height: int = 100
+        parent_time: int = 1700000000
+        encoded = ci.getExpectedSequence(TxLockTypes.SEQUENCE_LOCK_TIME, 4 * 60 * 60)
+        lock_value: int = ci.decodeSequence(encoded)
+
+        assert (
+            ci.csvLockRemaining(
+                TxLockTypes.SEQUENCE_LOCK_TIME,
+                encoded,
+                parent_height,
+                parent_time,
+                chain_mtp=parent_time,
+                coin_mtp=parent_time,
+            )
+            == lock_value
+        )
+        assert (
+            ci.csvLockRemaining(
+                TxLockTypes.SEQUENCE_LOCK_TIME,
+                encoded,
+                parent_height,
+                parent_time,
+                chain_mtp=parent_time + lock_value,
+                coin_mtp=parent_time,
+            )
+            == 0
+        )
+
+        # A remaining value at or below zero must mean the lock has matured
+        for offset in range(0, lock_value + 1024, 499):
+            chain_mtp: int = parent_time + offset
+            remaining = ci.csvLockRemaining(
+                TxLockTypes.SEQUENCE_LOCK_TIME,
+                encoded,
+                parent_height,
+                parent_time,
+                chain_mtp=chain_mtp,
+                coin_mtp=parent_time,
+            )
+            assert (remaining <= 0) == ci.isCsvLockMature(
+                TxLockTypes.SEQUENCE_LOCK_TIME,
+                encoded,
+                parent_height,
+                parent_time,
+                chain_mtp=chain_mtp,
+                coin_mtp=parent_time,
+            )
+
+        # Unknown until the lock tx is in a block
+        assert (
+            ci.csvLockRemaining(TxLockTypes.SEQUENCE_LOCK_TIME, encoded, None, None)
+            is None
+        )
+        assert (
+            ci.csvLockRemaining(
+                TxLockTypes.SEQUENCE_LOCK_TIME, encoded, parent_height, None
+            )
+            is None
+        )
+
+        encoded = ci.getExpectedSequence(TxLockTypes.SEQUENCE_LOCK_BLOCKS, 10)
+        assert (
+            ci.csvLockRemaining(
+                TxLockTypes.SEQUENCE_LOCK_BLOCKS,
+                encoded,
+                parent_height,
+                parent_time,
+                chain_height=parent_height + 5,
+            )
+            == 4
+        )
+
+    def test_lock_spend_margin(self):
+        # The margin the follower applies before publishing the lock spend tx
+        ci = self.ci_btc()
+
+        parent_height: int = 100
+        parent_time: int = 1700000000
+        margin: int = 3600
+        encoded = ci.getExpectedSequence(TxLockTypes.SEQUENCE_LOCK_TIME, 48 * 60 * 60)
+        lock_value: int = ci.decodeSequence(encoded)
+
+        def remaining_at(chain_mtp: int) -> int:
+            return ci.csvLockRemaining(
+                TxLockTypes.SEQUENCE_LOCK_TIME,
+                encoded,
+                parent_height,
+                parent_time,
+                chain_mtp=chain_mtp,
+                coin_mtp=parent_time,
+            )
+
+        # Exactly at the margin must still publish, one second under must not
+        assert remaining_at(parent_time + lock_value - margin) == margin
+        assert remaining_at(parent_time + lock_value - margin) >= margin
+        assert remaining_at(parent_time + lock_value - margin + 1) < margin
+
+        # An expired lock must always be caught by the same comparison
+        for offset in range(lock_value, lock_value + 2048, 499):
+            assert remaining_at(parent_time + offset) < margin
+            assert ci.isCsvLockMature(
+                TxLockTypes.SEQUENCE_LOCK_TIME,
+                encoded,
+                parent_height,
+                parent_time,
+                chain_mtp=parent_time + offset,
+                coin_mtp=parent_time,
+            )
+
+        # An honest leader releases well before its own margin, even on the shortest offer
+        release_margin: int = 3600
+        assert margin <= release_margin
+        # min_sequence_lock_seconds less the wait for the coin b lock to be spendable
+        assert (2 * 60 * 60) - (10 * 120) >= margin
+
+    def test_lock_spend_tx_fee(self):
+        # The lock spend tx must pay more than the lock refund tx, else the refund tx
+        # can replace it by RBF once the spend tx has been broadcast
+        ci = self.ci_btc()
+
+        Kal = ci.getPubkey(ci.getNewRandomKey())
+        Kaf = ci.getPubkey(ci.getNewRandomKey())
+        script_lock = CScript([2, Kal, Kaf, 2, OP_CHECKMULTISIG])
+        pkh_dest = ci.pkh(Kaf)
+
+        locked_coin: int = ci.make_int(0.1)
+        lock_tx = CTransaction()
+        lock_tx.nVersion = ci.txVersion()
+        lock_tx.vin.append(
+            CTxIn(COutPoint(uint256_from_str(secrets.token_bytes(32)), 0))
+        )
+        lock_tx.vout.append(CTxOut(locked_coin, ci.getScriptDest(script_lock)))
+        lock_tx.rehash()
+        lock_tx_bytes = lock_tx.serialize()
+
+        lock1_value = ci.getExpectedSequence(
+            TxLockTypes.SEQUENCE_LOCK_TIME, 2 * 60 * 60
+        )
+        csv_val = ci.getExpectedSequence(TxLockTypes.SEQUENCE_LOCK_TIME, 2 * 60 * 60)
+
+        for fee_rate in (1000, 1013, 2500, 10000, 59999):
+            refund_tx, _, refund_value = ci.createSCLockRefundTx(
+                lock_tx_bytes,
+                script_lock,
+                Kal,
+                Kaf,
+                lock1_value,
+                csv_val,
+                fee_rate,
+            )
+            refund_fee: int = locked_coin - refund_value
+
+            spend_tx = ci.createSCLockSpendTx(
+                lock_tx_bytes,
+                script_lock,
+                pkh_dest,
+                fee_rate,
+                tx_lock_refund_bytes=refund_tx,
+            )
+            spend_fee: int = locked_coin - ci.loadTx(spend_tx).vout[0].nValue
+
+            assert spend_fee == refund_fee + ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER
+            # RBF rule 3 rejects the refund tx as a replacement while this holds
+            assert spend_fee > refund_fee
+
+            ci.verifySCLockSpendTx(
+                spend_tx,
+                lock_tx_bytes,
+                script_lock,
+                pkh_dest,
+                fee_rate,
+                tx_lock_refund_bytes=refund_tx,
+            )
+
+            # A spend tx paying the refund tx's fee must be rejected
+            tx = ci.loadTx(spend_tx)
+            tx.vout[0].nValue += ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER
+            tx.rehash()
+            try:
+                ci.verifySCLockSpendTx(
+                    tx.serialize(),
+                    lock_tx_bytes,
+                    script_lock,
+                    pkh_dest,
+                    fee_rate,
+                    tx_lock_refund_bytes=refund_tx,
+                )
+                assert False, "Should fail"
+            except Exception as e:
+                assert "Bad fee" in str(e)
+
+    def test_compare_fee_rates(self):
+        # compareFeeRates must accept every fee feeForVSize can produce
+        ci = self.ci_btc()
+
+        for vsize in range(110, 400):
+            for expected in range(500, 20000, 7):
+                paid_rate: int = ci.feeForVSize(expected, vsize) * 1000 // vsize
+                assert ci.compareFeeRates(paid_rate, expected)
+                assert ci.compareFeeRates(expected - 1, expected) is False
 
     def test_make_int(self):
         def test_case(vs, vf, expect_int):
@@ -1267,6 +1553,99 @@ class Test(unittest.TestCase):
         sc.settings["strict_swap_type"] = False
         for case in should_pass:
             sc.validateSwapType(case[0], case[1], case[2])
+
+        del sc
+
+    def test_validateOfferLockValue(self):
+        logging.info("---------- Test validateOfferLockValue")
+        basicswap_dir = "/tmp/bsx_test_other"
+        if not os.path.exists(basicswap_dir):
+            os.makedirs(basicswap_dir)
+
+        k = PrivateKey()
+        settings = {
+            "network_key": toWIF(PREFIX_SECRET_KEY_REGTEST, k.secret),
+            "network_pubkey": k.public_key.format().hex(),
+        }
+
+        sc = BasicSwap(
+            basicswap_dir,
+            settings,
+            "regtest",
+            log_name="bsx_test_other",
+        )
+
+        # use_csv is the only coin_clients entry validateOfferLockValue reads
+        sc.coin_clients[Coins.BTC] = {"use_csv": True}
+        sc.coin_clients[Coins.XMR] = {"use_csv": True}
+        sc.coin_clients[Coins.PIVX] = {"use_csv": False}
+
+        seq_time = (
+            SwapTypes.XMR_SWAP,
+            Coins.BTC,
+            Coins.XMR,
+            TxLockTypes.SEQUENCE_LOCK_TIME,
+        )
+        seq_blocks = (
+            SwapTypes.XMR_SWAP,
+            Coins.BTC,
+            Coins.XMR,
+            TxLockTypes.SEQUENCE_LOCK_BLOCKS,
+        )
+        # The absolute lock types require at least one coin without CSV
+        abs_time = (
+            SwapTypes.SELLER_FIRST,
+            Coins.PIVX,
+            Coins.BTC,
+            TxLockTypes.ABS_LOCK_TIME,
+        )
+        abs_blocks = (
+            SwapTypes.SELLER_FIRST,
+            Coins.PIVX,
+            Coins.BTC,
+            TxLockTypes.ABS_LOCK_BLOCKS,
+        )
+
+        time_locks = [seq_time + (24 * 60 * 60,), abs_time + (24 * 60 * 60,)]
+        block_locks = [seq_blocks + (100,), abs_blocks + (100,)]
+
+        for case in time_locks + block_locks:
+            sc.validateOfferLockValue(*case)
+
+        out_of_range = [
+            seq_time + (sc.min_sequence_lock_seconds - 1,),
+            seq_time + (sc.max_sequence_lock_seconds + 1,),
+            seq_blocks + (4,),
+            seq_blocks + (1001,),
+            abs_time + (4 * 60 * 60 - 1,),
+            abs_time + (96 * 60 * 60 + 1,),
+            abs_blocks + (9,),
+            abs_blocks + (1001,),
+        ]
+        for case in out_of_range:
+            self.assertRaises(ValueError, sc.validateOfferLockValue, *case)
+
+        self.assertRaises(
+            ValueError,
+            sc.validateOfferLockValue,
+            SwapTypes.XMR_SWAP,
+            Coins.BTC,
+            Coins.XMR,
+            0,
+            100,
+        )
+
+        # Block count lock types are only valid on regtest
+        sc.chain = "mainnet"
+        for case in time_locks:
+            sc.validateOfferLockValue(*case)
+        for case in block_locks:
+            self.assertRaisesRegex(
+                ValueError,
+                "for testing only",
+                sc.validateOfferLockValue,
+                *case,
+            )
 
         del sc
 

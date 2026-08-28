@@ -77,6 +77,7 @@ from .offer_tracking import (
     get_offer_tracking,
     init_offer_tracking,
     offer_budget_allows,
+    offer_has_negotiating_bid,
     offer_in_flight_amount,
     offer_tracking_is_exhausted,
     offer_tracking_remaining,
@@ -191,8 +192,8 @@ import basicswap.protocols.xmr_swap_1 as xmr_swap_1
 PROTOCOL_VERSION_SECRET_HASH = 5
 MINPROTO_VERSION_SECRET_HASH = 4
 
-PROTOCOL_VERSION_ADAPTOR_SIG = 4
-MINPROTO_VERSION_ADAPTOR_SIG = 4
+PROTOCOL_VERSION_ADAPTOR_SIG = 6
+MINPROTO_VERSION_ADAPTOR_SIG = 6
 
 MINPROTO_VERSION = min(MINPROTO_VERSION_SECRET_HASH, MINPROTO_VERSION_ADAPTOR_SIG)
 MAXPROTO_VERSION = 10
@@ -298,6 +299,7 @@ def threadPollXMRChainState(swap_client, coin_type):
             swap_client.log.warning(
                 f"threadPollXMRChainState {ci.ticker()}, error: {e}"
             )
+            swap_client.tryXMRDaemonFailover(coin_type, e)
         swap_client.chainstate_delay_event.wait(
             random.randrange(20, 30)
         )  # Random to stagger updates
@@ -508,16 +510,29 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         )
         self._keep_notifications = self.settings.get("keep_notifications", 50)
         self._show_notifications = self.settings.get("show_notifications", 10)
+        self._expire_unused_offers = self.settings.get("expire_unused_offers", True)
+        self._expire_unused_offers_after = self.get_int_setting(
+            "expire_unused_offers_after", 7 * 86400, 0, 315600000
+        )  # Seconds
         self._expire_db_records = self.settings.get("expire_db_records", False)
         self._expire_db_records_after = self.get_int_setting(
-            "expire_db_records_after", 7 * 86400, 0, 31 * 86400
+            "expire_db_records_after", 7 * 86400, 0, 315600000
         )  # Seconds
         self._sc_lock_tx_timeout = self.get_int_setting(
-            "sc_lock_tx_timeout", 48 * 3600, 3600, 6 * 3600
+            "sc_lock_tx_timeout", 1200, 1200, 48 * 3600
         )  # Seconds
         self._sc_lock_tx_mempool_timeout = self.get_int_setting(
-            "sc_lock_tx_mempool_timeout", 48 * 3600, 3600, 12 * 3600
+            "sc_lock_tx_mempool_timeout", 12 * 3600, 3600, 48 * 3600
         )  # Seconds
+        self._sc_lock_release_min_margin = self.get_int_setting(
+            "sc_lock_release_min_margin", 3600, 600, 24 * 3600
+        )  # Seconds
+        self._sc_lock_spend_min_margin = self.get_int_setting(
+            "sc_lock_spend_min_margin", 3600, 600, 24 * 3600
+        )  # Seconds
+        self._mercy_watch_timeout_blocks = self.get_int_setting(
+            "mercy_watch_timeout_blocks", 100, 6, 10000
+        )  # Blocks, the swiper waits blocks_confirmed before sending
 
         self._max_logfile_bytes = self.settings.get(
             "max_logfile_size", 100
@@ -533,18 +548,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self._tx_cache = {}
         self._price_cache = {}
         self._volume_cache = {}
-        self._historical_cache = {}
         self._pending_bid_notifications = set()
         self._price_cache_lock = threading.Lock()
+        self._rate_limit_backoff_until = 0
+        self._rate_limit_backoff_step = 1
         self._price_fetch_thread = None
         self._price_fetch_running = False
         self._last_price_fetch = 0
-        self._last_volume_fetch = 0
         self.price_fetch_interval = self.get_int_setting(
             "price_fetch_interval", 5 * 60, 60, 60 * 60
-        )
-        self.volume_fetch_interval = self.get_int_setting(
-            "volume_fetch_interval", 5 * 60, 60, 60 * 60
         )
 
         self._max_transient_errors = self.settings.get(
@@ -594,7 +606,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         )
 
         self.min_sequence_lock_seconds = self.get_int_setting(
-            "min_sequence_lock_seconds", 60 if self.debug else (1 * 60 * 60)
+            "min_sequence_lock_seconds", 60 if self.debug else (2 * 60 * 60)
         )
         self.max_sequence_lock_seconds = self.get_int_setting(
             "max_sequence_lock_seconds", 96 * 60 * 60
@@ -620,6 +632,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             max_workers=4, thread_name_prefix="bsp"
         )
         self._electrum_spend_check_futures = {}
+        self._electrum_cert_pins = None
 
         # Encode key to match network
         wif_prefix = chainparams[Coins.PART][self.chain]["key_prefix"]
@@ -909,6 +922,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         # Passthrough settings
         for setting_name in (
+            "altruistic",
             "use_descriptors",
             "use_legacy_key_paths",
             "wallet_name",
@@ -925,7 +939,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     setting_name
                 ]
 
-        if coin in (Coins.FIRO, Coins.LTC):
+        if coin in (Coins.BTC, Coins.FIRO, Coins.LTC):
             if not chain_client_settings.get("min_relay_fee"):
                 chain_client_settings["min_relay_fee"] = 0.00001
 
@@ -1017,55 +1031,89 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 proxy_port = self.tor_proxy_port
         return proxy_host, proxy_port
 
-    def selectXMRRemoteDaemon(self, coin):
-        self.log.info("Selecting remote XMR daemon.")
-        chain_client_settings = self.getChainClientSettings(coin)
-        remote_daemon_urls = chain_client_settings.get("remote_daemon_urls", [])
-
+    def probeXMRDaemon(self, coin, rpchost, rpcport) -> dict:
         coin_settings = self.coin_clients[coin]
-        rpchost: str = coin_settings["rpchost"]
-        rpcport: int = coin_settings["rpcport"]
-        timeout: int = coin_settings["rpctimeout"]
-
-        def get_rpc_func(rpcport, daemon_login, rpchost):
-
-            proxy_host, proxy_port = self.getXMRWalletProxy(coin, rpchost)
-            if proxy_host:
-                self.log.info(f"Connecting through proxy at {proxy_host}.")
-
-            if coin in self.xmr_based_coins:
-                return make_xmr_rpc2_func(
-                    rpcport,
-                    daemon_login,
-                    rpchost,
-                    proxy_host=proxy_host,
-                    proxy_port=proxy_port,
-                )
-
         daemon_login = None
         if coin_settings.get("rpcuser", "") != "":
             daemon_login = (
                 coin_settings.get("rpcuser", ""),
                 coin_settings.get("rpcpassword", ""),
             )
+        proxy_host, proxy_port = self.getXMRWalletProxy(coin, rpchost)
+        if proxy_host:
+            self.log.debug(
+                f"Probing {getCoinName(coin)} daemon through proxy at {proxy_host}."
+            )
+        timeout: int = self.getChainClientSettings(coin).get(
+            "daemon_select_timeout", 10
+        )
+        rpc2 = make_xmr_rpc2_func(
+            int(rpcport),
+            daemon_login,
+            rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+        )
+        start_time = time.time()
+        try:
+            _ = rpc2("get_height", timeout=timeout)["height"]
+            latency_ms = int(round((time.time() - start_time) * 1000))
+            return {"reachable": True, "latency_ms": latency_ms}
+        except Exception as e:
+            self.log.warning(
+                f"{getCoinName(coin)} daemon {rpchost}:{rpcport} unreachable: {e}"
+            )
+            return {"reachable": False, "error": str(e)}
+
+    def isXMRDaemonReachable(self, coin, rpchost, rpcport) -> bool:
+        return self.probeXMRDaemon(coin, rpchost, rpcport)["reachable"]
+
+    @staticmethod
+    def normaliseRemoteDaemonUrls(entries) -> list:
+        # Legacy "host:port" strings normalise to failover-enabled dicts.
+        normalised = []
+        seen = set()
+        for entry in entries or []:
+            if isinstance(entry, str):
+                url = entry.strip()
+                failover = True
+            elif isinstance(entry, dict):
+                url = str(entry.get("url", "")).strip()
+                failover = bool(entry.get("failover", True))
+            else:
+                continue
+            if url == "" or url in seen:
+                continue
+            seen.add(url)
+            normalised.append({"url": url, "failover": failover})
+        return normalised
+
+    def getFailoverDaemonUrls(self, coin) -> list:
+        # URLs of the nodes marked for automatic failover/selection. Nodes kept in
+        # the list with failover disabled are only used for manual selection.
+        nodes = self.normaliseRemoteDaemonUrls(
+            self.getChainClientSettings(coin).get("remote_daemon_urls", [])
+        )
+        return [n["url"] for n in nodes if n["failover"]]
+
+    def selectXMRRemoteDaemon(self, coin):
+        self.log.info("Selecting remote XMR daemon.")
+        failover_urls = self.getFailoverDaemonUrls(coin)
+
+        coin_settings = self.coin_clients[coin]
+        rpchost: str = coin_settings["rpchost"]
+        rpcport: int = coin_settings["rpcport"]
+
         current_daemon_url = f"{rpchost}:{rpcport}"
-        if current_daemon_url in remote_daemon_urls:
+        if current_daemon_url in failover_urls:
             self.log.info(f"Trying last used url {rpchost}:{rpcport}.")
-            try:
-                rpc2 = get_rpc_func(rpcport, daemon_login, rpchost)
-                _ = rpc2("get_height", timeout=timeout)["height"]
+            if self.isXMRDaemonReachable(coin, rpchost, rpcport):
                 return True
-            except Exception as e:
-                self.log.warning(
-                    f"Failed to set XMR remote daemon to {rpchost}:{rpcport}, {e}"
-                )
-        random.shuffle(remote_daemon_urls)
-        for url in remote_daemon_urls:
+        random.shuffle(failover_urls)
+        for url in failover_urls:
             self.log.info(f"Trying url {url}.")
-            try:
-                rpchost, rpcport = url.rsplit(":", 1)
-                rpc2 = get_rpc_func(rpcport, daemon_login, rpchost)
-                _ = rpc2("get_height", timeout=timeout)["height"]
+            rpchost, rpcport = url.rsplit(":", 1)
+            if self.isXMRDaemonReachable(coin, rpchost, rpcport):
                 coin_settings["rpchost"] = rpchost
                 coin_settings["rpcport"] = rpcport
                 data = {
@@ -1074,10 +1122,60 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 }
                 self.editSettings(self.coin_clients[coin]["name"], data)
                 return True
-            except Exception as e:
-                self.log.warning(f"Failed to set XMR remote daemon to {url}, {e}")
 
         raise ValueError("Failed to select a working XMR daemon url.")
+
+    def tryXMRDaemonFailover(self, coin_type, exc) -> bool:
+        # Error-driven failover: switch to another remote_daemon_urls entry via set_daemon.
+        if coin_type not in (Coins.XMR, Coins.WOW):
+            return False
+        if not self.isCoinActive(coin_type):
+            return False
+        chain_client_settings = self.getChainClientSettings(coin_type)
+        if not chain_client_settings.get("automatically_select_daemon", False):
+            return False
+        if len(self.getFailoverDaemonUrls(coin_type)) < 1:
+            return False
+
+        ci = self.ci(coin_type)
+        if not ci.is_transient_error(exc):
+            return False
+        self.log.warning(f"{ci.coin_name()} daemon error, attempting failover: {exc}")
+        try:
+            self.selectXMRRemoteDaemon(coin_type)
+            return True
+        except Exception as e:
+            self.log.error(f"{ci.coin_name()} daemon failover failed: {e}")
+            return False
+
+    def setXMRWalletDaemon(self, coin) -> bool:
+        # set_daemon needs an open wallet; retried a few times for a not-yet-ready node.
+        ci = self.ci(coin)
+        auto_select = self.getChainClientSettings(coin).get(
+            "automatically_select_daemon", False
+        )
+        for i in range(3):
+            try:
+                rpchost = self.coin_clients[coin]["rpchost"]
+                rpcport = self.coin_clients[coin]["rpcport"]
+                # Confirm the daemon answers before set_daemon; fail over if it's down.
+                if auto_select and not self.isXMRDaemonReachable(
+                    coin, rpchost, rpcport
+                ):
+                    self.selectXMRRemoteDaemon(coin)
+                    rpchost = self.coin_clients[coin]["rpchost"]
+                    rpcport = self.coin_clients[coin]["rpcport"]
+                ci.setDaemonAddress(rpchost, rpcport)
+                self.log.debug(
+                    f"set_daemon for {ci.coin_name()} succeeded, daemon set to {rpchost}:{rpcport}"
+                )
+                return True
+            except Exception as e:
+                self.log.warning(
+                    f"set_daemon for {ci.coin_name()} failed (attempt {i + 1}): {e}"
+                )
+                self.delay_event.wait(2)
+        return False
 
     def isCoinActive(self, coin):
         use_coinid = coin
@@ -1128,6 +1226,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             raise ValueError(f"Unknown protocol_ind {protocol_ind}")
         return self.protocolInterfaces[protocol_ind]
 
+    def getElectrumCertPins(self):
+        # One store for every coin: separate stores would overwrite each
+        # other's pins when saving.
+        if self._electrum_cert_pins is None:
+            from .interface.electrumx import CERT_PINS_FILENAME, CertPinStore
+
+            self._electrum_cert_pins = CertPinStore(
+                os.path.join(self.data_dir, CERT_PINS_FILENAME)
+            )
+        return self._electrum_cert_pins
+
     def _initElectrumBackend(self, coin, interface) -> bool:
         from .wallet_backend import ElectrumBackend
 
@@ -1148,6 +1257,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 chain=self.chain,
                 proxy_host=proxy_host,
                 proxy_port=proxy_port,
+                cert_pins=self.getElectrumCertPins(),
             )
             interface.setBackend(backend)
             ticker = interface.ticker() if hasattr(interface, "ticker") else str(coin)
@@ -1403,7 +1513,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                         self.log.warning(
                             f"Can't open {ci.coin_name()} wallet, could be locked."
                         )
+                        # Wallet isn't open, so skip set_daemon.
                         continue
+                    self.setXMRWalletDaemon(c)
                 elif c == Coins.LTC:
                     ci_mweb = self.ci(Coins.LTC_MWEB)
                     is_encrypted, _ = self.getLockedState()
@@ -1951,6 +2063,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
             if coin is None or coin == Coins.PART:
                 self._is_locked = False
+
+            # Encrypted wallets skip the startup set_daemon (locked); send it now.
+            for c in self.activeCoins():
+                if c in (Coins.XMR, Coins.WOW) and (coin is None or coin == c):
+                    self.setXMRWalletDaemon(c)
 
             self.loadFromDB()
 
@@ -2704,6 +2821,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     chain=self.chain,
                     proxy_host=proxy_host,
                     proxy_port=proxy_port,
+                    cert_pins=self.getElectrumCertPins(),
                 )
             else:
                 backend = ci._backend
@@ -3581,6 +3699,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         if cursor is None:
             self.saveBid(bid.bid_id, bid)
 
+        # Remove locked mercy outputs
+        reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
+        ci_from = self.ci(offer.coin_to if reverse_bid else offer.coin_from)
+        self._unlockMercyPrevout(ci_from, bid, cursor)
+
         # Remove any watched outputs
         self.removeWatchedOutput(Coins(offer.coin_from), bid.bid_id, None)
         self.removeWatchedOutput(Coins(offer.coin_to), bid.bid_id, None)
@@ -4069,33 +4192,35 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             if swap_type == SwapTypes.XMR_SWAP:
                 reverse_bid: bool = self.is_reverse_ads_bid(coin_from, coin_to)
                 itx_coin_has_csv = coin_to_has_csv if reverse_bid else coin_from_has_csv
-                ensure(itx_coin_has_csv, "ITX coin needs CSV activated.")
+                ensure(itx_coin_has_csv, "ITX coin needs CSV activated")
             else:
                 ensure(
                     coin_from_has_csv and coin_to_has_csv,
-                    "Both coins need CSV activated.",
+                    "Both coins need CSV activated",
                 )
         elif lock_type == TxLockTypes.SEQUENCE_LOCK_BLOCKS:
+            ensure(self.chain == "regtest", "SEQUENCE_LOCK_BLOCKS is for testing only")
             ensure(lock_value >= 5 and lock_value <= 1000, "Invalid lock_value blocks")
             if swap_type == SwapTypes.XMR_SWAP:
                 reverse_bid: bool = self.is_reverse_ads_bid(coin_from, coin_to)
                 itx_coin_has_csv = coin_to_has_csv if reverse_bid else coin_from_has_csv
-                ensure(itx_coin_has_csv, "ITX coin needs CSV activated.")
+                ensure(itx_coin_has_csv, "ITX coin needs CSV activated")
             else:
                 ensure(
                     coin_from_has_csv and coin_to_has_csv,
-                    "Both coins need CSV activated.",
+                    "Both coins need CSV activated",
                 )
         elif lock_type == TxLockTypes.ABS_LOCK_TIME:
             # TODO: range?
-            ensure(not coin_from_has_csv or not coin_to_has_csv, "Should use CSV.")
+            ensure(not coin_from_has_csv or not coin_to_has_csv, "Should use CSV")
             ensure(
                 lock_value >= 4 * 60 * 60 and lock_value <= 96 * 60 * 60,
                 "Invalid lock_value time",
             )
         elif lock_type == TxLockTypes.ABS_LOCK_BLOCKS:
             # TODO: range?
-            ensure(not coin_from_has_csv or not coin_to_has_csv, "Should use CSV.")
+            ensure(self.chain == "regtest", "ABS_LOCK_BLOCKS is for testing only")
+            ensure(not coin_from_has_csv or not coin_to_has_csv, "Should use CSV")
             ensure(lock_value >= 10 and lock_value <= 1000, "Invalid lock_value blocks")
         else:
             raise ValueError("Unknown locktype")
@@ -4163,7 +4288,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         )
         self.log.debug(f"Ensuring wallet can send {balance_msg}.")
         try:
-            if ci.interface_type() in self.scriptless_coins:
+            if (
+                ci.interface_type() in self.scriptless_coins
+                or ci.interface_type() == Coins.PART_BLIND
+            ):
                 ci.ensureFunds(ensure_balance + estimated_fee)
             elif ci.useBackend():
                 self.log.debug(
@@ -4481,7 +4609,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         return offer_id
 
-    def revokeOffer(self, offer_id, security_token=None) -> None:
+    def revokeOffer(
+        self, offer_id, security_token=None, refuse_if_negotiating: bool = False
+    ) -> None:
         self.log.info(f"Revoking offer {self.log.id(offer_id)}")
 
         cursor = self.openDB()
@@ -4490,6 +4620,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             ensure(offer, f"Offer not found: {self.log.id(offer_id)}.")
             ensure(offer.expire_at > self.getTime(), "Offer has expired")
             ensure(offer.active_ind == 1, "Offer not active")
+            # Don't revoke if negotiating
+            if refuse_if_negotiating:
+                ensure(
+                    offer_has_negotiating_bid(cursor, offer_id) is False,
+                    "Offer has a bid in negotiation",
+                )
 
             if (
                 offer.security_token is not None
@@ -5565,7 +5701,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     "Fixed-rate offer bids should set amount to instead of bid rate."
                 )
         else:
-            amount_to: int = offer.amount_to
+            amount_to: int = (
+                offer.amount_to
+                if amount == offer.amount_from
+                else (amount * offer.rate) // ci_from.COIN()
+            )
         bid_rate: int = ci_from.make_int(amount_to / amount, r=1)
 
         if offer.amount_negotiable and not offer.rate_negotiable:
@@ -5656,14 +5796,18 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             offer.amount_negotiable,
             f"Offer amounts are final: {self.log.id(offer_id)}.",
         )
-        if offer.coin_to in self.xmr_based_coins:
-            raise ValueError("TODO")
         if offer.swap_type != SwapTypes.XMR_SWAP:
             raise ValueError("TODO")
         ci_to = self.ci(offer.coin_to)
         ci_from = self.ci(offer.coin_from)
         pi = self.pi(SwapTypes.XMR_SWAP)
         reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
+
+        if not reverse_bid and offer.coin_to in self.xmr_based_coins + (
+            Coins.PART_ANON,
+            Coins.PART_BLIND,
+        ):
+            raise ValueError("TODO")
 
         feerate: int = xmr_offer.b_fee_rate
         if reverse_bid:
@@ -6976,7 +7120,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 )
                 pkh_dest = xmr_swap.dest_af
                 # refund script
-                refundExtraArgs["mining_fee"] = 1000
+                refundExtraArgs["mining_fee"] = a_fee_rate
                 refundExtraArgs["out_1"] = ci_from.getScriptForPubkeyHash(pkh_refund_to)
                 refundExtraArgs["out_2"] = ci_from.getScriptForPubkeyHash(pkh_dest)
                 refundExtraArgs["public_key"] = xmr_swap.pkaf
@@ -6988,7 +7132,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 refundExtraArgs["refund_lock_tx_script"] = refund_lock_tx_script
 
                 # lock script
-                lockExtraArgs["mining_fee"] = 1000
+                lockExtraArgs["mining_fee"] = a_fee_rate
                 lockExtraArgs["out_1"] = ci_from.getScriptForPubkeyHash(pkh_dest)
                 lockExtraArgs["out_2"] = ci_from.scriptToP2SH32LockingBytecode(
                     refund_lock_tx_script
@@ -8382,9 +8526,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
                     if TxTypes.XMR_SWAP_A_LOCK_REFUND_SPEND not in bid.txns:
                         try:
-                            if refund_tx_depth < ci_from.blocks_confirmed:
+                            # The refund spend tx has a one block csv, it can't be mined
+                            # until the lock refund tx has confirmed
+                            min_refund_tx_depth: int = max(ci_from.blocks_confirmed, 1)
+                            if refund_tx_depth < min_refund_tx_depth:
                                 raise TemporaryError(
-                                    f"Waiting for lock refund tx to reach depth {ci_from.blocks_confirmed}, currently {refund_tx_depth}"
+                                    f"Waiting for lock refund tx to reach depth {min_refund_tx_depth}, currently {refund_tx_depth}"
                                 )
                             if self.haveDebugInd(
                                 bid.bid_id,
@@ -8482,48 +8629,22 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                                 bid_id=bid_id,
                                 tx_type=TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE,
                                 txid=bytes.fromhex(txid),
+                                chain_height=ci_from.getChainHeight(),
                             )
-                            if self.isBchXmrSwap(offer):
-                                if ci_from.altruistic():
-                                    for_ed25519: bool = (
-                                        True
-                                        if ci_to.curve_type() == Curves.ed25519
-                                        else False
-                                    )
-                                    kbsf = self.getPathKey(
-                                        ci_from.coin_type(),
-                                        ci_to.coin_type(),
-                                        bid.created_at,
-                                        xmr_swap.contract_count,
-                                        KeyTypes.KBSF,
-                                        for_ed25519,
-                                    )
-
-                                    mercy_tx = ci_from.createMercyTx(
-                                        xmr_swap.a_lock_refund_swipe_tx,
-                                        h2b(txid),
-                                        xmr_swap.a_lock_refund_tx_script,
-                                        kbsf,
-                                    )
-                                    txid_hex: str = ci_from.publishTx(mercy_tx)
-                                    bid.txns[TxTypes.BCH_MERCY] = SwapTx(
-                                        bid_id=bid_id,
-                                        tx_type=TxTypes.BCH_MERCY,
-                                        txid=bytes.fromhex(txid_hex),
-                                    )
-                                    self.log.info(
-                                        f"Submitted mercy tx for bid {self.log.id(bid_id)}, txid {self.logIDT(txid_hex)}"
-                                    )
-                                    self.logBidEvent(
-                                        bid_id,
-                                        EventLogTypes.BCH_MERCY_TX_PUBLISHED,
-                                        "",
-                                        cursor,
-                                    )
-                                else:
-                                    self.log.info(
-                                        f"Not sending mercy tx for bid {self.log.id(bid_id)}"
-                                    )
+                            if ci_from.altruistic() and ci_from.canSendMercyTx():
+                                # The mercy tx spends this output, keep it out of
+                                # coin selection until it has been sent
+                                self._lockMercyPrevout(ci_from, bid, cursor)
+                                delay = self.get_delay_event_seconds()
+                                self.log.info(
+                                    f"Queuing mercy tx for bid {self.log.id(bid_id)} in {delay} seconds."
+                                )
+                                self.createActionInSession(
+                                    delay,
+                                    ActionTypes.SEND_MERCY_TX,
+                                    bid_id,
+                                    cursor,
+                                )
 
                             self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
                             self.commitDB()
@@ -8535,7 +8656,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 if BidStates(bid.state) == BidStates.XMR_SWAP_NOSCRIPT_TX_RECOVERED:
                     txid_hex = bid.xmr_b_lock_tx.spend_txid.hex()
 
-                    found_tx = ci_to.findTxnByHash(txid_hex)
+                    found_tx = ci_to.findConfirmedTxnByHash(txid_hex)
                     if found_tx is not None:
                         self.log.info(
                             f"Found coin b lock recover tx bid {self.log.id(bid_id)}"
@@ -8629,46 +8750,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                             self.log.warning(
                                 f"Trying to publish coin a lock refund tx: {ex}"
                             )
-                            # TODO: Remove
-                            try:
-                                if ci_from.coin_type() != Coins.BCH:
-                                    sigl = ci_from.extractLeaderSig(
-                                        xmr_swap.a_lock_refund_tx
-                                    )
-                                    sigf = ci_from.extractFollowerSig(
-                                        xmr_swap.a_lock_refund_tx
-                                    )
-                                    self.log.debug(f"sigl hashtype {sigl[-1]}")
-                                    self.log.debug(f"sigf hashtype {sigf[-1]}")
-                                    try_fix: bool = False
-                                    if sigl[-1] != 1:
-                                        self.log.warning(
-                                            f"Trying to repair invalid leader hashtype for refund tx of bid {self.log.id(bid_id)}"
-                                        )
-                                        try_fix = True
-                                    if sigf[-1] != 1:
-                                        self.log.warning(
-                                            f"Trying to repair invalid follower hashtype for refund tx of bid {self.log.id(bid_id)}"
-                                        )
-                                        try_fix = True
-                                    if try_fix:
-                                        xmr_swap.al_lock_refund_tx_sig = sigl[
-                                            :-1
-                                        ] + bytes((1,))
-                                        xmr_swap.af_lock_refund_tx_sig = sigf[
-                                            :-1
-                                        ] + bytes((1,))
-                                        xmr_swap_1.addLockRefundSigs(
-                                            self, xmr_swap, ci_from
-                                        )
-                                        self.saveBidInSession(
-                                            bid_id, bid, cursor, xmr_swap
-                                        )
-                                        self.commitDB()
-                            except Exception as ex:
-                                self.log.error(
-                                    f"Trying to repair coin a lock refund tx: {ex}"
-                                )
 
             state = BidStates(bid.state)
             if state == BidStates.SWAP_COMPLETED:
@@ -8676,6 +8757,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             elif state == BidStates.XMR_SWAP_FAILED_REFUNDED:
                 rv = True  # Remove from swaps_in_progress
             elif state == BidStates.XMR_SWAP_FAILED_SWIPED:
+                rv = True  # Remove from swaps_in_progress
+            elif state == BidStates.XMR_SWAP_FAILED_SWIPED_USED_MERCY:
+                rv = True  # Remove from swaps_in_progress
+            elif state == BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED:
                 rv = True  # Remove from swaps_in_progress
             elif state == BidStates.XMR_SWAP_FAILED:
                 if bid.xmr_b_lock_tx is None:
@@ -8955,7 +9040,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                                 cursor,
                             )
                             bid.xmr_b_lock_tx.setState(TxStates.TX_CONFIRMED)
-                            bid.setState(BidStates.XMR_SWAP_NOSCRIPT_COIN_LOCKED)
+                            # Set only from the publish of the refund tx onwards,
+                            # by then the swap has moved past this state and a
+                            # late chain b confirmation must not take it back.
+                            if TxTypes.XMR_SWAP_A_LOCK_REFUND not in bid.txns:
+                                bid.setState(BidStates.XMR_SWAP_NOSCRIPT_COIN_LOCKED)
 
                             if was_received:
                                 if TxTypes.XMR_SWAP_A_LOCK_REFUND in bid.txns:
@@ -8986,6 +9075,38 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 if bid_changed:
                     self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
                     self.commitDB()
+
+                if state == BidStates.XMR_SWAP_SCRIPT_TX_PREREFUND:
+                    if TxTypes.XMR_SWAP_A_LOCK_REFUND in bid.txns:
+                        refund_tx = bid.txns[TxTypes.XMR_SWAP_A_LOCK_REFUND]
+                        if refund_tx.block_time is None:
+                            refund_tx_addr = ci_from.getSCLockScriptAddress(
+                                xmr_swap.a_lock_refund_tx_script
+                            )
+                            lock_refund_tx_chain_info = ci_from.getLockTxHeight(
+                                refund_tx.txid,
+                                refund_tx_addr,
+                                0,
+                                bid.chain_a_height_start,
+                                vout=refund_tx.vout,
+                            )
+                            if (
+                                lock_refund_tx_chain_info is not None
+                                and lock_refund_tx_chain_info.get("height", 0) > 0
+                            ):
+                                self.setTxBlockInfoFromHeight(
+                                    ci_from,
+                                    refund_tx,
+                                    lock_refund_tx_chain_info["height"],
+                                )
+
+                                self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
+                                self.commitDB()
+
+                    if was_received and TxTypes.MERCY not in bid.txns:
+                        if self._checkMercyWatch(ci_from, bid, cursor):
+                            self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
+                            self.commitDB()
             elif state == BidStates.XMR_SWAP_LOCK_RELEASED:
                 # Wait for script spend tx to confirm
                 # TODO: Use explorer to get tx / block hash for getrawtransaction
@@ -9041,7 +9162,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             elif state == BidStates.XMR_SWAP_NOSCRIPT_TX_REDEEMED:
                 txid_hex = bid.xmr_b_lock_tx.spend_txid.hex()
 
-                found_tx = ci_to.findTxnByHash(txid_hex)
+                found_tx = ci_to.findConfirmedTxnByHash(txid_hex)
                 if found_tx is not None:
                     self.log.info(
                         f"Found coin b lock spend tx bid {self.log.id(bid_id)}"
@@ -9054,30 +9175,31 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
                     self.commitDB()
                     self.notify(NT.SWAP_COMPLETED, {"bid_id": bid_id.hex()})
-            elif state == BidStates.XMR_SWAP_SCRIPT_TX_PREREFUND:
-                if TxTypes.XMR_SWAP_A_LOCK_REFUND in bid.txns:
-                    refund_tx = bid.txns[TxTypes.XMR_SWAP_A_LOCK_REFUND]
-                    if refund_tx.block_time is None:
-                        refund_tx_addr = ci_from.getSCLockScriptAddress(
-                            xmr_swap.a_lock_refund_tx_script
+            elif state == BidStates.XMR_SWAP_FAILED_SWIPED_USING_MERCY:
+                if (
+                    bid.xmr_b_lock_tx is not None
+                    and bid.xmr_b_lock_tx.spend_txid is not None
+                ):
+                    txid_hex = bid.xmr_b_lock_tx.spend_txid.hex()
+                    found_tx = ci_to.findConfirmedTxnByHash(txid_hex)
+                    if found_tx is not None:
+                        self.log.info(
+                            f"Found coin b lock spend tx bid {self.log.id(bid_id)}"
                         )
-                        lock_refund_tx_chain_info = ci_from.getLockTxHeight(
-                            refund_tx.txid,
-                            refund_tx_addr,
-                            0,
-                            bid.chain_a_height_start,
-                            vout=refund_tx.vout,
+                        self.logBidEvent(
+                            bid.bid_id,
+                            EventLogTypes.LOCK_TX_B_SPEND_TX_SEEN,
+                            "",
+                            cursor,
                         )
-                        if (
-                            lock_refund_tx_chain_info is not None
-                            and lock_refund_tx_chain_info.get("height", 0) > 0
-                        ):
-                            self.setTxBlockInfoFromHeight(
-                                ci_from, refund_tx, lock_refund_tx_chain_info["height"]
-                            )
-
-                            self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
-                            self.commitDB()
+                        rv = True  # Remove from swaps_in_progress
+                        bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED_USED_MERCY)
+                        self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
+                        self.commitDB()
+            elif state == BidStates.XMR_SWAP_FAILED_SWIPED_SENDING_MERCY:
+                if self._checkMercySend(ci_from, bid, cursor):
+                    self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
+                    self.commitDB()
 
         except Exception as e:  # noqa: F841
             raise
@@ -9099,6 +9221,107 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             parent_tx.block_height,
             parent_tx.block_time,
         )
+
+    def _removeMercyWatch(self, ci_from, bid) -> None:
+        swipe_tx = bid.txns.get(TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE, None)
+        if swipe_tx is None:
+            return
+        self.removeWatchedOutput(ci_from.coin_type(), bid.bid_id, swipe_tx.txid.hex())
+
+    def _checkMercyWatch(self, ci_from, bid, cursor) -> bool:
+        # Returns True if the bid state changed
+        swipe_tx = bid.txns.get(TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE, None)
+        if swipe_tx is None or swipe_tx.chain_height is None:
+            # This state is reached before the swipe, the bid is moved on from
+            # here by the refund spend if one never arrives.
+            return False
+
+        blocks_watched: int = ci_from.getChainHeight() - swipe_tx.chain_height
+        give_up_reason: str = ""
+        if blocks_watched >= self._mercy_watch_timeout_blocks:
+            give_up_reason = f"{blocks_watched} blocks passed"
+
+        if not give_up_reason:
+            self.log.debug(
+                f"Waiting for a mercy tx for bid {self.log.id(bid.bid_id)}: "
+                f"{blocks_watched} / {self._mercy_watch_timeout_blocks} blocks."
+            )
+            return False
+
+        self.log.info(
+            f"No mercy tx for bid {self.log.id(bid.bid_id)}: {give_up_reason}."
+        )
+        self.logBidEvent(
+            bid.bid_id, EventLogTypes.MERCY_TX_NOT_FOUND, give_up_reason, cursor
+        )
+        self._removeMercyWatch(ci_from, bid)
+        bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED)
+        return True
+
+    def _lockMercyPrevout(self, ci_from, bid, cursor) -> None:
+        # Locks are held in memory by the daemon and expire on the electrum
+        # backend, so this is re-asserted for as long as the mercy tx is owed
+        swipe_tx = bid.txns.get(TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE, None)
+        if swipe_tx is None:
+            return
+        try:
+            txid_hex: str = swipe_tx.txid.hex()
+            ci_from.lockOutput(
+                txid_hex,
+                ci_from.getMercyPrevout(txid_hex),
+                bid_id=bid.bid_id,
+                cursor=cursor,
+            )
+        except Exception as e:
+            self.log.debug(f"Locking mercy prevout failed: {e}")
+
+    def _unlockMercyPrevout(self, ci_from, bid, cursor) -> None:
+        swipe_tx = bid.txns.get(TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE, None)
+        if swipe_tx is None:
+            return
+        try:
+            txid_hex: str = swipe_tx.txid.hex()
+            ci_from.unlockOutput(
+                txid_hex, ci_from.getMercyPrevout(txid_hex), cursor=cursor
+            )
+        except Exception as e:
+            self.log.debug(f"Unlocking mercy prevout failed: {e}")
+
+    def _checkMercySend(self, ci_from, bid, cursor) -> bool:
+        # Returns True if the bid state changed
+        swipe_tx = bid.txns.get(TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE, None)
+        give_up_reason: str = ""
+        if swipe_tx is None or swipe_tx.chain_height is None:
+            # Nothing drives this state but the send, don't wait on a timeout
+            # that can never be measured.
+            give_up_reason = "the swipe tx height is unknown"
+        else:
+            blocks_waited: int = ci_from.getChainHeight() - swipe_tx.chain_height
+            if blocks_waited >= self._mercy_watch_timeout_blocks:
+                give_up_reason = f"{blocks_waited} blocks passed"
+
+        if give_up_reason:
+            self.log.info(
+                f"Giving up on the mercy tx for bid {self.log.id(bid.bid_id)}: {give_up_reason}."
+            )
+            self.logBidEvent(
+                bid.bid_id, EventLogTypes.MERCY_TX_NOT_SENT, give_up_reason, cursor
+            )
+            self._unlockMercyPrevout(ci_from, bid, cursor)
+            bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED)
+            return True
+
+        # The action is dropped if a send fails in a way that isn't transient,
+        # and this state would hold the bid open with nothing left to send it.
+        if self.countQueuedActions(cursor, bid.bid_id, ActionTypes.SEND_MERCY_TX) < 1:
+            delay = self.get_delay_event_seconds()
+            self.log.info(
+                f"Requeuing mercy tx for bid {self.log.id(bid.bid_id)} in {delay} seconds."
+            )
+            self.createActionInSession(
+                delay, ActionTypes.SEND_MERCY_TX, bid.bid_id, cursor
+            )
+        return False
 
     def checkBidState(self, bid_id: bytes, bid, offer):
         # assert (self.mxDB.locked())
@@ -9541,8 +9764,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         watched.append(WatchedOutput(bid_id, txid_hex, vout, tx_type, swap_type))
 
-    def removeWatchedOutput(self, coin_type, bid_id: bytes, txid_hex: str) -> None:
-        # Remove all for bid if txid is None
+    def removeWatchedOutput(
+        self, coin_type, bid_id: bytes, txid_hex: str, vout=None
+    ) -> None:
+        # Remove all for bid if txid is None, all vouts if vout is None
         self.log.debug(
             f"Removing watched output {Coins(coin_type).name} {self.log.id(bid_id)} {self.logIDT(txid_hex)}"
         )
@@ -9550,7 +9775,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         old_len = len(watched)
         for i in range(old_len - 1, -1, -1):
             wo = watched[i]
-            if wo.bid_id == bid_id and (txid_hex is None or wo.txid_hex == txid_hex):
+            if (
+                wo.bid_id == bid_id
+                and (txid_hex is None or wo.txid_hex == txid_hex)
+                and (vout is None or wo.vout == vout)
+            ):
                 del watched[i]
                 self.log.debug(
                     f"Removed watched output {Coins(coin_type).name} {self.log.id(bid_id)} {self.logIDT(wo.txid_hex)}"
@@ -9813,15 +10042,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                         xmr_swap.a_lock_refund_spend_tx
                     )
 
-                    if was_received:
-                        refund_to_script = ci_from.getRefundOutputScript(xmr_swap)
-                        self.addWatchedScript(
-                            ci_from.coin_type(),
-                            bid_id,
-                            refund_to_script,
-                            TxTypes.BCH_MERCY,
-                        )
-
                 bid.setState(BidStates.XMR_SWAP_SCRIPT_TX_PREREFUND)
                 self.logBidEvent(
                     bid.bid_id, EventLogTypes.LOCK_TX_A_REFUND_TX_SEEN, "", use_cursor
@@ -9874,7 +10094,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
             reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
             coin_from = Coins(offer.coin_to if reverse_bid else offer.coin_from)
-            coin_to = Coins(offer.coin_from if reverse_bid else offer.coin_to)
             was_sent: bool = bid.was_received if reverse_bid else bid.was_sent
             was_received: bool = bid.was_sent if reverse_bid else bid.was_received
 
@@ -9902,9 +10121,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     xmr_swap.a_lock_refund_spend_tx_id = spending_txid
                     xmr_swap.a_lock_refund_spend_tx = bytes.fromhex(spend_txn_hex)
 
-                    if was_received:
-                        self.removeWatchedScript(
-                            coin_from, bid_id, None, TxTypes.BCH_MERCY
+                    if (
+                        was_received
+                        and TxTypes.XMR_SWAP_A_LOCK_REFUND_SPEND not in bid.txns
+                    ):
+                        # Recorded so the mercy watch isn't re-armed, the
+                        # leader recovered without needing one.
+                        bid.txns[TxTypes.XMR_SWAP_A_LOCK_REFUND_SPEND] = SwapTx(
+                            bid_id=bid_id,
+                            tx_type=TxTypes.XMR_SWAP_A_LOCK_REFUND_SPEND,
+                            txid=spending_txid,
+                            chain_height=ci_from.getChainHeight(),
                         )
 
                 self.logBidEvent(
@@ -9951,34 +10178,70 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     f"Coin a lock refund spent by unknown tx, bid {self.log.id(bid_id)}, txid {self.logIDT(spending_txid)}."
                 )
 
-                mercy_keyshare = None
                 if was_received:
-                    if self.isBchXmrSwap(offer):
-                        # Mercy tx is sent separately
-                        # Can't set XMR_SWAP_FAILED_SWIPED, as bid should continue looking for mercy tx
-                        pass
-                    else:
-                        # Look for a mercy output
-                        try:
-                            mercy_keyshare = ci_from.inspectSwipeTx(spend_txn)
-                            if mercy_keyshare is None:
-                                raise ValueError("Not found")
-                            ensure(
-                                self.ci(coin_to).verifyKey(mercy_keyshare),
-                                "Invalid keyshare",
+                    # Search for mercy utxo for backwards compatibility.
+                    # TODO: Remove
+                    mercy_keyshare = None
+                    try:
+                        found_keyshare = (
+                            None
+                            if bid.protocol_version >= 6
+                            else ci_from.extractMercyKeyshare(spend_txn)
+                        )
+                        if found_keyshare is not None:
+                            ci_to = self.ci(
+                                offer.coin_from if reverse_bid else offer.coin_to
                             )
-                        except Exception as e:
-                            self.log.warning(
-                                f"Could not extract mercy output from swipe tx: {self.log.id(spend_txid_hex)}, {e}."
-                            )
+                            # It is Kbf or it is nothing
+                            if (
+                                ci_to.verifyKey(found_keyshare)
+                                and ci_to.getPubkey(found_keyshare) == xmr_swap.pkbsf
+                            ):
+                                mercy_keyshare = found_keyshare
+                            else:
+                                self.log.warning(
+                                    f"Invalid keyshare on swipe tx for bid {self.log.id(bid_id)}."
+                                )
+                                self.logBidEvent(
+                                    bid_id,
+                                    EventLogTypes.MERCY_TX_UNUSABLE,
+                                    "Keyshare is not kbsf",
+                                    cursor,
+                                )
+                                bid.setState(
+                                    BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED
+                                )
+                    except Exception as e:
+                        self.log.debug(f"extractMercyKeyshare failed: {e}")
 
-                        if mercy_keyshare is None:
-                            bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED)
+                    if mercy_keyshare is not None:
+                        self.logBidEvent(
+                            bid_id,
+                            EventLogTypes.MERCY_TX_FOUND,
+                            spend_txid_hex,
+                            cursor,
+                        )
+                        bid.txns[TxTypes.MERCY] = SwapTx(
+                            bid_id=bid_id,
+                            tx_type=TxTypes.MERCY,
+                            txid=spending_txid,
+                            tx_data=mercy_keyshare,
+                        )
+                        if bid.xmr_b_lock_tx is None:
+                            self.log.info(
+                                f"Keyshare on swipe tx for bid {self.log.id(bid_id)} has no lock tx b to spend."
+                            )
+                            self.logBidEvent(
+                                bid_id,
+                                EventLogTypes.MERCY_TX_UNUSABLE,
+                                "No lock tx b to spend",
+                                cursor,
+                            )
+                            bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED)
                         else:
                             delay = self.get_delay_event_seconds()
-                            self.log.info("Found mercy output.")
                             self.log.info(
-                                f"Redeeming coin b lock tx for bid {self.log.id(bid_id)} in {delay} seconds."
+                                f"Found keyshare on swipe tx, redeeming coin b lock tx for bid {self.log.id(bid_id)} in {delay} seconds."
                             )
                             self.createActionInSession(
                                 delay,
@@ -9986,19 +10249,43 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                                 bid_id,
                                 cursor,
                             )
+                            bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED_USING_MERCY)
+                    elif ci_from.canSendMercyTx():
+                        # The keyshare arrives in a tx of its own, held back
+                        # until the swipe it spends has confirmed
+                        for mercy_vout in ci_from.getMercyWatchVouts(
+                            spend_txid_hex, spend_txn
+                        ):
+                            self.addWatchedOutput(
+                                coin_from,
+                                bid_id,
+                                spend_txid_hex,
+                                mercy_vout,
+                                TxTypes.MERCY,
+                                SwapTypes.XMR_SWAP,
+                            )
+                    else:
+                        # Nothing can arrive to watch for, don't hold the bid
+                        # open until the watch times out.
+                        bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED)
                 else:
-                    bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED)
+                    if (
+                        self.countQueuedActions(
+                            cursor, bid_id, ActionTypes.SEND_MERCY_TX
+                        )
+                        > 0
+                    ):
+                        bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED_SENDING_MERCY)
+                    else:
+                        bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED)
 
                 if TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE not in bid.txns:
                     bid.txns[TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE] = SwapTx(
                         bid_id=bid_id,
                         tx_type=TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE,
                         txid=spending_txid,
+                        chain_height=ci_from.getChainHeight(),
                     )
-                    if mercy_keyshare:
-                        bid.txns[TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE].tx_data = (
-                            mercy_keyshare
-                        )
 
             self.saveBidInSession(bid_id, bid, cursor, xmr_swap, save_in_progress=offer)
         except Exception as ex:
@@ -10029,6 +10316,22 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 self.process_XMR_SWAP_A_LOCK_REFUND_tx_spend(
                     watched_output.bid_id, spend_txid_hex, spend_txn
                 )
+            elif watched_output.tx_type == TxTypes.MERCY:
+                if (
+                    self.process_MERCY_tx(
+                        coin_type, watched_output.bid_id, spend_txid_hex, spend_txn
+                    )
+                    is False
+                ):
+                    # Another output of the swipe was spent, the mercy tx may
+                    # still be to come on one of the others.
+                    self.removeWatchedOutput(
+                        coin_type,
+                        watched_output.bid_id,
+                        watched_output.txid_hex,
+                        watched_output.vout,
+                    )
+                    return
 
             self.removeWatchedOutput(
                 coin_type, watched_output.bid_id, watched_output.txid_hex
@@ -10047,24 +10350,27 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
     def processFoundScript(
         self, coin_type, watched_script, txid: bytes, vout: int
     ) -> None:
+        bid_in_progress = self.swaps_in_progress.get(watched_script.bid_id, None)
+        if bid_in_progress is None:
+            self.log.warning(
+                f"Could not find active bid for found watched script: {self.logIDB(watched_script.bid_id)}."
+            )
+            self.removeWatchedScript(
+                coin_type, watched_script.bid_id, watched_script.script
+            )
+            return
+        bid = bid_in_progress[0]
+
         if watched_script.tx_type == TxTypes.PTX:
-            if watched_script.bid_id in self.swaps_in_progress:
-                bid = self.swaps_in_progress[watched_script.bid_id][0]
+            bid.participate_tx.txid = txid
+            bid.participate_tx.vout = vout
+            bid.setPTxState(TxStates.TX_IN_CHAIN)
 
-                bid.participate_tx.txid = txid
-                bid.participate_tx.vout = vout
-                bid.setPTxState(TxStates.TX_IN_CHAIN)
-
-                self.saveBid(watched_script.bid_id, bid)
-            else:
-                self.log.warning(
-                    f"Could not find active bid for found watched script: {self.logIDB(watched_script.bid_id)}."
-                )
+            self.saveBid(watched_script.bid_id, bid)
         elif watched_script.tx_type == TxTypes.XMR_SWAP_A_LOCK:
             self.log.info(
                 f"Found chain A lock txid {self.log.id(txid)} for bid: {self.log.id(watched_script.bid_id)}."
             )
-            bid = self.swaps_in_progress[watched_script.bid_id][0]
             if bid.xmr_a_lock_tx.txid != txid:
                 self.log.debug(
                     f"Updating xmr_a_lock_tx from {self.log.id(bid.xmr_a_lock_tx.txid)} to {self.log.id(txid)}."
@@ -10079,7 +10385,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             self.log.info(
                 f"Found chain B lock txid {self.log.id(txid)} for bid: {self.log.id(watched_script.bid_id)}."
             )
-            bid = self.swaps_in_progress[watched_script.bid_id][0]
             bid.xmr_b_lock_tx = SwapTx(
                 bid_id=watched_script.bid_id,
                 tx_type=TxTypes.XMR_SWAP_B_LOCK,
@@ -10106,46 +10411,95 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             coin_type, watched_script.bid_id, watched_script.script
         )
 
-    def processMercyTx(
-        self, coin_type, watched_script, txid: bytes, vout: int, tx
-    ) -> None:
-        bid_id = watched_script.bid_id
-        ci = self.ci(coin_type)
-
-        mercy_keyshare = ci.isMercyTx(tx, vout)
-        if mercy_keyshare is None:
-            self.log.info(
-                f"Found tx is not a mercy tx for bid: {self.log.id(bid_id)}, still watching."
-            )
-            return
-
-        self.log.info(f"Found mercy tx for bid: {self.log.id(bid_id)}.")
-
-        self.logBidEvent(
-            bid_id, EventLogTypes.BCH_MERCY_TX_FOUND, txid.hex(), cursor=None
-        )
-
+    def process_MERCY_tx(
+        self, coin_type, bid_id: bytes, spend_txid_hex: str, spend_txn
+    ) -> bool:
+        # The swiper spends its own swipe payout to hand over the keyshare,
+        # once that swipe has confirmed.
+        # Returns False if the spend was not a mercy tx.
         if bid_id not in self.swaps_in_progress:
             self.log.warning(
                 f"Could not find active bid for found mercy tx: {self.logIDB(bid_id)}."
             )
-        else:
-            bid = self.swaps_in_progress[bid_id][0]
-            bid.txns[TxTypes.BCH_MERCY] = SwapTx(
-                bid_id=bid_id,
-                tx_type=TxTypes.BCH_MERCY,
-                txid=txid,
-                tx_data=mercy_keyshare,
-            )
-            self.saveBid(bid_id, bid)
+            return True
+        bid, offer = self.swaps_in_progress[bid_id]
 
-            delay = self.get_delay_event_seconds()
+        reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
+        # Not coin_type, the watched outputs of the PART balance types are held
+        # against the base coin
+        coin_from = Coins(offer.coin_to if reverse_bid else offer.coin_from)
+        coin_to = Coins(offer.coin_from if reverse_bid else offer.coin_to)
+        ci_to = self.ci(coin_to)
+
+        try:
+            mercy_keyshare = self.ci(coin_from).extractMercyKeyshare(spend_txn)
+        except Exception as e:
+            self.log.debug(f"extractMercyKeyshare failed: {e}")
+            return False
+        if mercy_keyshare is None:
             self.log.info(
-                f"Redeeming coin b lock tx for bid {self.logIDB(bid_id)} in {delay} seconds."
+                f"Swipe payout spent by a tx with no keyshare for bid: {self.log.id(bid_id)}."
             )
-            self.createAction(delay, ActionTypes.REDEEM_XMR_SWAP_LOCK_TX_B, bid_id)
+            return False
+        # A swiper can publish whatever it likes, it is Kbf or it is nothing
+        keyshare_valid: bool = False
+        try:
+            if ci_to.verifyKey(mercy_keyshare):
+                _, xmr_swap = self.getXmrBid(bid_id)
+                keyshare_valid = (
+                    xmr_swap is not None
+                    and ci_to.getPubkey(mercy_keyshare) == xmr_swap.pkbsf
+                )
+        except Exception as e:
+            self.log.debug(f"Mercy keyshare check failed: {e}")
+        if not keyshare_valid:
+            self.log.warning(
+                f"Invalid keyshare in mercy tx for bid {self.log.id(bid_id)}."
+            )
+            self.logBidEvent(
+                bid_id,
+                EventLogTypes.MERCY_TX_UNUSABLE,
+                "Keyshare is not kbsf",
+                cursor=None,
+            )
+            bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED)
+            self.saveBid(bid_id, bid)
+            return True
 
-        self.removeWatchedScript(coin_type, bid_id, watched_script.script)
+        self.log.info(f"Found mercy tx for bid: {self.log.id(bid_id)}.")
+        self.logBidEvent(
+            bid_id, EventLogTypes.MERCY_TX_FOUND, spend_txid_hex, cursor=None
+        )
+        bid.txns[TxTypes.MERCY] = SwapTx(
+            bid_id=bid_id,
+            tx_type=TxTypes.MERCY,
+            txid=bytes.fromhex(spend_txid_hex),
+            tx_data=mercy_keyshare,
+        )
+
+        if bid.xmr_b_lock_tx is None:
+            self.log.info(
+                f"Mercy tx for bid {self.logIDB(bid_id)} has no lock tx b to spend."
+            )
+            self.logBidEvent(
+                bid_id,
+                EventLogTypes.MERCY_TX_UNUSABLE,
+                "No lock tx b to spend",
+                cursor=None,
+            )
+            bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED)
+            self.saveBid(bid_id, bid)
+            return True
+
+        bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED_USING_MERCY)
+        self.saveBid(bid_id, bid)
+
+        delay = self.get_delay_event_seconds()
+        self.log.info(
+            f"Redeeming coin b lock tx for bid {self.logIDB(bid_id)} in {delay} seconds."
+        )
+        self.createAction(delay, ActionTypes.REDEEM_XMR_SWAP_LOCK_TX_B, bid_id)
+        return True
 
     def haveCheckedPrevBlock(self, ci, c, block, cursor=None) -> bool:
         previousblockhash = bytes.fromhex(block["previousblockhash"])
@@ -10195,6 +10549,36 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         finally:
             if cursor is None:
                 self.closeDB(use_cursor)
+
+    def checkWatched(self) -> None:
+        for k, c in self.coin_clients.items():
+            if k in (Coins.PART_ANON, Coins.PART_BLIND, Coins.LTC_MWEB):
+                continue
+            if len(c["watched_outputs"]) < 1 and len(c["watched_scripts"]) < 1:
+                continue
+
+            if c.get("connection_type") == "electrum":
+                if (
+                    k not in self._electrum_spend_check_futures
+                    or self._electrum_spend_check_futures[k].done()
+                ):
+                    self._electrum_spend_check_futures[k] = self.thread_pool.submit(
+                        self._fetchSpendsElectrum,
+                        k,
+                        list(c["watched_outputs"]),
+                        list(c["watched_scripts"]),
+                    )
+                continue
+
+            try:
+                self.checkForSpends(k, c)
+            except Exception as ex:
+                if self.debug:
+                    self.log.error("checkForSpends %s", traceback.format_exc())
+                if self.is_transient_error(ex):
+                    self.log.warning(f"checkForSpends {Coins(k).name} {ex}.")
+                else:
+                    self.log.error(f"checkForSpends {Coins(k).name} {ex}.")
 
     def checkForSpends(self, coin_type, c):
         # assert (self.mxDB.locked())
@@ -10305,10 +10689,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                                 self.log.debug(
                                     f"Found script from search for bid {self.log.id(s.bid_id)}: {self.logIDT(txid_bytes)} {i}."
                                 )
-                                if s.tx_type == TxTypes.BCH_MERCY:
-                                    self.processMercyTx(coin_type, s, txid_bytes, i, tx)
-                                else:
-                                    self.processFoundScript(coin_type, s, txid_bytes, i)
+                                self.processFoundScript(coin_type, s, txid_bytes, i)
 
                 for o in c["watched_outputs"]:
                     for i, inp in enumerate(tx["vin"]):
@@ -10658,9 +11039,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         if self._is_locked is True:
             self.log.debug("Not expiring database records while system locked.")
             return
-        if not self._expire_db_records:
-            return
-        remove_expired_data(self, self._expire_db_records_after)
+        if self._expire_unused_offers:
+            remove_expired_data(
+                self, self._expire_unused_offers_after, unused_offers_only=True
+            )
+        if self._expire_db_records:
+            remove_expired_data(self, self._expire_db_records_after)
 
     def checkAcceptedBids(self) -> None:
         # Check for bids stuck as accepted (not yet in-progress)
@@ -10671,8 +11055,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         now: int = self.getTime()
         cursor = self.openDB()
 
-        respond_grace_period: int = 60 * 60
-        # Time for transaction to be mined into the chain
+        # Time for transaction to be mined into the chain, measured from the last
+        # state change so the bidder's chosen expiry can't extend it.
         # Only timeout waiting for the tx to be mined if not the sending the tx.
         tx_grace_period: int = self._sc_lock_tx_timeout
         tx_mempool_grace_period: int = self._sc_lock_tx_mempool_timeout
@@ -10681,16 +11065,13 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             query_str = (
                 "SELECT b.bid_id FROM bids AS b, bidstates AS s "
                 + "WHERE b.active_ind = 1 AND s.state_id = b.state "
-                + " AND ((b.state = :accepted_state AND b.expire_at + :respond_grace_period <= :now) "
-                + "  OR (s.can_timeout AND b.expire_at + (CASE WHEN EXISTS(SELECT event_id FROM eventlog WHERE linked_type = :event_linked_type AND linked_id = b.bid_id AND event_type = :tx_mempool_event_type) THEN :tx_mempool_grace_period ELSE :tx_grace_period END) <= :now)) "
+                + " AND s.can_timeout AND b.state_time + (CASE WHEN EXISTS(SELECT event_id FROM eventlog WHERE linked_type = :event_linked_type AND linked_id = b.bid_id AND event_type = :tx_mempool_event_type) THEN :tx_mempool_grace_period ELSE :tx_grace_period END) <= :now "
                 + " AND NOT EXISTS(SELECT event_id FROM eventlog WHERE linked_type = :event_linked_type AND linked_id = b.bid_id AND event_type = :tx_sent_event_type)"
             )
             q = cursor.execute(
                 query_str,
                 {
-                    "accepted_state": int(BidStates.BID_ACCEPTED),
                     "now": now,
-                    "respond_grace_period": respond_grace_period,
                     "tx_grace_period": tx_grace_period,
                     "tx_mempool_grace_period": tx_mempool_grace_period,
                     "event_linked_type": int(Concepts.BID),
@@ -10768,6 +11149,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                         self.recoverXmrBidCoinBLockTx(linked_id, cursor)
                     elif action_type == ActionTypes.SEND_XMR_SWAP_LOCK_SPEND_MSG:
                         self.sendXmrBidCoinALockSpendTxMsg(linked_id, cursor)
+                    elif action_type == ActionTypes.SEND_MERCY_TX:
+                        self.sendMercyTx(linked_id, cursor)
                     elif action_type == ActionTypes.REDEEM_ITX:
                         atomic_swap_1.redeemITx(self, linked_id, cursor)
                     elif action_type == ActionTypes.ACCEPT_AS_REV_BID:
@@ -10790,9 +11173,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     )
                     # Don't error the bid on a transient failure, keep the
                     # action alive and retry.
-                    if not accepting_bid and self.isBidTransientError(
-                        bid_id, ex, cursor
-                    ):
+                    if self.isBidTransientError(bid_id, ex, cursor):
                         self.log.warning(
                             f"Retrying action type {action_type} for bid {self.log.id(bid_id)} after transient error: {ex}"
                         )
@@ -11288,16 +11669,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 )
             )
 
-    def getCompletedAndActiveBidsValue(self, offer, cursor):
+    def getCompletedAndActiveBidsValue(self, offer, cursor, reverse_bid: bool = False):
         bids = []
         total_value: int = 0
 
+        amount_col: str = "bids.amount_to" if reverse_bid else "bids.amount"
         q = cursor.execute(
-            """SELECT bid_id, amount, state FROM bids
+            f"""SELECT bids.bid_id, {amount_col}, bids.state FROM bids
                JOIN bidstates ON bidstates.state_id = bids.state AND (bidstates.state_id = :state_id OR bidstates.in_progress > 0)
                WHERE bids.active_ind = 1 AND bids.offer_id = :offer_id
                UNION
-               SELECT bid_id, amount, state FROM bids
+               SELECT bids.bid_id, {amount_col}, bids.state FROM bids
                JOIN actions ON actions.linked_id = bids.bid_id AND actions.active_ind = 1 AND actions.action_type IN (:action_type_acc_bid, :action_type_acc_adp_bid, :action_type_acc_rev_bid)
                WHERE bids.active_ind = 1 AND bids.offer_id = :offer_id
             """,
@@ -11392,7 +11774,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             bid_amount: int = bid.amount
             bid_rate: int = bid.rate
 
-            if options.get("reverse_bid", False):
+            reverse_bid: bool = options.get("reverse_bid", False)
+            if reverse_bid:
                 bid_amount = bid.amount_to
                 bid_rate = options.get("bid_rate")
 
@@ -11432,7 +11815,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     raise AutomationConstraint("Rate outside acceptable tolerance")
 
             active_bids, total_bids_value = self.getCompletedAndActiveBidsValue(
-                offer, use_cursor
+                offer, use_cursor, reverse_bid
             )
 
             # Tracked offers are bounded by offer_budget_allows above.
@@ -12008,6 +12391,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ensure(offer and offer.was_sent, f"Offer not found: {self.log.id(offer_id)}")
         ensure(offer.swap_type == SwapTypes.XMR_SWAP, "Bid/offer swap type mismatch")
         ensure(xmr_offer, f"Adaptor-sig offer not found: {self.log.id(offer_id)}")
+        ensure(
+            offer.protocol_version >= MINPROTO_VERSION_ADAPTOR_SIG,
+            "Incompatible offer protocol version",
+        )
         reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
         ensure(reverse_bid is False, f"Offer: {self.log.id(offer_id)} is reversed")
 
@@ -12163,25 +12550,37 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ensure(msg["to"] == addr_to, "Received on incorrect address")
         ensure(msg["from"] == addr_from, "Sent from incorrect address")
 
+        allowed_states = [
+            BidStates.BID_SENT,
+            BidStates.BID_RECEIVED,
+            BidStates.BID_REQUEST_ACCEPTED,
+        ]
+        if bid.was_sent and offer.was_sent:
+            allowed_states.append(
+                BidStates.BID_ACCEPTED
+            )  # TODO: Split BID_ACCEPTED into received and sent
+        ensure(
+            bid.state in allowed_states,
+            f"Invalid state for bid {bid.state}, {strBidState(bid.state)}",
+        )
+
         try:
-            xmr_swap.pkal = msg_data.pkal
-            xmr_swap.vkbvl = msg_data.kbvl
-            ensure(ci_to.verifyKey(xmr_swap.vkbvl), "Invalid key, vkbvl")
-            xmr_swap.vkbv = ci_to.sumKeys(xmr_swap.vkbvl, xmr_swap.vkbvf)
-            ensure(ci_to.verifyKey(xmr_swap.vkbv), "Invalid key, vkbv")
+            pkal: bytes = msg_data.pkal
+            vkbvl: bytes = msg_data.kbvl
+            ensure(ci_to.verifyKey(vkbvl), "Invalid key, vkbvl")
+            vkbv: bytes = ci_to.sumKeys(vkbvl, xmr_swap.vkbvf)
+            ensure(ci_to.verifyKey(vkbv), "Invalid key, vkbv")
 
-            xmr_swap.pkbvl = ci_to.getPubkey(msg_data.kbvl)
-            xmr_swap.kbsl_dleag = msg_data.kbsl_dleag
+            pkbvl: bytes = ci_to.getPubkey(msg_data.kbvl)
+            kbsl_dleag: bytes = msg_data.kbsl_dleag
 
-            xmr_swap.a_lock_tx = msg_data.a_lock_tx
-            xmr_swap.a_lock_tx_script = msg_data.a_lock_tx_script
-            xmr_swap.a_lock_refund_tx = msg_data.a_lock_refund_tx
-            xmr_swap.a_lock_refund_tx_script = msg_data.a_lock_refund_tx_script
-            xmr_swap.a_lock_refund_spend_tx = msg_data.a_lock_refund_spend_tx
-            xmr_swap.a_lock_refund_spend_tx_id = ci_from.getTxid(
-                xmr_swap.a_lock_refund_spend_tx
-            )
-            xmr_swap.al_lock_refund_tx_sig = msg_data.al_lock_refund_tx_sig
+            a_lock_tx: bytes = msg_data.a_lock_tx
+            a_lock_tx_script: bytes = msg_data.a_lock_tx_script
+            a_lock_refund_tx: bytes = msg_data.a_lock_refund_tx
+            a_lock_refund_tx_script: bytes = msg_data.a_lock_refund_tx_script
+            a_lock_refund_spend_tx: bytes = msg_data.a_lock_refund_spend_tx
+            a_lock_refund_spend_tx_id: bytes = ci_from.getTxid(a_lock_refund_spend_tx)
+            al_lock_refund_tx_sig: bytes = msg_data.al_lock_refund_tx_sig
 
             refundExtraArgs = dict()
             lockExtraArgs = dict()
@@ -12192,7 +12591,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 bch_ci = self.ci(Coins.BCH)
 
                 mining_fee, out_1, out_2, public_key, timelock = (
-                    bch_ci.extractScriptLockScriptValues(xmr_swap.a_lock_tx_script)
+                    bch_ci.extractScriptLockScriptValues(a_lock_tx_script)
                 )
                 ensure(
                     out_1 == bch_ci.getScriptForPubkeyHash(xmr_swap.dest_af),
@@ -12200,14 +12599,16 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 )
                 ensure(
                     out_2
-                    == bch_ci.scriptToP2SH32LockingBytecode(
-                        xmr_swap.a_lock_refund_tx_script
-                    ),
+                    == bch_ci.scriptToP2SH32LockingBytecode(a_lock_refund_tx_script),
                     "Invalid BCH lock tx script out_2",
                 )
                 ensure(
                     timelock == xmr_offer.lock_time_1,
                     "Invalid BCH lock tx script timelock",
+                )
+                ensure(
+                    public_key == pkal,
+                    "Invalid BCH lock tx script public_key",
                 )
 
                 lockExtraArgs["mining_fee"] = mining_fee
@@ -12217,9 +12618,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 lockExtraArgs["timelock"] = timelock
 
                 mining_fee, out_1, out_2, public_key, timelock = (
-                    bch_ci.extractScriptLockScriptValues(
-                        xmr_swap.a_lock_refund_tx_script
-                    )
+                    bch_ci.extractScriptLockScriptValues(a_lock_refund_tx_script)
                 )
                 ensure(
                     out_2 == bch_ci.getScriptForPubkeyHash(xmr_swap.dest_af),
@@ -12228,6 +12627,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 ensure(
                     timelock == xmr_offer.lock_time_2,
                     "Invalid BCH refund tx script timelock",
+                )
+                ensure(
+                    public_key == xmr_swap.pkaf,
+                    "Invalid BCH refund tx script public_key",
                 )
 
                 refundExtraArgs["mining_fee"] = mining_fee
@@ -12239,15 +12642,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             # TODO: check_lock_tx_inputs without txindex
             check_a_lock_tx_inputs = False
             try:
-                xmr_swap.a_lock_tx_id, xmr_swap.a_lock_tx_vout = ci_from.verifySCLockTx(
-                    xmr_swap.a_lock_tx,
-                    xmr_swap.a_lock_tx_script,
+                a_lock_tx_id, a_lock_tx_vout = ci_from.verifySCLockTx(
+                    a_lock_tx,
+                    a_lock_tx_script,
                     bid.amount,
-                    xmr_swap.pkal,
+                    pkal,
                     xmr_swap.pkaf,
                     a_fee_rate,
                     check_a_lock_tx_inputs,
-                    xmr_swap.vkbv,
+                    vkbv,
                     **lockExtraArgs,
                 )
             except Exception as e:
@@ -12260,64 +12663,69 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 raise
 
             (
-                xmr_swap.a_lock_refund_tx_id,
-                xmr_swap.a_swap_refund_value,
+                a_lock_refund_tx_id,
+                a_swap_refund_value,
                 lock_refund_vout,
             ) = ci_from.verifySCLockRefundTx(
-                xmr_swap.a_lock_refund_tx,
-                xmr_swap.a_lock_tx,
-                xmr_swap.a_lock_refund_tx_script,
-                xmr_swap.a_lock_tx_id,
-                xmr_swap.a_lock_tx_vout,
+                a_lock_refund_tx,
+                a_lock_tx,
+                a_lock_refund_tx_script,
+                a_lock_tx_id,
+                a_lock_tx_vout,
                 xmr_offer.lock_time_1,
-                xmr_swap.a_lock_tx_script,
-                xmr_swap.pkal,
+                a_lock_tx_script,
+                pkal,
                 xmr_swap.pkaf,
                 xmr_offer.lock_time_2,
                 bid.amount,
                 a_fee_rate,
-                xmr_swap.vkbv,
+                vkbv,
                 **refundExtraArgs,
             )
 
             ci_from.verifySCLockRefundSpendTx(
-                xmr_swap.a_lock_refund_spend_tx,
-                xmr_swap.a_lock_refund_tx,
-                xmr_swap.a_lock_refund_tx_id,
-                xmr_swap.a_lock_refund_tx_script,
-                xmr_swap.pkal,
+                a_lock_refund_spend_tx,
+                a_lock_refund_tx,
+                a_lock_refund_tx_id,
+                a_lock_refund_tx_script,
+                pkal,
                 lock_refund_vout,
-                xmr_swap.a_swap_refund_value,
+                a_swap_refund_value,
                 a_fee_rate,
-                xmr_swap.vkbv,
+                vkbv,
                 **refundExtraArgs,
             )
+
+            xmr_swap.pkal = pkal
+            xmr_swap.vkbvl = vkbvl
+            xmr_swap.vkbv = vkbv
+            xmr_swap.pkbvl = pkbvl
+            xmr_swap.kbsl_dleag = kbsl_dleag
+            xmr_swap.a_lock_tx = a_lock_tx
+            xmr_swap.a_lock_tx_id = a_lock_tx_id
+            xmr_swap.a_lock_tx_vout = a_lock_tx_vout
+            xmr_swap.a_lock_tx_script = a_lock_tx_script
+            xmr_swap.a_lock_refund_tx_id = a_lock_refund_tx_id
+            xmr_swap.a_lock_refund_tx_script = a_lock_refund_tx_script
+            xmr_swap.a_swap_refund_value = a_swap_refund_value
+            xmr_swap.a_lock_refund_spend_tx = a_lock_refund_spend_tx
+            xmr_swap.a_lock_refund_spend_tx_id = a_lock_refund_spend_tx_id
 
             self.log.info("Checking leader's lock refund tx signature.")
             prevout_amount = ci_from.getLockTxSwapOutputValue(bid, xmr_swap)
             v = ci_from.verifyTxSig(
-                xmr_swap.a_lock_refund_tx,
-                xmr_swap.al_lock_refund_tx_sig,
-                xmr_swap.pkal,
+                a_lock_refund_tx,
+                al_lock_refund_tx_sig,
+                pkal,
                 0,
-                xmr_swap.a_lock_tx_script,
+                a_lock_tx_script,
                 prevout_amount,
             )
             ensure(v, "Invalid coin A lock refund tx leader sig")
 
-            allowed_states = [
-                BidStates.BID_SENT,
-                BidStates.BID_RECEIVED,
-                BidStates.BID_REQUEST_ACCEPTED,
-            ]
-            if bid.was_sent and offer.was_sent:
-                allowed_states.append(
-                    BidStates.BID_ACCEPTED
-                )  # TODO: Split BID_ACCEPTED into received and sent
-            ensure(
-                bid.state in allowed_states,
-                f"Invalid state for bid {bid.state}, {strBidState(bid.state)}",
-            )
+            xmr_swap.a_lock_refund_tx = a_lock_refund_tx
+            xmr_swap.al_lock_refund_tx_sig = al_lock_refund_tx_sig
+
             bid.setState(BidStates.BID_RECEIVING_ACC)
             self.saveBid(bid.bid_id, bid, xmr_swap=xmr_swap)
 
@@ -12330,7 +12738,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         except Exception as ex:
             if self.debug:
                 self.log.error(traceback.format_exc())
-            self.setBidError(bid, str(ex), xmr_swap=xmr_swap)
+            self.setBidError(bid, str(ex))
 
     def watchXmrSwap(self, bid, offer, xmr_swap, cursor=None) -> None:
         self.log.debug(f"Adaptor-sig swap in progress, bid {self.log.id(bid.bid_id)}.")
@@ -12372,17 +12780,29 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             )
 
         was_received: bool = bid.was_sent if reverse_bid else bid.was_received
+        swipe_tx = bid.txns.get(TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE, None)
         if (
-            self.isBchXmrSwap(offer)
-            and was_received
-            and BidStates(bid.state) == BidStates.XMR_SWAP_SCRIPT_TX_PREREFUND
-            and TxTypes.BCH_MERCY not in bid.txns
+            was_received
+            and swipe_tx is not None
+            and TxTypes.MERCY not in bid.txns
             and TxTypes.XMR_SWAP_A_LOCK_REFUND_SPEND not in bid.txns
+            and self.ci(coin_from).canSendMercyTx()
         ):
-            refund_to_script = self.ci(coin_from).getRefundOutputScript(xmr_swap)
-            self.addWatchedScript(
-                coin_from, bid.bid_id, refund_to_script, TxTypes.BCH_MERCY
-            )
+            # Watched outputs only exist in memory
+            try:
+                mercy_vouts = self.ci(coin_from).getMercyWatchVouts(swipe_tx.txid.hex())
+            except Exception as e:
+                self.log.warning(f"Could not find mercy prevouts to watch: {e}")
+                mercy_vouts = []
+            for mercy_vout in mercy_vouts:
+                self.addWatchedOutput(
+                    coin_from,
+                    bid.bid_id,
+                    swipe_tx.txid.hex(),
+                    mercy_vout,
+                    TxTypes.MERCY,
+                    SwapTypes.XMR_SWAP,
+                )
 
     def sendXmrBidTxnSigsFtoL(self, bid_id, cursor) -> None:
         # F -> L: Sending MSG3L
@@ -12544,6 +12964,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             xmr_swap.dest_af,
             a_fee_rate,
             xmr_swap.vkbv,
+            tx_lock_refund_bytes=xmr_swap.a_lock_refund_tx,
         )
 
         xmr_swap.a_lock_spend_tx_id = ci_from.getTxid(xmr_swap.a_lock_spend_tx)
@@ -12843,7 +13264,50 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ensure(offer, f"Offer not found: {self.log.id(bid.offer_id)}.")
         ensure(xmr_offer, f"Adaptor-sig offer not found: {self.log.id(bid.offer_id)}.")
 
+        if TxTypes.XMR_SWAP_A_LOCK_REFUND in bid.txns:
+            self.log.warning(
+                f"Not releasing the lock tx secret for bid {self.log.id(bid_id)}: Chain A lock refund tx already exists."
+            )
+            self.logBidEvent(
+                bid.bid_id,
+                EventLogTypes.LOCK_RELEASE_ABANDONED_LOCK_CLOSE,
+                "Chain A lock refund tx already exists",
+                cursor,
+            )
+            return
+
         reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
+
+        # Block count locks are regtest only and have no comparable margin
+        if offer.lock_type == TxLockTypes.SEQUENCE_LOCK_TIME:
+            ci_from = self.ci(Coins(offer.coin_to if reverse_bid else offer.coin_from))
+            lock_remaining = (
+                None
+                if bid.xmr_a_lock_tx is None
+                else ci_from.csvLockRemaining(
+                    offer.lock_type,
+                    xmr_offer.lock_time_1,
+                    bid.xmr_a_lock_tx.block_height,
+                    bid.xmr_a_lock_tx.block_time,
+                )
+            )
+            if lock_remaining is None:
+                raise TemporaryError(
+                    f"Can't determine the coin a lock refund timelock for bid {self.log.id(bid_id)}."
+                )
+            if lock_remaining < self._sc_lock_release_min_margin:
+                # Releasing now would let the lock spend and refund txs be broadcast together
+                self.log.error(
+                    f"Not releasing the lock tx secret for bid {self.log.id(bid_id)}, "
+                    f"refund timelock too close: {lock_remaining} < {self._sc_lock_release_min_margin}."
+                )
+                self.logBidEvent(
+                    bid.bid_id,
+                    EventLogTypes.LOCK_RELEASE_ABANDONED_LOCK_CLOSE,
+                    "",
+                    cursor,
+                )
+                return
 
         msg_buf = XmrBidLockReleaseMessage(
             bid_msg_id=bid_id, al_lock_spend_tx_esig=xmr_swap.al_lock_spend_tx_esig
@@ -12910,6 +13374,36 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         coin_to = Coins(offer.coin_from if reverse_bid else offer.coin_to)
         ci_from = self.ci(coin_from)
         ci_to = self.ci(coin_to)
+
+        # Block count locks are regtest only and have no comparable margin
+        if offer.lock_type == TxLockTypes.SEQUENCE_LOCK_TIME:
+            lock_remaining = (
+                None
+                if bid.xmr_a_lock_tx is None
+                else ci_from.csvLockRemaining(
+                    offer.lock_type,
+                    xmr_offer.lock_time_1,
+                    bid.xmr_a_lock_tx.block_height,
+                    bid.xmr_a_lock_tx.block_time,
+                )
+            )
+            if lock_remaining is None:
+                raise TemporaryError(
+                    f"Can't determine the coin a lock refund timelock for bid {self.log.id(bid_id)}."
+                )
+            if lock_remaining < self._sc_lock_spend_min_margin:
+                # Publishing now would reveal the coin b keyshare with too little time to confirm
+                self.log.error(
+                    f"Not publishing the lock spend tx for bid {self.log.id(bid_id)}, "
+                    f"refund timelock too close: {lock_remaining} < {self._sc_lock_spend_min_margin}."
+                )
+                self.logBidEvent(
+                    bid.bid_id,
+                    EventLogTypes.LOCK_SPEND_ABANDONED_LOCK_CLOSE,
+                    "",
+                    cursor,
+                )
+                return
 
         for_ed25519: bool = True if ci_to.curve_type() == Curves.ed25519 else False
         kbsf = self.getPathKey(
@@ -13049,21 +13543,13 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     f"Chain B lock tx still confirming {lock_tx_depth} / {ci_to.depth_spendable()}."
                 )
 
-            if TxTypes.BCH_MERCY in bid.txns:
+            if TxTypes.MERCY in bid.txns:
                 self.log.info("Using keyshare from mercy tx.")
-                kbsf = bid.txns[TxTypes.BCH_MERCY].tx_data
+                kbsf = bid.txns[TxTypes.MERCY].tx_data
                 pkbsf = ci_to.getPubkey(kbsf)
                 ensure(
                     pkbsf == xmr_swap.pkbsf,
                     "Keyshare from mercy tx does not match expected pubkey",
-                )
-            elif TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE in bid.txns:
-                self.log.info("Using keyshare from swipe tx.")
-                kbsf = bid.txns[TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE].tx_data
-                pkbsf = ci_to.getPubkey(kbsf)
-                ensure(
-                    pkbsf == xmr_swap.pkbsf,
-                    "Keyshare from swipe tx does not match expected pubkey",
                 )
             else:
                 # Extract the leader's decrypted signature and use it to recover the follower's privatekey
@@ -13164,13 +13650,21 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             return
 
         bid.xmr_b_lock_tx.spend_txid = txid
-        bid.setState(BidStates.XMR_SWAP_NOSCRIPT_TX_REDEEMED)
+        # A swipe took chain a, so only chain b comes back.  Hold in
+        # XMR_SWAP_FAILED_SWIPED_USING_MERCY until the spend confirms.
+        using_mercy: bool = bid.state == BidStates.XMR_SWAP_FAILED_SWIPED_USING_MERCY
+        if not using_mercy:
+            bid.setState(BidStates.XMR_SWAP_NOSCRIPT_TX_REDEEMED)
         if bid.xmr_b_lock_tx:
             bid.xmr_b_lock_tx.setState(TxStates.TX_REDEEMED)
 
         if not is_redeem_address_owned:
-            bid.setState(BidStates.SWAP_COMPLETED)
-            self.notify(NT.SWAP_COMPLETED, {"bid_id": bid_id.hex()})
+            # The spend won't be seen in the wallet, there is nothing to wait for
+            if using_mercy:
+                bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED_USED_MERCY)
+            else:
+                bid.setState(BidStates.SWAP_COMPLETED)
+                self.notify(NT.SWAP_COMPLETED, {"bid_id": bid_id.hex()})
 
         # TODO: Why does using bid.txns error here?
         self.saveBidInSession(bid_id, bid, cursor, xmr_swap, save_in_progress=offer)
@@ -13304,6 +13798,98 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         bid.setState(BidStates.XMR_SWAP_NOSCRIPT_TX_RECOVERED)
         if bid.xmr_b_lock_tx:
             bid.xmr_b_lock_tx.setState(TxStates.TX_REFUNDED)
+        self.saveBidInSession(bid_id, bid, cursor, xmr_swap, save_in_progress=offer)
+
+    def sendMercyTx(self, bid_id: bytes, cursor) -> None:
+        self.log.debug(f"Sending mercy tx for bid {self.log.id(bid_id)}.")
+
+        bid, xmr_swap = self.getXmrBidFromSession(cursor, bid_id)
+        ensure(bid, f"Bid not found: {self.log.id(bid_id)}.")
+        ensure(xmr_swap, f"Adaptor-sig swap not found: {self.log.id(bid_id)}.")
+
+        offer, xmr_offer = self.getXmrOfferFromSession(cursor, bid.offer_id)
+        ensure(offer, f"Offer not found: {self.log.id(bid.offer_id)}.")
+
+        if TxTypes.MERCY in bid.txns:
+            self.log.debug(f"Mercy tx already exists for bid {self.log.id(bid_id)}.")
+            return
+
+        reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
+        coin_from = Coins(offer.coin_to if reverse_bid else offer.coin_from)
+        coin_to = Coins(offer.coin_from if reverse_bid else offer.coin_to)
+        ci_from = self.ci(coin_from)
+
+        skip_reason: str = ""
+        if not ci_from.altruistic():
+            # The setting can be changed while the swipe confirms
+            skip_reason = "altruistic is disabled"
+        elif not ci_from.canSendMercyTx():
+            skip_reason = f"{ci_from.coin_name()} can't build a mercy tx"
+        if skip_reason:
+            self.log.info(
+                f"Not sending mercy tx for bid {self.log.id(bid_id)}: {skip_reason}."
+            )
+            self.logBidEvent(
+                bid_id, EventLogTypes.MERCY_TX_NOT_SENT, skip_reason, cursor
+            )
+            self._unlockMercyPrevout(ci_from, bid, cursor)
+            bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED)
+            self.saveBidInSession(bid_id, bid, cursor, xmr_swap, save_in_progress=offer)
+            return
+
+        swipe_tx = bid.txns.get(TxTypes.XMR_SWAP_A_LOCK_REFUND_SWIPE)
+        ensure(swipe_tx, f"Swipe tx not found for bid {self.log.id(bid_id)}.")
+
+        # Retried here until the swipe confirms, covering a wallet that hadn't
+        # picked the output up when the lock was first taken
+        self._lockMercyPrevout(ci_from, bid, cursor)
+
+        found_tx = ci_from.findConfirmedTxnByHash(swipe_tx.txid.hex())
+        if found_tx is None:
+            raise TemporaryError(
+                f"Swipe tx not yet confirmed for bid {self.log.id(bid_id)}."
+            )
+
+        ci_to = self.ci(coin_to)
+        for_ed25519: bool = True if ci_to.curve_type() == Curves.ed25519 else False
+        kbsf = self.getPathKey(
+            coin_from,
+            coin_to,
+            bid.created_at,
+            xmr_swap.contract_count,
+            KeyTypes.KBSF,
+            for_ed25519,
+        )
+
+        if self.haveDebugInd(bid_id, DebugTypes.MAKE_INVALID_MERCY_TX):
+            self.log.debug(f"Bid {self.log.id(bid_id)}: Sending an invalid keyshare.")
+            kbsf = ci_to.getNewRandomKey()
+
+        a_fee_rate: int = xmr_offer.b_fee_rate if reverse_bid else xmr_offer.a_fee_rate
+        mercy_tx = ci_from.createMercyTx(
+            xmr_swap.a_lock_refund_swipe_tx,
+            swipe_tx.txid,
+            xmr_swap.a_lock_refund_tx_script,
+            kbsf,
+            a_fee_rate,
+        )
+        txid_hex: str = ci_from.publishTx(mercy_tx)
+        bid.txns[TxTypes.MERCY] = SwapTx(
+            bid_id=bid_id,
+            tx_type=TxTypes.MERCY,
+            txid=bytes.fromhex(txid_hex),
+        )
+        self.log.info(
+            f"Submitted mercy tx for bid {self.log.id(bid_id)}, txid {self.logIDT(txid_hex)}"
+        )
+        self.logBidEvent(
+            bid_id,
+            EventLogTypes.MERCY_TX_PUBLISHED,
+            "",
+            cursor,
+        )
+        if bid.state == BidStates.XMR_SWAP_FAILED_SWIPED_SENDING_MERCY:
+            bid.setState(BidStates.XMR_SWAP_FAILED_SWIPED)
         self.saveBidInSession(bid_id, bid, cursor, xmr_swap, save_in_progress=offer)
 
     def sendXmrBidCoinALockSpendTxMsg(self, bid_id: bytes, cursor) -> None:
@@ -13571,6 +14157,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 xmr_swap.dest_af,
                 a_fee_rate,
                 xmr_swap.vkbv,
+                tx_lock_refund_bytes=xmr_swap.a_lock_refund_tx,
             )
 
             ci_from.verifyCompactSig(
@@ -13782,6 +14369,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ensure(offer and offer.was_sent, f"Offer not found: {self.log.id(offer_id)}")
         ensure(offer.swap_type == SwapTypes.XMR_SWAP, "Bid/offer swap type mismatch")
         ensure(xmr_offer, f"Adaptor-sig offer not found: {self.log.id(offer_id)}")
+        ensure(
+            offer.protocol_version >= MINPROTO_VERSION_ADAPTOR_SIG,
+            "Incompatible offer protocol version",
+        )
         reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
         ensure(reverse_bid is True, f"Offer: {self.log.id(offer_id)} not reversed")
 
@@ -14448,30 +15039,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 self._last_checked_progress = now
 
             if now - self._last_checked_watched >= self.check_watched_seconds:
-                for k, c in self.coin_clients.items():
-                    if (
-                        k == Coins.PART_ANON
-                        or k == Coins.PART_BLIND
-                        or k == Coins.LTC_MWEB
-                    ):
-                        continue
-                    if len(c["watched_outputs"]) > 0 or len(c["watched_scripts"]):
-                        if c.get("connection_type") == "electrum":
-                            if (
-                                k not in self._electrum_spend_check_futures
-                                or self._electrum_spend_check_futures[k].done()
-                            ):
-                                self._electrum_spend_check_futures[k] = (
-                                    self.thread_pool.submit(
-                                        self._fetchSpendsElectrum,
-                                        k,
-                                        list(c["watched_outputs"]),
-                                        list(c["watched_scripts"]),
-                                    )
-                                )
-                        else:
-                            self.checkForSpends(k, c)
-                self._last_checked_watched = now
+                try:
+                    self.checkWatched()
+                except Exception as ex:
+                    self.logException(f"checkWatched {ex}")
+                finally:
+                    self._last_checked_watched = now
 
             if now - self._last_checked_expired >= self.check_expired_seconds:
                 self.expireMessages()
@@ -14643,6 +15216,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 if settings_copy.get("debug_ui", False) != new_value:
                     self.debug_ui = new_value
                     settings_copy["debug_ui"] = new_value
+                    settings_changed = True
+
+            if "expire_unused_offers" in data:
+                new_value = data["expire_unused_offers"]
+                ensure(
+                    isinstance(new_value, bool),
+                    "New expire_unused_offers value not boolean",
+                )
+                if settings_copy.get("expire_unused_offers", True) != new_value:
+                    self._expire_unused_offers = new_value
+                    settings_copy["expire_unused_offers"] = new_value
                     settings_changed = True
 
             if "expire_db_records" in data:
@@ -14977,6 +15561,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                             cc["chain_lookups"] = data["lookups"]
                             break
 
+            is_xmr_like = coin_name in ("monero", "wownero")
+            daemon_settings_changed = False
+            # Set when host/port changed, so the live apply points straight at it.
+            rpc_target_changed = False
             for setting in (
                 "manage_daemon",
                 "rpchost",
@@ -14987,20 +15575,47 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     continue
                 if settings_cc.get(setting) != data[setting]:
                     settings_changed = True
-                    suggest_reboot = True
                     settings_cc[setting] = data[setting]
+                    if is_xmr_like and setting in (
+                        "rpchost",
+                        "rpcport",
+                        "automatically_select_daemon",
+                    ):
+                        daemon_settings_changed = True
+                        if setting in ("rpchost", "rpcport"):
+                            rpc_target_changed = True
+                    else:
+                        suggest_reboot = True
 
-            if "remotedaemonurls" in data:
-                remotedaemonurls_in = data["remotedaemonurls"].split("\n")
-                remotedaemonurls = set()
-                for url in remotedaemonurls_in:
-                    if url.count(":") > 0:
-                        remotedaemonurls.add(url.strip())
-
-                if set(settings_cc.get("remote_daemon_urls", [])) != remotedaemonurls:
-                    settings_cc["remote_daemon_urls"] = list(remotedaemonurls)
+            # Node list changes. The settings page posts remote_daemon_nodes (a
+            # list of {"url", "failover"} dicts); the legacy API still accepts
+            # remotedaemonurls (newline-separated "host:port", all failover-on).
+            new_nodes = None
+            if "remote_daemon_nodes" in data:
+                new_nodes = self.normaliseRemoteDaemonUrls(data["remote_daemon_nodes"])
+            elif "remotedaemonurls" in data:
+                new_nodes = self.normaliseRemoteDaemonUrls(
+                    [
+                        line.strip()
+                        for line in data["remotedaemonurls"].split("\n")
+                        if line.count(":") > 0
+                    ]
+                )
+            if new_nodes is not None:
+                existing_nodes = self.normaliseRemoteDaemonUrls(
+                    settings_cc.get("remote_daemon_urls", [])
+                )
+                # Compare url+failover membership only, so a purely cosmetic
+                # reorder of the node list is not treated as a settings change.
+                if {(n["url"], n["failover"]) for n in existing_nodes} != {
+                    (n["url"], n["failover"]) for n in new_nodes
+                }:
+                    settings_cc["remote_daemon_urls"] = new_nodes
                     settings_changed = True
-                    suggest_reboot = True
+                    if is_xmr_like:
+                        daemon_settings_changed = True
+                    else:
+                        suggest_reboot = True
 
             # Ensure remote_daemon_urls appears in settings if automatically_select_daemon is present
             if (
@@ -15115,7 +15730,52 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     json.dump(settings_copy, fp, indent=4)
                 shutil.move(settings_path_new, settings_path)
                 self.settings = settings_copy
+
+        # Apply XMR/WOW daemon changes via set_daemon, outside the mxDB lock.
+        if daemon_settings_changed:
+            coin_id = self.getCoinIdFromName(coin_name)
+            if not self.isCoinActive(coin_id):
+                suggest_reboot = True
+            else:
+                try:
+                    new_cc = self.settings["chainclients"][coin_name]
+                    if rpc_target_changed:
+                        self.ci(coin_id).setDaemonAddress(
+                            new_cc["rpchost"], new_cc["rpcport"]
+                        )
+                    elif new_cc.get("automatically_select_daemon", False):
+                        # Auto-select or list changed: selectXMRRemoteDaemon applies via set_daemon.
+                        self.selectXMRRemoteDaemon(coin_id)
+                except Exception as e:
+                    self.log.error(
+                        f"Applying daemon settings for {coin_name} failed: {e}"
+                    )
+                    suggest_reboot = True
+
         return settings_changed, suggest_reboot, migration_message
+
+    def saveRemoteDaemonNodes(self, coin_name: str, nodes) -> bool:
+        new_nodes = self.normaliseRemoteDaemonUrls(nodes)
+        settings_copy = copy.deepcopy(self.settings)
+        with self.mxDB:
+            settings_cc = settings_copy["chainclients"][coin_name]
+            existing_nodes = self.normaliseRemoteDaemonUrls(
+                settings_cc.get("remote_daemon_urls", [])
+            )
+            if {(n["url"], n["failover"]) for n in existing_nodes} == {
+                (n["url"], n["failover"]) for n in new_nodes
+            }:
+                return False
+            settings_cc["remote_daemon_urls"] = new_nodes
+            self._normalizeSettingsPaths(settings_copy)
+            settings_path = os.path.join(self.data_dir, cfg.CONFIG_FILENAME)
+            settings_path_new = settings_path + ".new"
+            shutil.copyfile(settings_path, settings_path + ".last")
+            with open(settings_path_new, "w") as fp:
+                json.dump(settings_copy, fp, indent=4)
+            shutil.move(settings_path_new, settings_path)
+            self.settings = settings_copy
+        return True
 
     def enableCoin(self, coin_name: str) -> None:
         self.log.info(f"Enabling coin {coin_name}.")
@@ -16230,24 +16890,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         coin_from = Coins(offer.coin_to if reverse_bid else offer.coin_from)
         coin_to = Coins(offer.coin_from if reverse_bid else offer.coin_to)
 
-        # TODO: Ensure a chain B lock tx to the expected/summed address exists before sending mercy output.
-        kbsf = None
-        if self.isBchXmrSwap(offer):
-            pass
-            # BCH sends a separate mercy tx
-        else:
-            for_ed25519: bool = (
-                True if self.ci(coin_to).curve_type() == Curves.ed25519 else False
-            )
-            kbsf = self.getPathKey(
-                coin_from,
-                coin_to,
-                bid.created_at,
-                xmr_swap.contract_count,
-                KeyTypes.KBSF,
-                for_ed25519,
-            )
-
         pkh_dest = ci.decodeAddress(self.getReceiveAddressForCoin(ci.coin_type()))
         spend_tx = ci.createSCLockRefundSpendToFTx(
             xmr_swap.a_lock_refund_tx,
@@ -16255,7 +16897,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             pkh_dest,
             a_fee_rate,
             xmr_swap.vkbv,
-            kbsf,
         )
 
         vkaf = self.getPathKey(
@@ -16362,16 +17003,34 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         return chainparams[use_coinid]["name"]
 
-    def _backgroundPriceFetchLoop(self):
-        backoff_until = 0
-        backoff_multiplier = 1
+    def isRateLimitError(self, e) -> bool:
+        error_str = str(e)
+        return "429" in error_str or "Too Many Requests" in error_str
 
+    def rateSourceBackoffRemaining(self) -> int:
+        with self._price_cache_lock:
+            return max(0, self._rate_limit_backoff_until - int(time.time()))
+
+    def noteRateSourceLimited(self) -> int:
+        with self._price_cache_lock:
+            backoff_seconds: int = min(20 * self._rate_limit_backoff_step, 120)
+            self._rate_limit_backoff_until = int(time.time()) + backoff_seconds
+            self._rate_limit_backoff_step = min(self._rate_limit_backoff_step + 1, 6)
+        return backoff_seconds
+
+    def clearRateSourceBackoff(self) -> None:
+        with self._price_cache_lock:
+            self._rate_limit_backoff_until = 0
+            self._rate_limit_backoff_step = 1
+
+    def _backgroundPriceFetchLoop(self):
         while self._price_fetch_running:
             try:
                 now = int(time.time())
 
-                if now < backoff_until:
-                    for _ in range(60):
+                backoff_remaining: int = self.rateSourceBackoffRemaining()
+                if backoff_remaining > 0:
+                    for _ in range(backoff_remaining):
                         if not self._price_fetch_running:
                             break
                         time.sleep(1)
@@ -16381,14 +17040,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     try:
                         self._fetchPricesAndVolumeBackground()
                         self._last_price_fetch = now
-                        self._last_volume_fetch = now
-                        backoff_multiplier = 1
+                        self.clearRateSourceBackoff()
                     except Exception as e:
-                        error_str = str(e)
-                        if "429" in error_str or "Too Many Requests" in error_str:
-                            backoff_seconds = min(120 * backoff_multiplier, 960)
-                            backoff_until = now + backoff_seconds
-                            backoff_multiplier = min(backoff_multiplier * 2, 8)
+                        if self.isRateLimitError(e):
+                            backoff_seconds: int = self.noteRateSourceLimited()
                             self.log.warning(
                                 f"CoinGecko rate limited, backing off for {backoff_seconds}s"
                             )
@@ -16411,177 +17066,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         for rate_source in ["coingecko.com"]:
             self._fetchPricesAndVolumeForSource(all_coins, rate_source, Fiat.USD)
-
-    def _fetchPricesBackground(self):
-        all_coins = [c for c in Coins if c in chainparams]
-        if not all_coins:
-            return
-
-        for rate_source in ["coingecko.com"]:
-            try:
-                self._fetchPricesForSource(all_coins, rate_source, Fiat.USD)
-            except Exception as e:
-                self.log.warning(
-                    f"Background price fetch from {rate_source} failed: {e}"
-                )
-
-    def _fetchVolumeBackground(self):
-        all_coins = [c for c in Coins if c in chainparams]
-        if not all_coins:
-            return
-
-        for rate_source in ["coingecko.com"]:
-            try:
-                self._fetchVolumeForSource(all_coins, rate_source)
-            except Exception as e:
-                self.log.warning(
-                    f"Background volume fetch from {rate_source} failed: {e}"
-                )
-
-    def _fetchPricesForSource(self, coins_list, rate_source, currency_to):
-        now = int(time.time())
-        headers = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
-
-        exchange_name_map = {}
-        coin_ids = ""
-        for coin_id in coins_list:
-            if len(coin_ids) > 0:
-                coin_ids += ","
-            exchange_name = self.getExchangeName(coin_id, rate_source)
-            coin_ids += exchange_name
-            exchange_name_map[exchange_name] = coin_id
-
-        if rate_source == "coingecko.com":
-            ticker_to = fiatTicker(currency_to).lower()
-            api_key = get_api_key_setting(
-                self.settings,
-                "coingecko_api_key",
-                default_coingecko_api_key,
-                escape=True,
-            )
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_ids}&vs_currencies={ticker_to}"
-            if api_key != "":
-                url += f"&api_key={api_key}"
-
-            js = json.loads(self.readURL(url, timeout=3, headers=headers))
-
-            with self._price_cache_lock:
-                for k, v in js.items():
-                    coin_id = exchange_name_map[k]
-                    cache_key = (coin_id, currency_to, rate_source)
-                    self._price_cache[cache_key] = {
-                        "rate": v[ticker_to],
-                        "timestamp": now,
-                    }
-
-            cursor = self.openDB()
-            try:
-                update_query = """
-                    UPDATE coinrates SET
-                        rate=:rate,
-                        last_updated=:last_updated
-                    WHERE currency_from = :currency_from AND currency_to = :currency_to AND source = :rate_source
-                    """
-
-                insert_query = """INSERT INTO coinrates(currency_from, currency_to, rate, source, last_updated)
-                        VALUES(:currency_from, :currency_to, :rate, :rate_source, :last_updated)"""
-
-                for k, v in js.items():
-                    coin_id = exchange_name_map[k]
-                    cursor.execute(
-                        update_query,
-                        {
-                            "currency_from": coin_id,
-                            "currency_to": currency_to,
-                            "rate": v[ticker_to],
-                            "rate_source": rate_source,
-                            "last_updated": now,
-                        },
-                    )
-                    if cursor.rowcount < 1:
-                        cursor.execute(
-                            insert_query,
-                            {
-                                "currency_from": coin_id,
-                                "currency_to": currency_to,
-                                "rate": v[ticker_to],
-                                "rate_source": rate_source,
-                                "last_updated": now,
-                            },
-                        )
-                self.commitDB()
-            finally:
-                self.closeDB(cursor, commit=False)
-
-    def _fetchVolumeForSource(self, coins_list, rate_source):
-        now = int(time.time())
-        headers = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
-
-        exchange_name_map = {}
-        coin_ids = ""
-        for coin_id in coins_list:
-            if len(coin_ids) > 0:
-                coin_ids += ","
-            exchange_name = self.getExchangeName(coin_id, rate_source)
-            coin_ids += exchange_name
-            exchange_name_map[exchange_name] = coin_id
-
-        if rate_source == "coingecko.com":
-            api_key = get_api_key_setting(
-                self.settings,
-                "coingecko_api_key",
-                default_coingecko_api_key,
-                escape=True,
-            )
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_ids}&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true"
-            if api_key != "":
-                url += f"&api_key={api_key}"
-
-            js = json.loads(self.readURL(url, timeout=3, headers=headers))
-
-            with self._price_cache_lock:
-                for k, v in js.items():
-                    coin_id = exchange_name_map[k]
-                    cache_key = (coin_id, rate_source)
-                    volume_24h = v.get("usd_24h_vol")
-                    price_change_24h = v.get("usd_24h_change")
-                    self._volume_cache[cache_key] = {
-                        "volume_24h": (
-                            float(volume_24h) if volume_24h is not None else None
-                        ),
-                        "price_change_24h": (
-                            float(price_change_24h)
-                            if price_change_24h is not None
-                            else 0.0
-                        ),
-                        "timestamp": now,
-                    }
-
-            cursor = self.openDB()
-            try:
-                for k, v in js.items():
-                    coin_id = exchange_name_map[k]
-                    volume_24h = v.get("usd_24h_vol")
-                    price_change_24h = v.get("usd_24h_change")
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO coinvolume (coin_id, volume_24h, price_change_24h, source, last_updated) VALUES (:coin_id, :volume_24h, :price_change_24h, :rate_source, :last_updated)",
-                        {
-                            "coin_id": coin_id,
-                            "volume_24h": (
-                                str(volume_24h) if volume_24h is not None else "None"
-                            ),
-                            "price_change_24h": (
-                                str(price_change_24h)
-                                if price_change_24h is not None
-                                else "0.0"
-                            ),
-                            "rate_source": rate_source,
-                            "last_updated": now,
-                        },
-                    )
-                self.commitDB()
-            finally:
-                self.closeDB(cursor, commit=False)
 
     def _fetchPricesAndVolumeForSource(self, coins_list, rate_source, currency_to):
         now = int(time.time())
@@ -16675,7 +17159,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     volume_24h = v.get(f"{ticker_to}_24h_vol")
                     price_change_24h = v.get(f"{ticker_to}_24h_change")
                     cursor.execute(
-                        "INSERT OR REPLACE INTO coinvolume (coin_id, volume_24h, price_change_24h, source, last_updated) VALUES (:coin_id, :volume_24h, :price_change_24h, :rate_source, :last_updated)",
+                        "DELETE FROM coinvolume WHERE coin_id = :coin_id AND source = :rate_source",
+                        {
+                            "coin_id": coin_id,
+                            "rate_source": rate_source,
+                        },
+                    )
+                    cursor.execute(
+                        "INSERT INTO coinvolume (coin_id, volume_24h, price_change_24h, source, last_updated) VALUES (:coin_id, :volume_24h, :price_change_24h, :rate_source, :last_updated)",
                         {
                             "coin_id": coin_id,
                             "volume_24h": (
@@ -16871,6 +17362,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             if len(need_coins) < 1:
                 return return_data
 
+            backoff_remaining: int = self.rateSourceBackoffRemaining()
+            if backoff_remaining > 0:
+                self.log.debug(
+                    f"Skipping historical data fetch, rate limited for {backoff_remaining}s"
+                )
+                for coin_id in need_coins:
+                    return_data[coin_id] = []
+                return return_data
+
             if rate_source == "coingecko.com":
                 api_key: str = get_api_key_setting(
                     self.settings,
@@ -16893,11 +17393,21 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                         if "prices" in js:
                             return_data[coin_id] = js["prices"]
                             new_values[coin_id] = js["prices"]
+                        self.clearRateSourceBackoff()
                     except Exception as e:
                         self.log.warning(
                             f"Could not fetch historical data for {Coins(coin_id).name}: {e}"
                         )
                         return_data[coin_id] = []
+                        if self.isRateLimitError(e):
+                            backoff_seconds: int = self.noteRateSourceLimited()
+                            self.log.warning(
+                                f"CoinGecko rate limited, backing off for {backoff_seconds}s"
+                            )
+                            for remaining_id in need_coins:
+                                if remaining_id not in return_data:
+                                    return_data[remaining_id] = []
+                            break
             else:
                 raise ValueError(f"Unknown rate source {rate_source}")
 
@@ -16906,7 +17416,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
             for coin_id, price_data in new_values.items():
                 cursor.execute(
-                    "INSERT OR REPLACE INTO coinhistory (coin_id, days, price_data, source, last_updated) VALUES (:coin_id, :days, :price_data, :rate_source, :last_updated)",
+                    "DELETE FROM coinhistory WHERE coin_id = :coin_id AND days = :days AND source = :rate_source",
+                    {
+                        "coin_id": coin_id,
+                        "days": days,
+                        "rate_source": rate_source,
+                    },
+                )
+                cursor.execute(
+                    "INSERT INTO coinhistory (coin_id, days, price_data, source, last_updated) VALUES (:coin_id, :days, :price_data, :rate_source, :last_updated)",
                     {
                         "coin_id": coin_id,
                         "days": days,

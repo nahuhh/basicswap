@@ -1,3 +1,239 @@
+0.18.5
+==============
+
+**Security / hardening**
+- The mercy keyshare is sent in a transaction of its own instead of as an extra output on
+  the swipe tx. The mercy tx is only sent once the swipe tx has confirmed.
+- The node gives up watching for a mercy tx after a bounded number of blocks and records
+  why, rather than leaving the bid waiting for a tx that will never arrive.
+- Sending a mercy is enabled by default again, reversing the temporary opt-in of 0.18.4.
+  One setting now controls the default for every coin.
+
+**Fixes**
+- Price lookups no longer spam a rate-limited source.  The backoff is shorter and every
+  caller now respects it.
+
+**Database**
+- New setting `expire_unused_offers`, on by default, removes expired offers that never
+  received a bid.  Offers that carry bid history are left to `expire_db_records`, which is
+  unchanged and still off by default.
+- The expiry prune runs as set-based deletes in batches, with a cap on the work done per
+  pass so a large backlog drains over several main loop cycles rather than holding the
+  database lock for the whole run.
+- Old coinhistory and coinvolume rows are trimmed.
+- Indices added on `bids.offer_id`, `xmr_offers.offer_id` and
+  `message_network_links(linked_type, linked_id)`.
+
+**UI**
+- The bid debug header is only shown in debug UI mode.
+
+**Dependencies**
+- Firo 0.14.17.2 -> 0.14.18.0
+
+**Upgrade note**
+- The adaptor-sig protocol version is raised to 6, and the minimum accepted version with
+  it.  This release will not accept adaptor-sig offers or bids from 0.18.4 and earlier.
+  Secret-hash swaps are unchanged.
+- `expire_unused_offers` defaults to on, so expired offers with no bids are removed on the
+  first expiry pass after upgrading.  Set it to false before starting if you want to keep
+  them.
+
+
+0.18.4
+==============
+
+**Security / hardening**
+- Mercy outputs are temporarily opt-in.  When a swap fails and the follower swipes the
+  chain A lock refund output, a mercy output reveals the follower's chain B keyshare so
+  that the leader can still recover their coin.  Sending one is no longer automatic and
+  must be enabled explicitly.
+
+**Fixes**
+- Bids CSV export: the from and to amount and coin columns were written in the opposite
+  order to their headers.
+
+**UI**
+- The settings page shows whether mercy outputs are enabled for each coin.
+
+**Dependencies**
+- pyzmq 27.1.0 -> 27.2.0
+
+
+0.18.3
+==============
+
+**Security / hardening**
+- Adaptor-sig swaps: the chain A lock spend tx now pays a higher absolute fee than the
+  pre-refund tx.  Both spend the same lock output, so a leader could let the follower
+  broadcast the lock spend tx and then replace it with the pre-refund tx by RBF once the
+  timelock matured, taking both legs.  The pre-refund tx pays to a p2wsh output and was
+  the larger of the two, so at the agreed rate it paid the larger fee; Bitcoin Core v29.1
+  lowered the incremental relay fee to 100 sat/kvB, which brought the replacement within
+  reach.
+- Adaptor-sig swaps: the lock refund script now carries a one block sequence lock on its
+  2 of 2 branch.  Without it the pre-refund tx and the refund spend tx could be submitted
+  together as a package that outpaid the lock spend tx, reaching the same replacement by
+  another route.
+- Adaptor-sig swaps: BIP68 relative time locks are measured from the median time past of
+  the block before the one holding the lock tx, as consensus does, rather than from that
+  block's header time.  The header time runs ahead of the median time past, so the margins
+  that gate releasing the lock secret and publishing the lock spend tx could read the
+  refund timelock as further away than it was.
+- The chain median time no longer falls back to the last value fetched when the daemon or
+  Electrum server cannot be reached.  A stale value overstates the time remaining on a
+  refund timelock by the length of the outage, in the direction that lets those margins
+  pass when they should hold.
+- Fee rate verification allows 10 sat/kvB above the agreed rate rather than 20.
+
+**Upgrade note**
+- The adaptor-sig protocol version is raised to 5, and the minimum accepted version with
+  it.  This release will not accept adaptor-sig offers or bids from 0.18.2 and earlier.
+  Secret-hash swaps are unchanged.
+- Adaptor-sig swaps already in progress when the node is upgraded keep verifying the lock
+  spend tx fee under the previous rule, so upgrading mid-swap does not strand them.
+
+
+0.18.2
+==============
+
+**Security / hardening**
+- Adaptor-sig swaps: don't publish the chain A lock spend tx when the refund timelock is
+  close to expiring.
+- Default the `min_relay_fee` setting to 0.00001 for Bitcoin.  Bitcoin Core lowered its own
+  `-minrelaytxfee` default from 1000 to 100 sat/kvB in v29.1, so this is the more
+  conservative of the two: offers below 1000 sat/kvB are refused even where the node would
+  relay them.
+
+
+0.18.1
+==============
+
+**Security / hardening**
+- Adaptor-sig swaps: don't send the chain A lock release secret when the refund timelock
+  is close to expiring.  Releasing late leaves the follower's lock spend tx and the
+  leader's refund tx able to reach the mempool at the same time.  The margin is set by
+  `sc_lock_release_min_margin`, one hour by default.
+- Raise the default minimum sequence lock to two hours, so that an offer at the minimum
+  lock value still leaves room to release the secret ahead of the margin above.
+
+**Refactors**
+- Remove the temporary repair for invalid lock tx A refund tx sighash types.
+
+
+0.18.0
+==============
+
+**Security / hardening**
+- Secret-hash contracts: reject scripts with trailing opcodes.
+- Adaptor-sig swaps: transaction fee verification no longer accepts a rate slightly below the one
+  agreed in the offer.  The comparison allowed 19 sat/kvB of leeway in either direction.
+  Fees are now rounded up when building transactions, so a transaction always meets the
+  rate it was built for.
+- Fee validation: apply a relay-fee floor on Electrum connections, where there is no daemon
+  to query for one, and apply the floor to a configured `low_feerate` as well.
+- Electrum: pin server TLS certificates.
+- Electrum: server entries use TLS unless explicitly downgraded with a `:t` marker; the
+  port no longer implies the transport.  An unmarked entry is treated as plaintext only for
+  .onion, LAN and loopback hosts, which authenticate the endpoint by other means.
+- Electrum: require confirmed UTXOs when funding swap transactions.
+- Decred: generate passwords with `secrets` rather than `random`.
+
+**Fixes**
+- Password verification rejected valid hashes when the salt contained "60".
+- Bids: fix subfee bids on PART blind.
+- Bids: clamp to the offer rate when the bid amount is omitted.  A partial bid on a
+  fixed-rate offer took the offer's full amount for the other side.
+- Offers: fix early revoke of an in-flight offer.
+- Queued actions: a failed spend check no longer blocks the queue.
+- Guard against a missing bid in processFoundScript.
+
+**Electrum**
+- Select coins from every signable address.
+- Serialise socket reads and writes.
+- Fix connection churn.
+
+**AMM**
+- Fix rate poisoning: modes that derive a rate from the orderbook now require `minrate` to
+  be greater than zero, so a manipulated orderbook cannot pull an offer's rate down without
+  a floor.
+- Fix a KeyError caused by a max_rate/maxrate template key mismatch.  Configurations are
+  standardised on `max_rate` and legacy `maxrate` entries are migrated.
+
+**Daemon updates**
+- Decred bumped to v2.1.6 [mandatory]
+- Firo bumped to v0.14.17.2 [mandatory]
+- Dash bumped to v23.1.8
+- Bitcoin Cash bumped to v29.1.0
+
+**Prepare**
+- Fix Bitcoin Cash 29.1.0 prepare on macOS, which changed its release asset names.
+
+**Other**
+- coincurve raised to v04.
+
+**Upgrade note**
+- Fee verification is stricter in both directions: transactions are built with the fee
+  rounded up, and a rate below the one agreed in the offer is rejected.  Peers on earlier
+  versions round the fee to nearest when building, which lands a satoshi low roughly half
+  the time, so swaps against them can fail fee verification.
+- Electrum server entries without a transport marker are now TLS.  Existing plaintext
+  entries that are not .onion, LAN or loopback need an explicit `:t` marker added.
+- AMM templates using `maxrate` are migrated to `max_rate` automatically.  Templates using
+  an orderbook-derived rate mode are skipped unless `minrate` is set above zero.
+
+
+0.17.9
+==============
+
+**Security / hardening**
+- Adaptor-sig swaps: check the bid state sooner.  A failed check no longer persists the message.
+- Swap timeouts: measure the lock transaction timeout from the bid's last state change
+  rather than from its expiry, so a bidder's chosen bid validity period can no longer
+  extend how long the other side waits.
+- Offers: block count based lock types are rejected outside regtest.
+
+**Fixes**
+- The default and maximum for `sc_lock_tx_timeout` and `sc_lock_tx_mempool_timeout` were
+  transposed, so both were clamped to the maximum instead of using the intended default.
+- Reduced the default and minimum lock transaction timeout to 20 minutes, so a stalled
+  counterparty is abandoned sooner.
+- Automation: fix the cumulative bid value cap on reversed offers.  It compared totals in
+  one chain's units against the offer amount in the other's, so the cap never triggered.
+- Queued actions: retry bid acceptance after a transient error instead of erroring the bid.
+- Treat socket errors, and timeouts other than read timeouts, as transient.
+
+**Daemon updates**
+- Litecoin bumped to v0.21.5.6.
+  - This release contains important security fixes.
+    - Please make sure to upgrade ASAP.
+
+**Upgrade note**
+- The lock transaction timeout now defaults to 20 minutes rather than several hours.  Bids
+  waiting on a counterparty's lock transaction will time out considerably sooner; raise
+  `sc_lock_tx_timeout` if you need the previous behaviour.
+
+
+0.17.8
+==============
+
+**Security / hardening**
+- BCH swaps: bind the covenant's signature-check public key to the pubkeys agreed during
+  the bid.
+- BCH swaps: verify the exact covenant fee.  The covenant requires the spent value minus
+  the output value to equal the script's mining fee exactly, but the redeem and
+  refund-spend transactions were built from a fee *rate*.  With any non-default fee rate
+  both exit paths were unbroadcastable once the lock transaction was on chain.
+- BCH swaps: bind the covenant mining fee to the fee rate agreed in the offer.
+
+**Fixes**
+- BCH: fix the fee rate at 1000 sat/kB, so the covenant's absolute fee is stable across
+  nodes rather than depending on the local fee estimate.
+
+**Refactors**
+- Range-check decoded transaction output values in the lock, refund and spend verifiers
+  for Bitcoin-derived coins, Bitcoin Cash and Decred.
+- Documented the absolute-fee convention on the BCH interface.
+
 
 0.17.7
 ==============

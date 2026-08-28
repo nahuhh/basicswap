@@ -19,6 +19,11 @@ from .chainparams import (
     Fiat,
 )
 
+# The chain a lock spend tx must pay more than the lock refund tx, or the refund tx can
+# replace it by RBF once the spend tx has been broadcast.  Reachable from Bitcoin Core v29.1,
+# which lowered the incremental relay fee to 100 sat/kvB
+ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER = 12  # sats
+
 
 class TxLockTypes(IntEnum):
     SEQUENCE_LOCK_BLOCKS = 1
@@ -128,6 +133,10 @@ class BidStates(IntEnum):
     BID_AACCEPT_DELAY = 32
     BID_AACCEPT_FAIL = 33
     CONNECT_REQ_SENT = 34
+    XMR_SWAP_FAILED_SWIPED_USED_MERCY = 36
+    XMR_SWAP_FAILED_SWIPED_USING_MERCY = 37
+    XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED = 38
+    XMR_SWAP_FAILED_SWIPED_SENDING_MERCY = 39
 
 
 class TxStates(IntEnum):
@@ -159,7 +168,7 @@ class TxTypes(IntEnum):
 
     ITX_PRE_FUNDED = auto()
 
-    BCH_MERCY = auto()
+    MERCY = auto()
 
     PTX_PRE_FUNDED = auto()
 
@@ -177,6 +186,7 @@ class ActionTypes(IntEnum):
     SEND_XMR_SWAP_LOCK_SPEND_MSG = auto()
     REDEEM_ITX = auto()
     ACCEPT_AS_REV_BID = auto()
+    SEND_MERCY_TX = auto()
 
 
 class EventLogTypes(IntEnum):
@@ -210,8 +220,8 @@ class EventLogTypes(IntEnum):
     PTX_REDEEM_PUBLISHED = auto()
     PTX_REFUND_PUBLISHED = auto()
     LOCK_TX_B_IN_MEMPOOL = auto()
-    BCH_MERCY_TX_PUBLISHED = auto()
-    BCH_MERCY_TX_FOUND = auto()
+    MERCY_TX_PUBLISHED = auto()
+    MERCY_TX_FOUND = auto()
     LOCK_TX_A_IN_MEMPOOL = auto()
     LOCK_TX_A_CONFLICTS = auto()
     LOCK_TX_B_RPC_ERROR = auto()
@@ -220,6 +230,11 @@ class EventLogTypes(IntEnum):
     LOCK_TX_B_REFUND_TX_SEEN = auto()
     LOCK_TX_A_INVALID = auto()
     LOCK_TX_A_REFUND_TX_CONFIRMED = auto()
+    LOCK_RELEASE_ABANDONED_LOCK_CLOSE = auto()
+    LOCK_SPEND_ABANDONED_LOCK_CLOSE = auto()
+    MERCY_TX_NOT_FOUND = auto()
+    MERCY_TX_NOT_SENT = auto()
+    MERCY_TX_UNUSABLE = auto()
 
 
 class XmrSplitMsgTypes(IntEnum):
@@ -251,6 +266,7 @@ class DebugTypes(IntEnum):
     BID_DONT_SPEND_COIN_A_LOCK = auto()
     DONT_SEND_COIN_B_LOCK = auto()
     DONT_RELEASE_COIN_A_LOCK = auto()
+    MAKE_INVALID_MERCY_TX = auto()
 
 
 class NotificationTypes(IntEnum):
@@ -358,6 +374,14 @@ def strBidState(state):
         return "Failed, refunded"
     if state == BidStates.XMR_SWAP_FAILED_SWIPED:
         return "Failed, swiped"
+    if state == BidStates.XMR_SWAP_FAILED_SWIPED_SENDING_MERCY:
+        return "Failed, swiped, sending mercy"
+    if state == BidStates.XMR_SWAP_FAILED_SWIPED_USING_MERCY:
+        return "Failed, swiped, recovering"
+    if state == BidStates.XMR_SWAP_FAILED_SWIPED_USED_MERCY:
+        return "Failed, swiped, recovered"
+    if state == BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED:
+        return "Failed, swiped, mercy unused"
     if state == BidStates.XMR_SWAP_FAILED:
         return "Failed"
     if state == BidStates.SWAP_DELAYING:
@@ -416,8 +440,8 @@ def strTxType(tx_type):
         return "Chain B Lock Tx"
     if tx_type == TxTypes.ITX_PRE_FUNDED:
         return "Funded mock initiate Tx"
-    if tx_type == TxTypes.BCH_MERCY:
-        return "BCH Mercy Tx"
+    if tx_type == TxTypes.MERCY:
+        return "Mercy Tx"
     return "Unknown"
 
 
@@ -490,6 +514,10 @@ def describeEventEntry(event_type, event_msg):
         return "Lock tx A pre-refund tx seen in chain"
     if event_type == EventLogTypes.LOCK_TX_A_REFUND_TX_CONFIRMED:
         return "Lock tx A pre-refund tx confirmed in chain"
+    if event_type == EventLogTypes.LOCK_RELEASE_ABANDONED_LOCK_CLOSE:
+        return "Lock tx A release abandoned, refund timelock too close"
+    if event_type == EventLogTypes.LOCK_SPEND_ABANDONED_LOCK_CLOSE:
+        return "Lock tx A spend abandoned, refund timelock too close"
     if event_type == EventLogTypes.LOCK_TX_A_REFUND_SPEND_TX_SEEN:
         return "Lock tx A refund spend tx seen in chain"
     if event_type == EventLogTypes.SYSTEM_WARNING:
@@ -512,10 +540,16 @@ def describeEventEntry(event_type, event_msg):
         return "Participate tx redeem tx published"
     if event_type == EventLogTypes.PTX_REFUND_PUBLISHED:
         return "Participate tx refund tx published"
-    if event_type == EventLogTypes.BCH_MERCY_TX_FOUND:
-        return "BCH mercy tx found"
-    if event_type == EventLogTypes.BCH_MERCY_TX_PUBLISHED:
-        return "Lock tx B mercy tx published"
+    if event_type == EventLogTypes.MERCY_TX_FOUND:
+        return "Mercy tx found"
+    if event_type == EventLogTypes.MERCY_TX_PUBLISHED:
+        return "Mercy tx published"
+    if event_type == EventLogTypes.MERCY_TX_NOT_FOUND:
+        return "Gave up waiting for a mercy tx"
+    if event_type == EventLogTypes.MERCY_TX_NOT_SENT:
+        return "Mercy tx not sent"
+    if event_type == EventLogTypes.MERCY_TX_UNUSABLE:
+        return "Mercy tx can't be used"
     if event_type == EventLogTypes.LOCK_TX_A_SPEND_TX_SEEN:
         return "Lock tx A spend tx seen in chain"
     if event_type == EventLogTypes.LOCK_TX_B_SPEND_TX_SEEN:
@@ -624,6 +658,8 @@ inactive_states = [
     BidStates.SWAP_TIMEDOUT,
     BidStates.BID_ABANDONED,
     BidStates.BID_EXPIRED,
+    BidStates.XMR_SWAP_FAILED_SWIPED_USED_MERCY,
+    BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED,
 ]
 
 
@@ -671,6 +707,8 @@ def isActiveBidState(state):
         BidStates.XMR_SWAP_MSG_SCRIPT_LOCK_TX_SIGS,
         BidStates.XMR_SWAP_MSG_SCRIPT_LOCK_SPEND_TX,
         BidStates.XMR_SWAP_FAILED,
+        BidStates.XMR_SWAP_FAILED_SWIPED_SENDING_MERCY,
+        BidStates.XMR_SWAP_FAILED_SWIPED_USING_MERCY,
         BidStates.BID_REQUEST_ACCEPTED,
     )
 
@@ -679,6 +717,7 @@ def isErrorBidState(state):
     return state in (
         BidStates.BID_STALLED_FOR_TEST,
         BidStates.BID_ERROR,
+        BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED,
     )
 
 
@@ -690,6 +729,10 @@ def isFailingBidState(state):
         BidStates.XMR_SWAP_NOSCRIPT_TX_RECOVERED,
         BidStates.XMR_SWAP_FAILED_REFUNDED,
         BidStates.XMR_SWAP_FAILED_SWIPED,
+        BidStates.XMR_SWAP_FAILED_SWIPED_SENDING_MERCY,
+        BidStates.XMR_SWAP_FAILED_SWIPED_USED_MERCY,
+        BidStates.XMR_SWAP_FAILED_SWIPED_USING_MERCY,
+        BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED,
         BidStates.XMR_SWAP_FAILED,
     )
 
