@@ -221,7 +221,7 @@
           <h5 class="text-xs font-medium text-gray-600 dark:text-gray-400 mb-3">Clearnet</h5>
           <div class="bg-gray-50 dark:bg-gray-700 rounded-lg p-4">
            <textarea class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none font-mono" name="electrum_clearnet_{{ c.name }}" id="electrum_clearnet_{{ c.name }}" rows="3" placeholder="electrum.blockstream.info:50002&#10;electrum.emzy.de:50002">{% if c.connection_type == 'electrum' %}{{ c.clearnet_servers_text }}{% endif %}</textarea>
-           <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">One per line. Format: host:port (50002=SSL, 50001=non-SSL)</p>
+           <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">One per line. Format: host:port[:s|t] - SSL unless :t is given. IPv6 as [addr]:port</p>
           </div>
          </div>
 
@@ -419,13 +419,60 @@
            </div>
            {% endif %}
 
-           {% if c.name == 'particl' %}
+            {% if c.name == 'particl' %}
            <div>
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Anon Tx Ring Size</label>
             <input type="number" class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" name="rct_ring_size_{{ c.name }}" min="3" max="32" value="{{ c.anon_tx_ring_size }}" placeholder="12">
            </div>
            {% endif %}
 
+           <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">External Destination Address</label>
+            <input type="text" autocomplete="off" spellcheck="false" class="destination-address-input hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" name="destination_address_{{ c.name }}" value="{{ c.destination_address | e }}" data-coin="{{ c.destination_coin_id }}" placeholder="Optional: default {{ c.display_name }} address to receive swap proceeds (blank = this wallet)">
+            <p class="destination-address-feedback mt-1 text-xs hidden"></p>
+           </div>
+
+           {% if c.supports_stealth %}
+           <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">External Destination Address (Anon/Blind)</label>
+            <input type="text" autocomplete="off" spellcheck="false" class="destination-address-input hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" name="destination_address_stealth_{{ c.name }}" value="{{ c.destination_address_stealth | e }}" data-coin="{{ c.stealth_coin_id }}" placeholder="Optional: default stealth address for anon and blind swap proceeds (blank = this wallet)">
+            <p class="destination-address-feedback mt-1 text-xs hidden"></p>
+           </div>
+           {% endif %}
+
+           <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Use Destination Address For</label>
+            <div class="relative">
+             <select class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" name="destination_address_scope_{{ c.name }}">
+              <option value="both"{% if c.destination_address_scope == 'both' %} selected{% endif %}>Both bids and offers</option>
+              <option value="bids"{% if c.destination_address_scope == 'bids' %} selected{% endif %}>Bids only (when taking)</option>
+              <option value="offers"{% if c.destination_address_scope == 'offers' %} selected{% endif %}>Offers only (when making)</option>
+             </select>
+             <div class="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none">
+              <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+              </svg>
+             </div>
+            </div>
+           </div>
+           <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Altruistic (Mercy Tx)</label>
+            {% if c.altruistic %}
+            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300">
+             <svg class="w-2 h-2 mr-1" fill="currentColor" viewBox="0 0 8 8">
+              <circle cx="4" cy="4" r="3"/>
+             </svg>
+             On
+            </span>
+            {% else %}
+            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300">
+             <svg class="w-2 h-2 mr-1" fill="currentColor" viewBox="0 0 8 8">
+              <circle cx="4" cy="4" r="3"/>
+             </svg>
+             Off
+            </span>
+            {% endif %}
+           </div>
           </div>
          </div>
         </div>
@@ -517,7 +564,23 @@
         </div>
 
         <div class="md:col-span-2">
-         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Remove DB Records for Expired Offers</label>
+         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Remove DB Records for Expired Unused Offers</label>
+         <div class="relative max-w-xs">
+          <select name="expire_unused_offers" class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none">
+           <option {% if general_settings.expire_unused_offers %}selected{% endif %} value="True">True</option>
+           <option {% if not general_settings.expire_unused_offers %}selected{% endif %} value="False">False</option>
+          </select>
+          <div class="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none">
+           <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+           </svg>
+          </div>
+         </div>
+         <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Automatically clean up database records for expired offers with no bids</p>
+        </div>
+
+        <div class="md:col-span-2">
+         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Remove DB Records for Expired Offers and Bids</label>
          <div class="relative max-w-xs">
           <select name="expire_db_records" class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none">
            <option {% if general_settings.expire_db_records %}selected{% endif %} value="True">True</option>
@@ -529,7 +592,7 @@
            </svg>
           </div>
          </div>
-         <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Automatically clean up database records for expired offers</p>
+         <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Automatically clean up database records for expired offers and bids and all related data</p>
         </div>
 
        </div>
@@ -968,6 +1031,7 @@
   </div>
 </div>
 
+<script src="/static/js/modules/address-validation.js"></script>
 <script src="/static/js/pages/settings-page.js"></script>
 
 {% include 'footer.html' %}

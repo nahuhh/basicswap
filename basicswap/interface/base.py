@@ -9,11 +9,15 @@ import socks
 import threading
 
 from enum import IntEnum
-from typing import List
+from typing import List, Optional
 
+from basicswap.basicswap_util import (
+    TxLockTypes,
+)
 from basicswap.chainparams import (
     chainparams,
 )
+from basicswap.config import DEFAULT_ALTRUISTIC
 from basicswap.util import (
     ensure,
     i2b,
@@ -42,13 +46,11 @@ class Curves(IntEnum):
 
 
 class CoinInterface:
+    _max_mtp_cache_entries: int = 1000
+
     @staticmethod
     def watch_blocks_for_scripts() -> bool:
         return False
-
-    @staticmethod
-    def compareFeeRates(a, b) -> bool:
-        return abs(a - b) < 20
 
     @staticmethod
     def getVoutValue(vout) -> int:
@@ -73,8 +75,15 @@ class CoinInterface:
     def __init__(self, network, **kwargs):
         self.setDefaults()
         self._network = network
+        # Keyed by height, the median time past of a block only changes in a reorg
+        self._mtp_at_height_cache = {}
         self._mx_wallet = threading.Lock()
-        self._altruistic = True
+        coin_settings = kwargs.get("coin_settings", {})
+        swap_client = kwargs.get("swap_client")
+        base_altruistic = (
+            swap_client.getBaseAltruistic() if swap_client else DEFAULT_ALTRUISTIC
+        )
+        self._altruistic = coin_settings.get("altruistic", base_altruistic)
         self._core_version = None  # Set in getDaemonVersion()
 
     def interface_type(self) -> int:
@@ -92,11 +101,23 @@ class CoinInterface:
         amount_int = make_int(amount_in, self.exp(), r=r) if conv_int else amount_in
         return format_amount(amount_int, self.exp())
 
+    def max_money(self) -> int:
+        return 21000000 * self.COIN()
+
+    def money_range(self, sats: int) -> bool:
+        return sats >= 0 and sats <= self.max_money()
+
     def coin_name(self) -> str:
         coin_chainparams = chainparams[self.coin_type()]
         if "display_name" in coin_chainparams:
             return coin_chainparams["display_name"]
         return coin_chainparams["name"].capitalize()
+
+    def canConfirmExternalTxn(self) -> bool:
+        return False
+
+    def findTxnByHashInChain(self, txid: str):
+        raise NotImplementedError()
 
     def ticker(self) -> str:
         ticker = chainparams[self.coin_type()]["ticker"]
@@ -204,6 +225,30 @@ class CoinInterface:
     def altruistic(self) -> bool:
         return self._altruistic
 
+    def canSendMercyTx(self) -> bool:
+        # Whether a standalone mercy tx spending the swipe's payout can be built.
+        # A coin that can't must not fall back to putting the keyshare on the
+        # swipe, that publishes it while the swipe can still be replaced.
+        return False
+
+    def getMercyWatchVouts(self, swipe_txid_hex: str, swipe_tx=None) -> List[int]:
+        # Which outputs of the swipe a mercy tx could spend.  The leader has to
+        # watch each one, it can't tell which the swiper will use.
+        return [0]
+
+    def getMercyPrevout(self, swipe_txid_hex: str, swipe_tx=None) -> int:
+        # The swiper's side of getMercyWatchVouts: the one output the mercy tx
+        # spends, and which must stay locked until it is sent.
+        return 0
+
+    def lockOutput(self, txid_hex: str, vout: int, bid_id=None, cursor=None) -> None:
+        # Keep an output out of coin selection.  Locks are not durable, callers
+        # must re-assert them for as long as the output must stay unspent.
+        self._log.debug(f"lockOutput not implemented for {self.coin_name()}")
+
+    def unlockOutput(self, txid_hex: str, vout: int, cursor=None) -> None:
+        pass
+
 
 class AdaptorSigInterface:
     def getP2WPKHDummyWitness(self, verifying: bool = True) -> List[bytes]:
@@ -218,6 +263,14 @@ class AdaptorSigInterface:
 
     def getScriptLockRefundSwipeTxDummyWitness(self, script: bytes) -> List[bytes]:
         return [bytes(72), b"", bytes(len(script))]
+
+    def getLockRefundTxFee(self, locked_coin: int, tx_lock_refund_bytes: bytes) -> int:
+        # The lock refund tx spends the lock tx output to its own single output
+        tx_lock_refund = self.loadTx(tx_lock_refund_bytes)
+        ensure(len(tx_lock_refund.vout) == 1, "Lock refund tx doesn't have one output")
+        fee_paid: int = locked_coin - self.getVoutValue(tx_lock_refund.vout[0])
+        ensure(fee_paid > 0, "Zero or negative lock refund tx fee")
+        return fee_paid
 
     def getLockRefundVout(self, lock_refund_tx_data: bytes, vbkv: bytes) -> int:
         return 0
@@ -264,6 +317,64 @@ class Secp256k1Interface(CoinInterface, AdaptorSigInterface):
     def isValidAddressHash(self, address_hash: bytes) -> bool:
         if len(address_hash) == 20:
             return True
+
+    def getMedianTimePastAtHeight(self, height: int) -> Optional[int]:
+        # BIP68 measures time based relative locks from the median time past of the
+        # block before the one containing the output being spent, not its header time
+        if height < 0:
+            return None
+        cached = self._mtp_at_height_cache.get(height, None)
+        if cached is not None:
+            return cached
+        mtp = self._getMedianTimePastAtHeight(height)
+        if mtp is not None:
+            if len(self._mtp_at_height_cache) >= self._max_mtp_cache_entries:
+                self._mtp_at_height_cache.pop(next(iter(self._mtp_at_height_cache)))
+            self._mtp_at_height_cache[height] = mtp
+        return mtp
+
+    def _getMedianTimePastAtHeight(self, height: int) -> Optional[int]:
+        try:
+            return self.getBlockHeaderFromHeight(height)["mediantime"]
+        except Exception as e:
+            self._log.warning(f"getMedianTimePastAtHeight failed: {e}")
+            return None
+
+    def csvLockRemaining(
+        self,
+        lock_type: int,
+        encoded_sequence: int,
+        parent_block_height: Optional[int],
+        parent_block_time: Optional[int],
+        chain_height: Optional[int] = None,
+        chain_mtp: Optional[int] = None,
+        coin_mtp: Optional[int] = None,
+    ) -> Optional[int]:
+        # Blocks or seconds until the lock matures, None if it can't be determined
+        if parent_block_height is None or parent_block_height < 1:
+            return None
+        lock_value: int = self.decodeSequence(encoded_sequence)
+        if lock_type == TxLockTypes.SEQUENCE_LOCK_BLOCKS:
+            if chain_height is None:
+                chain_height = self.getChainHeight()
+            if chain_height is None:
+                return None
+            return (parent_block_height + lock_value) - (chain_height + 1)
+        if lock_type == TxLockTypes.SEQUENCE_LOCK_TIME:
+            if parent_block_time is None or parent_block_time < 1:
+                return None
+            if coin_mtp is None:
+                coin_mtp = self.getMedianTimePastAtHeight(
+                    max(parent_block_height - 1, 0)
+                )
+            if coin_mtp is None:
+                return None
+            if chain_mtp is None:
+                chain_mtp = self.getChainMedianTime()
+            if chain_mtp is None:
+                return None
+            return (coin_mtp + lock_value) - chain_mtp
+        raise ValueError(f"Unknown lock type {lock_type}")
 
     def verifySig(self, pubkey: bytes, signed_hash: bytes, sig: bytes) -> bool:
         pubkey = PublicKey(pubkey)

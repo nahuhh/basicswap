@@ -29,6 +29,7 @@ from basicswap.util.script import (
     getWitnessElementLen,
 )
 from basicswap.util.address import (
+    decodeAddress,
     encodeStealthAddress,
 )
 from basicswap.interface.btc.btc import (
@@ -188,6 +189,16 @@ class PARTInterface(BTCInterface):
 
         return encodeStealthAddress(prefix_byte, scan_pubkey, spend_pubkey)
 
+    def isStealthAddress(self, address: str) -> bool:
+        try:
+            addr_data = decodeAddress(address)
+            prefix_byte = chainparams[self.coin_type()][self._network][
+                "stealth_key_prefix"
+            ]
+            return addr_data is not None and addr_data[0] == prefix_byte
+        except Exception as e:  # noqa: F841
+            return False
+
     def getWitnessStackSerialisedLength(self, witness_stack) -> int:
         length: int = 0
         if len(witness_stack) > 0 and isinstance(witness_stack[0], list):
@@ -289,7 +300,7 @@ class PARTInterfaceBlind(PARTInterface):
     @staticmethod
     def compareFeeRates(actual: int, expected: int) -> bool:
         # Allow the fee to be up to 10% larger than expected
-        if actual < expected - 20:
+        if actual < expected:
             return False
         if actual > expected + expected * 0.1:
             return False
@@ -297,6 +308,9 @@ class PARTInterfaceBlind(PARTInterface):
 
     def coin_name(self) -> str:
         return super().coin_name() + " Blind"
+
+    def ticker(self) -> str:
+        return super().ticker() + " Blind"
 
     def getScriptLockTxNonce(self, data):
         return hashlib.sha256(data + bytes("locktx", "utf-8")).digest()
@@ -503,7 +517,7 @@ class PARTInterfaceBlind(PARTInterface):
             {
                 "txid": tx_lock_refund_id,
                 "vout": spend_n,
-                "sequence": 0,
+                "sequence": 1,
                 "blindingfactor": input_blinded_info["blind"],
             }
         ]
@@ -739,7 +753,7 @@ class PARTInterfaceBlind(PARTInterface):
         ensure(len(lock_refund_spend_tx_obj["vin"]) == 1, "tx doesn't have one input")
 
         txin = lock_refund_spend_tx_obj["vin"][0]
-        ensure(txin["sequence"] == 0, "Bad input nSequence")
+        ensure(txin["sequence"] == 1, "Bad input nSequence")
         ensure(txin["scriptSig"]["hex"] == "", "Input scriptsig not empty")
         ensure(
             txin["txid"] == lock_refund_tx_id.hex() and txin["vout"] == prevout_n,
@@ -819,6 +833,7 @@ class PARTInterfaceBlind(PARTInterface):
         tx_fee_rate: int,
         vkbv: bytes,
         fee_info={},
+        tx_lock_refund_bytes=None,  # Unused, the daemon sets the fee
     ) -> bytes:
         lock_tx_obj = self.rpc("decoderawtransaction", [tx_lock_bytes.hex()])
         lock_txid_hex = lock_tx_obj["txid"]
@@ -909,7 +924,14 @@ class PARTInterfaceBlind(PARTInterface):
         return bytes.fromhex(lock_spend_tx_hex)
 
     def verifySCLockSpendTx(
-        self, tx_bytes, lock_tx_bytes, lock_tx_script, a_pk_f, feerate, vkbv
+        self,
+        tx_bytes,
+        lock_tx_bytes,
+        lock_tx_script,
+        a_pk_f,
+        feerate,
+        vkbv,
+        tx_lock_refund_bytes=None,  # Unused, the daemon sets the fee
     ):
         lock_spend_tx_obj = self.rpc("decoderawtransaction", [tx_bytes.hex()])
         lock_spend_txid_hex = lock_spend_tx_obj["txid"]
@@ -1010,6 +1032,63 @@ class PARTInterfaceBlind(PARTInterface):
 
         return True
 
+    def getMercyWatchVouts(self, swipe_txid_hex: str, swipe_tx=None) -> List[int]:
+        # fundrawtransactionfrom reorders the outputs, and the payout is blinded
+        # to an address the leader never sees, so it can't pick out the one the
+        # mercy tx will spend.
+        if swipe_tx is None:
+            swipe_tx = self.rpc("getrawtransaction", [swipe_txid_hex, True])
+        return [txo["n"] for txo in swipe_tx["vout"] if txo["type"] == "blind"]
+
+    def getMercyPrevout(self, swipe_txid_hex: str, swipe_tx=None) -> int:
+        # Either output would do, the leader watches both, so take the one the
+        # wallet owns.  The other is the zero value change to a throwaway key.
+        # Not listunspentblind, it hides the payout once it has been locked.
+        if swipe_tx is None:
+            swipe_tx = self.rpc("getrawtransaction", [swipe_txid_hex, True])
+        for txo in swipe_tx["vout"]:
+            if txo["type"] != "blind":
+                continue
+            script_pubkey = txo.get("scriptPubKey", {})
+            addrs = list(script_pubkey.get("addresses", []))
+            if "address" in script_pubkey:
+                addrs.append(script_pubkey["address"])
+            for addr in addrs:
+                try:
+                    if self.rpc_wallet("getaddressinfo", [addr])["ismine"]:
+                        return txo["n"]
+                except Exception as e:
+                    self._log.debug(f"getaddressinfo {addr} failed: {e}")
+        raise ValueError("Swipe payout output not found")
+
+    def createMercyTx(
+        self,
+        refund_swipe_tx_bytes: bytes,
+        refund_swipe_tx_id: bytes,
+        lock_refund_tx_script: bytes,
+        keyshare: bytes,
+        tx_fee_rate: int,
+    ) -> bytes:
+        # Hands the keyshare to the leader in a tx of its own, spending the
+        # swipe's payout output.
+        swipe_txid_hex: str = refund_swipe_tx_id.hex()
+        swipe_tx = self.rpc("decoderawtransaction", [refund_swipe_tx_bytes.hex()])
+
+        payout_n: int = self.getMercyPrevout(swipe_txid_hex, swipe_tx)
+
+        mercy_data = bytes((OP_RETURN,)) + b"XBSW" + keyshare
+        inputs = [{"txid": swipe_txid_hex, "vout": payout_n}]
+        outputs = [{"type": "data", "amount": 0, "data": mercy_data.hex()}]
+        rv = self.rpc_wallet("createrawparttransaction", [inputs, outputs])
+
+        # No changepubkey, unlike the zero change outputs elsewhere the change
+        # here is the swipe payout less the fee and has to stay spendable.
+        options = {"feeRate": self.format_amount(tx_fee_rate)}
+        rv = self.rpc_wallet(
+            "fundrawtransactionfrom", ["blind", rv["hex"], {}, rv["amounts"], options]
+        )
+        return self.signTxWithWallet(bytes.fromhex(rv["hex"]))
+
     def createSCLockRefundSpendToFTx(
         self,
         tx_lock_refund_bytes,
@@ -1017,7 +1096,6 @@ class PARTInterfaceBlind(PARTInterface):
         pkh_dest,
         tx_fee_rate,
         vkbv,
-        kbsf=None,
     ):
         # lock refund swipe tx
         # Sends the coinA locked coin to the follower
@@ -1055,16 +1133,6 @@ class PARTInterfaceBlind(PARTInterface):
                 "pubkey": output_pubkey_hex,
             }
         ]
-
-        if self.altruistic() and kbsf:
-            mercy_data = bytes((OP_RETURN,)) + b"XBSW" + kbsf
-            outputs.append({"type": "data", "amount": 0, "data": mercy_data.hex()})
-        else:
-            self._log.debug(
-                "Not attaching mercy output, have kbsf {}.".format(
-                    "true" if kbsf else "false"
-                )
-            )
         params = [inputs, outputs]
         rv = self.rpc_wallet("createrawparttransaction", params)
 
@@ -1271,14 +1339,14 @@ class PARTInterfaceBlind(PARTInterface):
         rv = self.rpc_wallet("sendtypeto", params)
         return bytes.fromhex(rv["txid"])
 
-    def findTxnByHash(self, txid_hex):
+    def findConfirmedTxnByHash(self, txid_hex):
         # txindex is enabled for Particl
 
         try:
             rv = self.rpc("getrawtransaction", [txid_hex, True])
         except Exception as e:  # noqa: F841
             self._log.debug(
-                f"findTxnByHash getrawtransaction failed: {self._log.id(txid_hex)}"
+                f"findConfirmedTxnByHash getrawtransaction failed: {self._log.id(txid_hex)}"
             )
             return None
 
@@ -1364,7 +1432,7 @@ class PARTInterfaceBlind(PARTInterface):
         spend_n, input_blinded_info = self.findOutputByNonce(lock_refund_tx_obj, nonce)
         return spend_n
 
-    def inspectSwipeTx(self, tx: dict):
+    def extractMercyKeyshare(self, tx: dict):
         find_tag: bytes = bytes((OP_RETURN,)) + b"XBSW"
         for vout in tx["vout"]:
             if vout["type"] != "data":
@@ -1379,7 +1447,7 @@ class PARTInterfaceBlind(PARTInterface):
                     raise ValueError("Unexpected mercy output data length")
                 return data[len(find_tag) : len(find_tag) + 32]
             except Exception as e:
-                self._log.debug(f"inspectSwipeTx vout {vout}, error: {e}")
+                self._log.debug(f"extractMercyKeyshare vout {vout}, error: {e}")
 
         return None
 
@@ -1413,6 +1481,9 @@ class PARTInterfaceAnon(PARTInterface):
 
     def coin_name(self) -> str:
         return super().coin_name() + " Anon"
+
+    def ticker(self) -> str:
+        return super().ticker() + " Anon"
 
     def publishBLockTx(
         self,
@@ -1578,14 +1649,14 @@ class PARTInterfaceAnon(PARTInterface):
         rv = self.rpc_wallet("sendtypeto", params)
         return bytes.fromhex(rv["txid"])
 
-    def findTxnByHash(self, txid_hex: str):
+    def findConfirmedTxnByHash(self, txid_hex: str):
         # txindex is enabled for Particl
 
         try:
             rv = self.rpc("getrawtransaction", [txid_hex, True])
         except Exception as e:  # noqa: F841
             self._log.debug(
-                "findTxnByHash getrawtransaction failed: {}".format(txid_hex)
+                "findConfirmedTxnByHash getrawtransaction failed: {}".format(txid_hex)
             )
             return None
 

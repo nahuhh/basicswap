@@ -42,6 +42,9 @@ def page_settings(self, url_split, post_string):
                 data = {
                     "debug": toBool(get_data_entry(form_data, "debugmode")),
                     "debug_ui": toBool(get_data_entry(form_data, "debugui")),
+                    "expire_unused_offers": toBool(
+                        get_data_entry(form_data, "expire_unused_offers")
+                    ),
                     "expire_db_records": toBool(
                         get_data_entry(form_data, "expire_db_records")
                     ),
@@ -250,6 +253,20 @@ def page_settings(self, url_split, post_string):
                             except ValueError:
                                 pass
 
+                    data["destination_address"] = get_data_entry_or(
+                        form_data, "destination_address_" + name, ""
+                    ).strip()
+                    if have_data_entry(
+                        form_data, "destination_address_stealth_" + name
+                    ):
+                        data["destination_address_stealth"] = get_data_entry_or(
+                            form_data, "destination_address_stealth_" + name, ""
+                        ).strip()
+                    if have_data_entry(form_data, "destination_address_scope_" + name):
+                        data["destination_address_scope"] = get_data_entry_or(
+                            form_data, "destination_address_scope_" + name, "both"
+                        )
+
                     settings_changed, suggest_reboot, migration_message = (
                         swap_client.editSettings(name, data)
                     )
@@ -315,6 +332,15 @@ def page_settings(self, url_split, post_string):
         except Exception:
             display_name = name
 
+        # Blank when inactive, disabling the advisory validation on the field.
+        try:
+            coin_id = swap_client.getCoinIdFromName(name)
+            destination_coin_id = (
+                int(coin_id) if swap_client.isCoinActive(coin_id) else ""
+            )
+        except Exception:
+            destination_coin_id = ""
+
         clearnet_servers = c.get("electrum_clearnet_servers", None)
         onion_servers = c.get("electrum_onion_servers", None)
 
@@ -345,6 +371,14 @@ def page_settings(self, url_split, post_string):
                 "clearnet_servers_text": clearnet_text,
                 "onion_servers_text": onion_text,
                 "address_gap_limit": c.get("address_gap_limit", 50),
+                "destination_address": c.get("destination_address", ""),
+                "destination_address_stealth": c.get("destination_address_stealth", ""),
+                "destination_address_scope": c.get("destination_address_scope", "both"),
+                "destination_coin_id": destination_coin_id,
+                "supports_stealth": name == "particl",
+                "stealth_coin_id": (
+                    int(Coins.PART_ANON) if destination_coin_id != "" else ""
+                ),
             }
         )
         if name in ("monero", "wownero"):
@@ -362,6 +396,16 @@ def page_settings(self, url_split, post_string):
             )
         else:
             chains_formatted[-1]["conf_target"] = c.get("conf_target", 2)
+
+        try:
+            chains_formatted[-1]["altruistic"] = swap_client.ci(
+                swap_client.getCoinIdFromName(name)
+            ).altruistic()
+        except Exception:
+            # Disabled coins have no interface to read the resolved setting from
+            chains_formatted[-1]["altruistic"] = c.get(
+                "altruistic", swap_client.getBaseAltruistic()
+            )
 
         if name == "particl":
             chains_formatted[-1]["anon_tx_ring_size"] = c.get("anon_tx_ring_size", 12)
@@ -383,6 +427,7 @@ def page_settings(self, url_split, post_string):
     general_settings = {
         "debug": swap_client.debug,
         "debug_ui": swap_client.debug_ui,
+        "expire_unused_offers": swap_client._expire_unused_offers,
         "expire_db_records": swap_client._expire_db_records,
         "check_updates": swap_client.settings.get("check_updates", True),
     }

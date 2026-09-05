@@ -719,17 +719,14 @@ def js_bids(self, url_split, post_string: str, is_json: bool) -> bytes:
                     get_data_entry(post_data, "bypass_fee_checks")
                 )
             if have_data_entry(post_data, "destination_address"):
-                if reverse_bid:
-                    extra_options["dest_bl"] = get_data_entry(
-                        post_data, "destination_address"
-                    )
-                else:
-                    extra_options["dest_af"] = ci_from.decodeAddress(
-                        get_data_entry(post_data, "destination_address")
-                    )
+                extra_options["destination_address"] = get_data_entry(
+                    post_data, "destination_address"
+                )
             if have_data_entry(post_data, "destination_script"):
                 if reverse_bid:
-                    raise ValueError("TODO")
+                    raise ValueError(
+                        "destination_script is not supported for reversed bids, use destination_address"
+                    )
                 extra_options["dest_af"] = bytes.fromhex(
                     get_data_entry(post_data, "destination_script")
                 )
@@ -884,7 +881,11 @@ def js_revokeoffer(self, url_split, post_string, is_json) -> bytes:
     swap_client.checkSystemStatus()
     offer_id = bytes.fromhex(url_split[3])
     ensure(len(offer_id) == 28, "Invalid offer id size")
-    swap_client.revokeOffer(offer_id)
+    post_data = {} if post_string == "" else getFormData(post_string, is_json)
+    refuse_if_negotiating: bool = toBool(
+        get_data_entry_or(post_data, "refuse_if_negotiating", False)
+    )
+    swap_client.revokeOffer(offer_id, refuse_if_negotiating=refuse_if_negotiating)
     return bytes(json.dumps({"revoked_offer": offer_id.hex()}), "UTF-8")
 
 
@@ -1357,6 +1358,25 @@ def js_validateamount(self, url_split, post_string: str, is_json: bool) -> bytes
 
     output_amount = ci.format_amount(amount, conv_int=True, r=r)
     return bytes(json.dumps(output_amount), "UTF-8")
+
+
+def js_validateaddress(self, url_split, post_string: str, is_json: bool) -> bytes:
+    swap_client = self.server.swap_client
+    swap_client.checkSystemStatus()
+
+    post_data = getFormData(post_string, is_json)
+
+    coin_type = Coins(int(get_data_entry(post_data, "coin")))
+    address = get_data_entry(post_data, "address")
+    mode = get_data_entry_or(post_data, "mode", "redeem")
+
+    try:
+        ci = swap_client.ci(coin_type)
+        error = swap_client.checkDestinationAddress(ci, address, mode)
+    except Exception as e:
+        error = str(e)
+
+    return bytes(json.dumps({"valid": error is None, "error": error}), "UTF-8")
 
 
 def js_vacuumdb(self, url_split, post_string, is_json) -> bytes:
@@ -2081,6 +2101,7 @@ def js_electrum_discover(self, url_split, post_string, is_json) -> bytes:
             temp_server = ElectrumServer(
                 coin_name,
                 log=swap_client.log,
+                cert_pins=swap_client.getElectrumCertPins(),
             )
             temp_server.connect()
             current_server = temp_server.get_current_server_info()
@@ -2172,6 +2193,7 @@ endpoints = {
     "identities": js_identities,
     "automationstrategies": js_automationstrategies,
     "validateamount": js_validateamount,
+    "validateaddress": js_validateaddress,
     "vacuumdb": js_vacuumdb,
     "getcoinseed": js_getcoinseed,
     "setpassword": js_setpassword,

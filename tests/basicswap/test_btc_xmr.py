@@ -16,9 +16,12 @@ from basicswap.basicswap import (
     DebugTypes,
     SwapTypes,
 )
+from basicswap.chainparams import chainparams
 from basicswap.basicswap_util import (
+    ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER,
     TxLockTypes,
     EventLogTypes,
+    TxTypes,
 )
 from basicswap.db import Concepts
 from basicswap.util import make_int
@@ -296,6 +299,203 @@ class TestFunctions(BaseTest):
         assert chain_a_lock_txid is not None
         assert chain_b_lock_txid is not None
 
+    def do_test_01_full_swap_custom_destination(
+        self, coin_from: Coins, coin_to: Coins
+    ) -> None:
+        # A configured destination_address sweeps the redeem to that external address
+        # instead of the client's own wallet.
+        logging.info(
+            f"---------- Test {coin_from.name} to {coin_to.name} custom destination"
+        )
+
+        id_offerer: int = self.node_a_id
+        id_bidder: int = self.node_b_id
+        id_external: int = self.node_c_id
+
+        swap_clients = self.swap_clients
+        # The offerer receives coin_to, so its redeem honours destination_address.
+        assert not swap_clients[0].is_reverse_ads_bid(coin_from, coin_to)
+        ci_from = swap_clients[id_offerer].ci(coin_from)
+        ci_to = swap_clients[id_bidder].ci(coin_to)
+
+        self.prepare_balance(coin_from, 100.0, 1800 + id_offerer, 1800)
+
+        # Use a wallet the offerer does not control as the external destination target.
+        # An anon/blind redeem pays a stealth address; anything else pays a normal one.
+        stealth_coin_to: bool = coin_to in (Coins.PART_ANON, Coins.PART_BLIND)
+        if stealth_coin_to:
+            external_address: str = read_json_api(1800 + id_external, "wallets/part")[
+                "stealth_address"
+            ]
+            balance_url: str = (
+                f"http://127.0.0.1:{1800 + id_external}/json/wallets/part"
+            )
+            balance_key: str = (
+                "blind_balance" if coin_to == Coins.PART_BLIND else "anon_balance"
+            )
+        else:
+            external_address: str = (
+                swap_clients[id_external].ci(coin_to).getMainWalletAddress()
+            )
+            balance_url: str = (
+                f"http://127.0.0.1:{1800 + id_external}/json/wallets/{coin_to.name.lower()}"
+            )
+            balance_key: str = "balance"
+        destination_setting: str = (
+            "destination_address_stealth" if stealth_coin_to else "destination_address"
+        )
+        swap_clients[id_offerer].coin_clients[coin_to][
+            destination_setting
+        ] = external_address
+
+        try:
+            external_to_before: float = self.getBalance(
+                read_json_api(1800 + id_external, "wallets"), coin_to
+            )
+            offerer_to_before: float = self.getBalance(
+                read_json_api(1800 + id_offerer, "wallets"), coin_to
+            )
+
+            amt_swap = ci_from.make_int(random.uniform(0.1, 2.0), r=1)
+            rate_swap = ci_to.make_int(random.uniform(0.2, 20.0), r=1)
+            offer_id = swap_clients[id_offerer].postOffer(
+                coin_from, coin_to, amt_swap, rate_swap, amt_swap, SwapTypes.XMR_SWAP
+            )
+            wait_for_offer(test_delay_event, swap_clients[id_bidder], offer_id)
+            offer = swap_clients[id_bidder].listOffers(filters={"offer_id": offer_id})[
+                0
+            ]
+
+            bid_id = swap_clients[id_bidder].postXmrBid(offer_id, offer.amount_from)
+            wait_for_bid(
+                test_delay_event,
+                swap_clients[id_offerer],
+                bid_id,
+                BidStates.BID_RECEIVED,
+                wait_for=(self.extra_wait_time + 40),
+            )
+
+            swap_clients[id_offerer].acceptBid(bid_id)
+
+            wait_for_bid(
+                test_delay_event,
+                swap_clients[id_offerer],
+                bid_id,
+                BidStates.SWAP_COMPLETED,
+                wait_for=(self.extra_wait_time + 180),
+            )
+            wait_for_bid(
+                test_delay_event,
+                swap_clients[id_bidder],
+                bid_id,
+                BidStates.SWAP_COMPLETED,
+                sent=True,
+                wait_for=(self.extra_wait_time + 30),
+            )
+
+            scale_from = ci_from.exp()
+            amount_to = int((amt_swap * rate_swap) // (10**scale_from))
+            amount_to_float = float(ci_to.format_amount(amount_to))
+
+            # The external wallet should receive the redeemed coin_to.
+            max_fee_to: float = 0.1 if stealth_coin_to else 0.02
+            wait_for_balance(
+                test_delay_event,
+                balance_url,
+                balance_key,
+                external_to_before + amount_to_float - max_fee_to,
+                iterations=40,
+            )
+
+            # The offerer's own wallet should not have received the swap output.
+            offerer_to_after: float = self.getBalance(
+                read_json_api(1800 + id_offerer, "wallets"), coin_to
+            )
+            assert offerer_to_after - offerer_to_before < amount_to_float - max_fee_to
+        finally:
+            swap_clients[id_offerer].coin_clients[coin_to].pop(
+                destination_setting, None
+            )
+
+    def do_test_01_full_swap_bidder_destination(
+        self, coin_from: Coins, coin_to: Coins
+    ) -> None:
+        # A bid-supplied destination address is honoured: the chain-A spend pays it
+        # instead of the bidder's own wallet.
+        logging.info(
+            f"---------- Test {coin_from.name} to {coin_to.name} bidder destination"
+        )
+
+        id_offerer: int = self.node_a_id
+        id_bidder: int = self.node_b_id
+        id_external: int = self.node_c_id
+
+        swap_clients = self.swap_clients
+        assert not swap_clients[0].is_reverse_ads_bid(coin_from, coin_to)
+        ci_from = swap_clients[id_offerer].ci(coin_from)
+        ci_to = swap_clients[id_bidder].ci(coin_to)
+
+        self.prepare_balance(coin_from, 100.0, 1800 + id_offerer, 1800)
+
+        # Address from a wallet the bidder is not redeeming into.
+        external_address: str = (
+            swap_clients[id_external]
+            .ci(coin_from)
+            .getNewAddress(ci_from.using_segwit())
+        )
+        external_from_before: float = self.getBalance(
+            read_json_api(1800 + id_external, "wallets"), coin_from
+        )
+
+        amt_swap = ci_from.make_int(random.uniform(0.1, 2.0), r=1)
+        rate_swap = ci_to.make_int(random.uniform(0.2, 20.0), r=1)
+        offer_id = swap_clients[id_offerer].postOffer(
+            coin_from, coin_to, amt_swap, rate_swap, amt_swap, SwapTypes.XMR_SWAP
+        )
+        wait_for_offer(test_delay_event, swap_clients[id_bidder], offer_id)
+        offer = swap_clients[id_bidder].listOffers(filters={"offer_id": offer_id})[0]
+
+        bid_id = swap_clients[id_bidder].postXmrBid(
+            offer_id,
+            offer.amount_from,
+            extra_options={"destination_address": external_address},
+        )
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[id_offerer],
+            bid_id,
+            BidStates.BID_RECEIVED,
+            wait_for=(self.extra_wait_time + 40),
+        )
+
+        swap_clients[id_offerer].acceptBid(bid_id)
+
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[id_offerer],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            wait_for=(self.extra_wait_time + 180),
+        )
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[id_bidder],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            sent=True,
+            wait_for=(self.extra_wait_time + 30),
+        )
+
+        amount_from = float(ci_from.format_amount(amt_swap))
+        # The external wallet should receive coin_from.
+        wait_for_balance(
+            test_delay_event,
+            f"http://127.0.0.1:{1800 + id_external}/json/wallets/{coin_from.name.lower()}",
+            "balance",
+            external_from_before + amount_from - 0.05,
+            iterations=30,
+        )
+
     def do_test_02_leader_recover_a_lock_tx(
         self, coin_from: Coins, coin_to: Coins, lock_value: int = 32
     ) -> None:
@@ -479,8 +679,101 @@ class TestFunctions(BaseTest):
             wait_for=(self.extra_wait_time + 180),
         )
 
+    def _has_bid_event(self, swap_client, bid_id, event_type) -> bool:
+        return any(
+            e.event_type == event_type
+            for e in swap_client.getEvents(Concepts.BID, bid_id)
+        )
+
+    def _assert_mercy_waits_for_swipe(
+        self, bid_id, id_leader: int, id_follower: int, chain_a_coin
+    ) -> None:
+        # The keyshare must not be published while the swipe can still be
+        # replaced.  Assert nothing is sent until the swipe has confirmed.
+        swap_clients = self.swap_clients
+        follower = swap_clients[id_follower]
+        ci_from = follower.ci(chain_a_coin)
+
+        wait_for_event(
+            test_delay_event,
+            follower,
+            Concepts.BID,
+            bid_id,
+            event_type=EventLogTypes.LOCK_TX_A_REFUND_SWIPE_TX_PUBLISHED,
+            wait_for=(self.extra_wait_time + 240),
+        )
+
+        bid, xmr_swap = follower.getXmrBid(bid_id)
+        swipe_txid: str = ci_from.getTxid(xmr_swap.a_lock_refund_swipe_tx).hex()
+
+        # The swipe must not carry the keyshare itself any more
+        swipe_raw = self.callnoderpc(
+            "getrawtransaction", [swipe_txid, True], None, id_follower
+        )
+        assert (
+            ci_from.extractMercyKeyshare(swipe_raw) is None
+        ), "Swipe tx still carries the keyshare"
+
+        # Hold the swipe unconfirmed.  Without this the swipe confirms sooner
+        # than the send action's own delay, so nothing would be observed even
+        # with the gate removed.
+        self.pauseMining()
+        try:
+            for _i in range(75):
+                if test_delay_event.is_set():
+                    raise ValueError("Test stopped.")
+                raw = self.callnoderpc(
+                    "getrawtransaction", [swipe_txid, True], None, id_follower
+                )
+                assert (
+                    raw.get("confirmations", 0) < ci_from.blocks_confirmed
+                ), "Swipe confirmed while mining was paused, test can't conclude"
+                assert not self._has_bid_event(
+                    follower, bid_id, EventLogTypes.MERCY_TX_PUBLISHED
+                ), "Mercy tx sent before the swipe confirmed"
+                bid, _ = follower.getXmrBid(bid_id)
+                assert (
+                    TxTypes.MERCY not in bid.txns
+                ), "Mercy tx recorded before the swipe confirmed"
+                test_delay_event.wait(1)
+        finally:
+            self.continueMining()
+
+        # Once confirmed the keyshare is sent, and reaches the leader
+        wait_for_event(
+            test_delay_event,
+            follower,
+            Concepts.BID,
+            bid_id,
+            event_type=EventLogTypes.MERCY_TX_PUBLISHED,
+            wait_for=(self.extra_wait_time + 180),
+        )
+        wait_for_event(
+            test_delay_event,
+            swap_clients[id_leader],
+            Concepts.BID,
+            bid_id,
+            event_type=EventLogTypes.MERCY_TX_FOUND,
+            wait_for=(self.extra_wait_time + 180),
+        )
+
+        # It spends the swipe's payout, which is what makes the send gateable
+        # and how the leader finds it
+        bid, xmr_swap = follower.getXmrBid(bid_id)
+        mercy_txid: str = bid.txns[TxTypes.MERCY].txid.hex()
+        mercy_raw = self.callnoderpc(
+            "getrawtransaction", [mercy_txid, True], None, id_follower
+        )
+        assert mercy_raw["vin"][0]["txid"] == swipe_txid
+        assert mercy_raw["vin"][0]["vout"] == 0
+
     def do_test_03_follower_recover_a_lock_tx(
-        self, coin_from, coin_to, lock_value: int = 32, with_mercy: bool = False
+        self,
+        coin_from,
+        coin_to,
+        lock_value: int = 32,
+        with_mercy: bool = False,
+        invalid_mercy: bool = False,
     ):
         logging.info(
             "---------- Test {} to {} follower recovers coin a lock tx{}".format(
@@ -512,6 +805,10 @@ class TestFunctions(BaseTest):
             coin_to if reverse_bid else coin_from
         )._altruistic = with_mercy
 
+        # A leader that is never sent a mercy tx holds the bid open until the
+        # watch times out, don't wait out the default for it here.
+        swap_clients[id_leader]._mercy_watch_timeout_blocks = 100 if with_mercy else 6
+
         amt_swap = ci_from.make_int(random.uniform(0.1, 2.0), r=1)
         rate_swap = ci_to.make_int(random.uniform(0.2, 20.0), r=1)
         offer_id = swap_clients[id_offerer].postOffer(
@@ -539,6 +836,10 @@ class TestFunctions(BaseTest):
         swap_clients[id_leader].setBidDebugInd(
             bid_id, DebugTypes.BID_DONT_SPEND_COIN_A_LOCK_REFUND2
         )
+        if invalid_mercy:
+            swap_clients[id_follower].setBidDebugInd(
+                bid_id, DebugTypes.MAKE_INVALID_MERCY_TX, False
+            )
         debug_type = DebugTypes.BID_DONT_SPEND_COIN_B_LOCK
         swap_clients[id_follower].setBidDebugInd(bid_id, debug_type)
 
@@ -551,15 +852,23 @@ class TestFunctions(BaseTest):
 
         swap_clients[id_offerer].acceptBid(bid_id)
 
+        if with_mercy and not invalid_mercy:
+            self._assert_mercy_waits_for_swipe(
+                bid_id, id_leader, id_follower, coin_to if reverse_bid else coin_from
+            )
+
         expect_state = (
-            (BidStates.XMR_SWAP_NOSCRIPT_TX_REDEEMED, BidStates.SWAP_COMPLETED)
-            if with_mercy
-            else (BidStates.BID_STALLED_FOR_TEST, BidStates.XMR_SWAP_FAILED_SWIPED)
+            BidStates.XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED
+            if invalid_mercy
+            else (
+                BidStates.XMR_SWAP_FAILED_SWIPED_USED_MERCY
+                if with_mercy
+                else (BidStates.BID_STALLED_FOR_TEST, BidStates.XMR_SWAP_FAILED_SWIPED)
+            )
         )
 
-        chain_a_coin = coin_to if reverse_bid else coin_from
-        if with_mercy is False and chain_a_coin == Coins.BCH:
-            # When using BCH, can't set XMR_SWAP_FAILED_SWIPED as should wait for mercy tx
+        if with_mercy is False:
+            # Can't set XMR_SWAP_FAILED_SWIPED, the leader waits for a mercy tx
             expect_state = expect_state + (BidStates.XMR_SWAP_SCRIPT_TX_PREREFUND,)
 
         wait_for_bid_states(
@@ -579,12 +888,23 @@ class TestFunctions(BaseTest):
         # amount_from = float(format_amount(amt_swap, 8))
         # assert (node1_from_after - node1_from_before > (amount_from - 0.02))
 
+        if invalid_mercy:
+            assert self._has_bid_event(
+                swap_clients[id_leader], bid_id, EventLogTypes.MERCY_TX_UNUSABLE
+            ), "Leader did not record the unusable mercy tx"
+
         swap_clients[id_offerer].abandonBid(bid_id)
 
         wait_for_none_active(test_delay_event, 1800 + id_offerer)
         wait_for_none_active(test_delay_event, 1800 + id_bidder)
 
-        if with_mercy is False:
+        if with_mercy is False and id_leader != id_offerer:
+            # Only when the leader isn't the bid abandoned above, that tears the
+            # watch down before it can time out.
+            assert self._has_bid_event(
+                swap_clients[id_leader], bid_id, EventLogTypes.MERCY_TX_NOT_FOUND
+            ), "Leader did not record giving up on the mercy tx"
+
             # Test manually redeeming the no-script lock tx
             offerer_key = read_json_api(
                 1800 + id_offerer,
@@ -1789,6 +2109,119 @@ class BasicSwapTest(TestFunctions):
         assert expect_vsize >= lock_tx_b_spend_decoded["vsize"]
         assert expect_vsize - lock_tx_b_spend_decoded["vsize"] <= 10
 
+    def test_017_lock_spend_not_replaceable(self):
+        # The pre-refund tx must not be able to replace a broadcast lock spend tx,
+        # alone (RBF rule 3) or paired with the refund spend tx (package RBF)
+        logging.info(
+            "---------- Test {} lock spend tx not replaceable".format(
+                self.test_coin_from.name
+            )
+        )
+        if self.test_coin_from != Coins.BTC:
+            return  # submitpackage
+
+        swap_clients = self.swap_clients
+        ci = swap_clients[0].ci(self.test_coin_from)
+        pi = swap_clients[0].pi(SwapTypes.XMR_SWAP)
+
+        amount: int = ci.make_int(random.uniform(0.1, 2.0), r=1)
+        a = ci.getNewRandomKey()
+        b = ci.getNewRandomKey()
+        A = ci.getPubkey(a)
+        B = ci.getPubkey(b)
+        lock_tx_script = pi.genScriptLockTxScript(ci, A, B)
+
+        lock_tx = ci.createSCLockTx(amount, lock_tx_script)
+        lock_tx = ci.fundSCLockTx(lock_tx, self.test_fee_rate)
+        lock_tx = ci.signTxWithWallet(lock_tx)
+
+        lock_value: int = 8
+        seq = ci.getExpectedSequence(TxLockTypes.SEQUENCE_LOCK_BLOCKS, lock_value)
+        refund_tx, refund_script, refund_value = ci.createSCLockRefundTx(
+            lock_tx, lock_tx_script, A, B, seq, seq, self.test_fee_rate
+        )
+
+        addr_out = ci.getNewAddress(True)
+        pkh_out = ci.decodeAddress(addr_out)
+        refund_spend_tx = ci.createSCLockRefundSpendTx(
+            refund_tx, refund_script, pkh_out, self.test_fee_rate
+        )
+        lock_spend_tx = ci.createSCLockSpendTx(
+            lock_tx,
+            lock_tx_script,
+            pkh_out,
+            self.test_fee_rate,
+            tx_lock_refund_bytes=refund_tx,
+        )
+
+        refund_fee: int = amount - refund_value
+        spend_fee: int = amount - ci.loadTx(lock_spend_tx).vout[0].nValue
+        logging.info(
+            f"Lock refund tx fee: {refund_fee}, lock spend tx fee: {spend_fee}"
+        )
+        assert spend_fee == refund_fee + ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER
+
+        def sign_2of2(tx, script, prevout_value, branch=None):
+            witness_stack = [
+                b"",
+                ci.signTx(a, tx, 0, script, prevout_value),
+                ci.signTx(b, tx, 0, script, prevout_value),
+            ]
+            if branch is not None:
+                witness_stack.append(branch)
+            witness_stack.append(script)
+            return ci.setTxSignature(tx, witness_stack)
+
+        lock_spend_tx = sign_2of2(lock_spend_tx, lock_tx_script, amount)
+        refund_tx = sign_2of2(refund_tx, lock_tx_script, amount)
+        refund_spend_tx = sign_2of2(
+            refund_spend_tx, refund_script, refund_value, bytes((1,))
+        )
+
+        self.pauseMining()
+        try:
+            ci.rpc("sendrawtransaction", [lock_tx.hex()])
+            # Confirm the lock tx and mature the pre-refund tx's csv
+            self.callnoderpc("generatetoaddress", [lock_value + 2, self.old_btc_addr])
+
+            # The follower claims, the lock spend tx is now in the mempool
+            ci.rpc("sendrawtransaction", [lock_spend_tx.hex()])
+
+            # Alone the pre-refund tx pays less than the lock spend tx, rbf rule 3
+            try:
+                ci.rpc("sendrawtransaction", [refund_tx.hex()])
+            except Exception as e:
+                logging.info(f"Lock refund tx alone rejected: {e}")
+                assert "insufficient fee" in str(e)
+            else:
+                assert False, "Should fail"
+
+            # Together they would pay more, but the refund spend tx's csv keeps it out
+            # of the mempool until the lock refund tx has confirmed, so the pair can
+            # never be submitted as a package
+            tx_errors = []
+            try:
+                rv = ci.rpc(
+                    "submitpackage",
+                    [[refund_tx.hex(), refund_spend_tx.hex()]],
+                )
+                package_msg = rv["package_msg"]
+                # Per tx failures are reported in tx-results, not package_msg
+                for tx_result in rv.get("tx-results", {}).values():
+                    if "error" in tx_result:
+                        tx_errors.append(tx_result["error"])
+            except Exception as e:
+                package_msg = str(e)
+            assert package_msg != "success", package_msg
+            reasons: str = " ".join([package_msg] + tx_errors)
+            logging.info(f"Lock refund tx package rejected: {reasons}")
+            assert "non-BIP68-final" in reasons or "feerate diagram" in reasons, reasons
+
+            # The lock spend tx is still the one in the mempool
+            assert ci.getTxid(lock_spend_tx).hex() in ci.rpc("getrawmempool")
+        finally:
+            self.continueMining()
+
     def test_011_p2sh(self):
         # Not used in bsx for native-segwit coins
         logging.info("---------- Test {} p2sh".format(self.test_coin_from.name))
@@ -2331,6 +2764,213 @@ class BasicSwapTest(TestFunctions):
     def test_01_d_full_swap_from_part(self):
         self.do_test_01_full_swap(Coins.PART, self.test_coin_from)
 
+    def test_01_e_full_swap_custom_destination(self):
+        if not self.has_segwit:
+            return
+        self.do_test_01_full_swap_custom_destination(self.test_coin_from, Coins.XMR)
+
+    def test_01_f_full_swap_bidder_destination(self):
+        if not self.has_segwit:
+            return
+        self.do_test_01_full_swap_bidder_destination(self.test_coin_from, Coins.XMR)
+
+    def test_01_j_part_bidder_destination(self):
+        # Same external destination, but the received coin is PART (not BTC): proves
+        # the dest_af path is not BTC-specific.
+        self.do_test_01_full_swap_bidder_destination(Coins.PART, Coins.XMR)
+
+    def test_01_g_destination_address_passthrough(self):
+        # The operator path: a destination_address set in a coin's chainclients
+        # settings must propagate into coin_clients (setCoinConnectParams), which
+        # is what getCustomDestinationAddress reads at redeem time.
+        swap_client = self.swap_clients[self.node_a_id]
+        coin = Coins.XMR
+        coin_name = chainparams[coin]["name"]
+        test_addr = swap_client.ci(coin).getMainWalletAddress()
+        orig_client = swap_client.coin_clients[coin]
+        try:
+            swap_client.settings["chainclients"][coin_name][
+                "destination_address"
+            ] = test_addr
+            swap_client.setCoinConnectParams(coin)
+            assert (
+                swap_client.coin_clients[coin].get("destination_address") == test_addr
+            )
+        finally:
+            # Restore the original coin_clients dict (preserves live chain state).
+            swap_client.coin_clients[coin] = orig_client
+            swap_client.settings["chainclients"][coin_name].pop(
+                "destination_address", None
+            )
+
+    def test_01_h_destination_validation(self):
+        swap_clients = self.swap_clients
+        swap_client = swap_clients[self.node_a_id]
+
+        cursor = swap_client.openDB()
+        try:
+            # getCustomDestinationAddress returns the address as-is (no read-time
+            # validation, so a transient RPC error can't strand a swap).
+            swap_client.coin_clients[Coins.XMR][
+                "destination_address"
+            ] = "returned-without-validation"
+            assert (
+                swap_client.getCustomDestinationAddress(
+                    swap_client.ci(Coins.XMR), cursor=cursor
+                )
+                == "returned-without-validation"
+            )
+            # coin_clients[PART_ANON/PART_BLIND] is the same dict as
+            # coin_clients[PART], so a plain Particl address must not reach the
+            # anon/blind redeems, which pay a stealth address.
+            plain_addr = swap_client.ci(Coins.PART).getNewAddress(False)
+            swap_client.coin_clients[Coins.PART]["destination_address"] = plain_addr
+            swap_client.coin_clients[Coins.PART][
+                "destination_address_stealth"
+            ] = plain_addr
+            for coin in (Coins.PART_ANON, Coins.PART_BLIND):
+                assert (
+                    swap_client.coin_clients[coin]
+                    is swap_client.coin_clients[Coins.PART]
+                ), "coin_clients aliasing changed, revisit the stealth guard"
+                assert (
+                    swap_client.getCustomDestinationAddress(
+                        swap_client.ci(coin), cursor=cursor
+                    )
+                    is None
+                )
+        finally:
+            swap_client.closeDB(cursor, commit=False)
+            swap_client.coin_clients[Coins.XMR].pop("destination_address", None)
+            swap_client.coin_clients[Coins.PART].pop("destination_address", None)
+            swap_client.coin_clients[Coins.PART].pop(
+                "destination_address_stealth", None
+            )
+
+        # An invalid bid-supplied address is rejected at bid time.
+        coin_from = self.test_coin_from
+        self.prepare_balance(coin_from, 100.0, 1800 + self.node_a_id, 1800)
+        ci_from = swap_clients[self.node_a_id].ci(coin_from)
+        ci_to = swap_clients[self.node_b_id].ci(Coins.XMR)
+        amt = ci_from.make_int(1)
+        rate = ci_to.make_int(1)
+        offer_id = swap_clients[self.node_a_id].postOffer(
+            coin_from, Coins.XMR, amt, rate, amt, SwapTypes.XMR_SWAP
+        )
+        wait_for_offer(test_delay_event, swap_clients[self.node_b_id], offer_id)
+
+        err = None
+        try:
+            swap_clients[self.node_b_id].postXmrBid(
+                offer_id,
+                amt,
+                extra_options={"destination_address": "not_a_valid_address"},
+            )
+        except Exception as e:
+            err = str(e)
+        assert (
+            err is not None and "valid" in err.lower()
+        ), f"postXmrBid must reject an invalid destination address, got: {err}"
+
+        # A valid address of the wrong type is rejected too: createSCLockSpendTx
+        # pays getScriptForPubkeyHash(dest_af), so a legacy address would be paid
+        # as p2wpkh of the same hash, i.e. to a different address.
+        redeems_p2wpkh: bool = bytes(
+            ci_from.getScriptForPubkeyHash(bytes(20))
+        ).startswith(bytes((0x00, 0x14)))
+        if redeems_p2wpkh:
+            legacy_addr = ci_from.rpc_wallet("getnewaddress", ["", "legacy"])
+            assert ci_from.isValidAddress(legacy_addr)
+            err = None
+            try:
+                swap_clients[self.node_b_id].postXmrBid(
+                    offer_id,
+                    amt,
+                    extra_options={"destination_address": legacy_addr},
+                )
+            except Exception as e:
+                err = str(e)
+            assert (
+                err is not None
+                and "unsupported destination address type" in err.lower()
+            ), f"postXmrBid must reject a non-p2wpkh destination, got: {err}"
+
+    def test_01_i_reverse_full_swap_bidder_destination(self):
+        # Reverse bid: the leader receives coin_from via the chain-B redeem.
+        # Verify a bid-supplied address is honoured and the swap completes
+        # (confirmed on-chain, as the wallet can't see the external sweep).
+        if not self.has_segwit:
+            return
+
+        id_offerer: int = self.node_a_id
+        id_bidder: int = self.node_b_id
+        id_external: int = self.node_c_id
+
+        swap_clients = self.swap_clients
+        coin_from = Coins.XMR  # reverse: the offer sells XMR
+        coin_to = self.test_coin_from
+        assert swap_clients[0].is_reverse_ads_bid(coin_from, coin_to)
+        ci_from = swap_clients[id_offerer].ci(coin_from)
+        ci_to = swap_clients[id_bidder].ci(coin_to)
+
+        self.prepare_balance(coin_from, 100.0, 1800 + id_offerer, 1801)
+
+        external_address: str = (
+            swap_clients[id_external].ci(coin_from).getMainWalletAddress()
+        )
+        external_from_before: float = self.getBalance(
+            read_json_api(1800 + id_external, "wallets"), coin_from
+        )
+
+        amt_swap = ci_from.make_int(random.uniform(0.1, 2.0), r=1)
+        rate_swap = ci_to.make_int(random.uniform(0.2, 20.0), r=1)
+        offer_id = swap_clients[id_offerer].postOffer(
+            coin_from, coin_to, amt_swap, rate_swap, amt_swap, SwapTypes.XMR_SWAP
+        )
+        wait_for_offer(test_delay_event, swap_clients[id_bidder], offer_id)
+        offer = swap_clients[id_bidder].listOffers(filters={"offer_id": offer_id})[0]
+
+        bid_id = swap_clients[id_bidder].postXmrBid(
+            offer_id,
+            offer.amount_from,
+            extra_options={"destination_address": external_address},
+        )
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[id_offerer],
+            bid_id,
+            BidStates.BID_RECEIVED,
+            wait_for=(self.extra_wait_time + 40),
+        )
+
+        swap_clients[id_offerer].acceptBid(bid_id)
+
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[id_offerer],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            wait_for=(self.extra_wait_time + 180),
+        )
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[id_bidder],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            sent=True,
+            wait_for=(self.extra_wait_time + 30),
+        )
+
+        amount_from = float(ci_from.format_amount(amt_swap))
+        # The external wallet should receive coin_from (the scriptless coin).
+        wait_for_balance(
+            test_delay_event,
+            f"http://127.0.0.1:{1800 + id_external}/json/wallets/{coin_from.name.lower()}",
+            "balance",
+            external_from_before + amount_from - 0.05,
+            iterations=30,
+        )
+
     def test_02_a_leader_recover_a_lock_tx(self):
         if not self.has_segwit:
             return
@@ -2339,6 +2979,8 @@ class BasicSwapTest(TestFunctions):
     def test_02_b_leader_recover_a_lock_tx_reverse(self):
         if not self.has_segwit:
             return
+        # Reversed, so the bidder funds the bid in coin_from
+        self.prepare_balance(self.test_coin_from, 100.0, 1801, 1800)
         self.prepare_balance(Coins.XMR, 100.0, 1800, 1801)
         self.do_test_02_leader_recover_a_lock_tx(Coins.XMR, self.test_coin_from)
 
@@ -2378,6 +3020,13 @@ class BasicSwapTest(TestFunctions):
 
     def test_03_d_follower_recover_a_lock_tx_from_part(self):
         self.do_test_03_follower_recover_a_lock_tx(Coins.PART, self.test_coin_from)
+
+    def test_03_g_follower_recover_a_lock_tx_invalid_mercy(self):
+        if not self.has_segwit:
+            return
+        self.do_test_03_follower_recover_a_lock_tx(
+            self.test_coin_from, Coins.XMR, with_mercy=True, invalid_mercy=True
+        )
 
     def test_03_e_follower_recover_a_lock_tx_mercy_release(self):
         if not self.has_segwit:
@@ -2773,6 +3422,23 @@ class BasicSwapTest(TestFunctions):
         ci1_from = swap_clients[1].ci(coin_from)
         ci1_to = swap_clients[1].ci(coin_to)
 
+        ci_from_settings = swap_clients[0].getChainClientSettings(coin_from)
+        ci1_from_settings = swap_clients[1].getChainClientSettings(coin_from)
+        old_override_feerate = ci_from_settings.get("override_feerate", None)
+        old_override_feerate1 = ci1_from_settings.get("override_feerate", None)
+        old_min_relay_fee = ci_from_settings.get("min_relay_fee", None)
+        old_min_relay_fee1 = ci1_from_settings.get("min_relay_fee", None)
+
+        networkinfo = ci_from.rpc("getnetworkinfo")
+        # BTC v29.1 relayfee dropped to 100
+        assert ci_from.make_int(networkinfo["relayfee"]) == 100
+        # The default min_relay_fee setting would floor every rate below at 1000
+        ci_from_settings["min_relay_fee"] = networkinfo["relayfee"]
+        ci1_from_settings["min_relay_fee"] = networkinfo["relayfee"]
+        assert ci_from.make_int(networkinfo["relayfee"]) == ci_from.make_int(
+            ci_from.get_fee_rate()[0]
+        )
+
         amt_swap = ci_from.make_int(random.uniform(0.1, 2.0), r=1)
         rate_swap = ci_to.make_int(random.uniform(0.2, 20.0), r=1)
 
@@ -2795,15 +3461,6 @@ class BasicSwapTest(TestFunctions):
             SwapTypes.XMR_SWAP,
         )
 
-        ci_from_settings = swap_clients[0].getChainClientSettings(coin_from)
-        old_override_feerate = ci_from_settings.get("override_feerate", None)
-        ci1_from_settings = swap_clients[1].getChainClientSettings(coin_from)
-        old_override_feerate1 = ci1_from_settings.get("override_feerate", None)
-
-        networkinfo = ci_from.rpc("getnetworkinfo")
-        assert ci_from.make_int(networkinfo["relayfee"]) == ci_from.make_int(
-            ci_from.get_fee_rate()[0]
-        )
         try:
             # Set override_feerate to increase feerate from get_fee_rate()
             ci_from_settings["override_feerate"] = ci_from.format_amount(120)
@@ -2914,6 +3571,8 @@ class BasicSwapTest(TestFunctions):
         finally:
             ci_from_settings["override_feerate"] = old_override_feerate
             ci1_from_settings["override_feerate"] = old_override_feerate1
+            ci_from_settings["min_relay_fee"] = old_min_relay_fee
+            ci1_from_settings["min_relay_fee"] = old_min_relay_fee1
 
 
 class TestBTC(BasicSwapTest):
@@ -3114,6 +3773,36 @@ class TestBTC_PARTB(TestFunctions):
             self.do_test_01_full_swap(self.test_coin_to, self.test_coin_from)
         finally:
             self.extra_wait_time = 0
+
+    def test_01_e_full_swap_custom_destination(self):
+        self.prepare_balance(self.test_coin_to, 100.0, 1801, 1800)
+        self.do_test_01_full_swap_custom_destination(
+            self.test_coin_from, self.test_coin_to
+        )
+
+    def test_01_g_plain_destination_ignored(self):
+        # coin_clients[PART_ANON/PART_BLIND] is the same dict as coin_clients[PART],
+        # so plain and anon/blind destinations are kept under separate keys and a
+        # wrong address type under either is ignored rather than paid to.
+        swap_client = self.swap_clients[self.node_a_id]
+        ci_part = swap_client.ci(Coins.PART)
+        ci_to = swap_client.ci(self.test_coin_to)
+        settings = swap_client.coin_clients[Coins.PART]
+        plain_addr = ci_part.getNewAddress(False)
+        stealth_addr = ci_part.getNewStealthAddress()
+        try:
+            settings["destination_address"] = plain_addr
+            settings["destination_address_stealth"] = stealth_addr
+            assert swap_client.getCustomDestinationAddress(ci_part) == plain_addr
+            assert swap_client.getCustomDestinationAddress(ci_to) == stealth_addr
+
+            settings["destination_address"] = stealth_addr
+            settings["destination_address_stealth"] = plain_addr
+            assert swap_client.getCustomDestinationAddress(ci_part) is None
+            assert swap_client.getCustomDestinationAddress(ci_to) is None
+        finally:
+            settings.pop("destination_address", None)
+            settings.pop("destination_address_stealth", None)
 
     def test_02_a_leader_recover_a_lock_tx(self):
         self.prepare_balance(self.test_coin_to, 100.0, 1801, 1800)
