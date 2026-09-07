@@ -176,6 +176,11 @@ class BaseApp(DBMethods):
         except Exception:
             return {}
 
+    def getBaseAltruistic(self) -> bool:
+        from basicswap.config import DEFAULT_ALTRUISTIC
+
+        return bool(self.settings.get("altruistic", DEFAULT_ALTRUISTIC))
+
     def getElectrumAddressIndex(self, coin_name: str) -> tuple:
         try:
             chain_settings = self.settings["chainclients"].get(coin_name, {})
@@ -307,7 +312,8 @@ class BaseApp(DBMethods):
         return out[0].decode("utf-8").strip()
 
     transient_error_markers = (
-        "read timed out",
+        "timed out",
+        "socket error",
         "no connection to daemon",
         # Connection-class faults, daemon restarting or briefly unreachable.
         "connection refused",

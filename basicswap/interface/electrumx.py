@@ -6,13 +6,33 @@
 
 import hashlib
 import json
+import os
 import queue
+import select
 import socket
 import ssl
 import threading
 import time
 
 from basicswap.util import TemporaryError
+
+CERT_PINS_FILENAME = "electrum_cert_pins.json"
+
+
+def _is_private_address(host: str) -> bool:
+    try:
+        import ipaddress
+
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except ValueError:
+        return host == "localhost"
+
+
+def _is_authenticated_transport(host: str) -> bool:
+    # A .onion address authenticates the endpoint by itself, and a LAN server
+    # is inside the operator's own trust boundary.
+    return host.endswith(".onion") or _is_private_address(host)
 
 
 def _close_socket_safe(sock):
@@ -25,6 +45,52 @@ def _close_socket_safe(sock):
             sock.close()
         except Exception:
             pass
+
+
+class CertPinStore:
+    # Fingerprints of servers no CA vouches for, trusted on first use.
+    # A corrupt store raises rather than falling back to trusting anything.
+
+    def __init__(self, path=None):
+        self._path = path
+        self._lock = threading.Lock()
+        self._pins = {}
+        self._loaded = False
+
+    def _load(self):
+        if self._loaded:
+            return
+        if self._path and os.path.exists(self._path):
+            with open(self._path) as fp:
+                loaded = json.load(fp)
+            if not isinstance(loaded, dict) or not all(
+                isinstance(pins, dict) for pins in loaded.values()
+            ):
+                raise ValueError(f"Malformed cert pin store: {self._path}")
+            self._pins = loaded
+        self._loaded = True
+
+    def _save(self):
+        if not self._path:
+            return
+        tmp_path = self._path + ".tmp"
+        with open(tmp_path, "w") as fp:
+            json.dump(self._pins, fp, indent=1, sort_keys=True)
+        os.replace(tmp_path, self._path)
+
+    def get(self, coin_name: str, key: str):
+        with self._lock:
+            self._load()
+            return self._pins.get(coin_name, {}).get(key)
+
+    def set(self, coin_name: str, key: str, fingerprint: str):
+        with self._lock:
+            self._load()
+            coin_pins = self._pins.setdefault(coin_name, {})
+            if coin_pins.get(key) == fingerprint:
+                return
+            coin_pins[key] = fingerprint
+            self._save()
 
 
 DEFAULT_ELECTRUM_SERVERS = {
@@ -63,14 +129,19 @@ class ElectrumConnection:
         log=None,
         proxy_host=None,
         proxy_port=None,
+        cert_pins=None,
+        coin_name="",
     ):
         self._host = host
         self._port = port
         self._use_ssl = use_ssl
         self._timeout = timeout
+        self._coin_name = coin_name
+        self._cert_pins = cert_pins if cert_pins is not None else CertPinStore()
         self._socket = None
         self._request_id = 0
         self._lock = threading.Lock()
+        self._io_lock = threading.Lock()
         self._connected = False
         self._response_queues = {}
         self._notification_callbacks = {}
@@ -81,51 +152,103 @@ class ElectrumConnection:
         self._proxy_host = proxy_host
         self._proxy_port = proxy_port
 
-    @staticmethod
-    def _is_private_address(host: str) -> bool:
-        try:
-            import ipaddress
+    def _open_socket(self):
+        use_proxy = (
+            self._proxy_host
+            and self._proxy_port
+            and not _is_private_address(self._host)
+        )
+        if use_proxy:
+            import socks
 
-            addr = ipaddress.ip_address(host)
-            return addr.is_private or addr.is_loopback or addr.is_link_local
-        except ValueError:
-            return host == "localhost"
+            sock = socks.socksocket()
+            sock.set_proxy(socks.SOCKS5, self._proxy_host, self._proxy_port, rdns=True)
+            sock.settimeout(self._timeout)
+            sock.connect((self._host, self._port))
+            if self._log:
+                self._log.debug(
+                    f"Electrum connecting via proxy {self._proxy_host}:{self._proxy_port} to {self._host}:{self._port}"
+                )
+            return sock
+        sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
+        if self._log and self._proxy_host and self._proxy_port:
+            self._log.debug(
+                f"Electrum connecting directly to LAN server {self._host}:{self._port} (bypassing proxy)"
+            )
+        return sock
+
+    def server_key(self) -> str:
+        return f"{self._host}:{self._port}"
+
+    @staticmethod
+    def _fingerprint(ssock) -> str:
+        return hashlib.sha256(ssock.getpeercert(True)).hexdigest()
+
+    def _wrap_pinned(self, sock):
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        ssock = context.wrap_socket(sock, server_hostname=self._host)
+        fingerprint = self._fingerprint(ssock)
+        key = self.server_key()
+        try:
+            pinned = self._cert_pins.get(self._coin_name, key)
+        except Exception as store_error:
+            _close_socket_safe(ssock)
+            raise ValueError(
+                f"no CA vouches for {key} and its pin cannot be read: {store_error}. "
+                f"Fix or delete {CERT_PINS_FILENAME}"
+            )
+        if pinned is None:
+            self._cert_pins.set(self._coin_name, key, fingerprint)
+            if self._log:
+                self._log.warning(
+                    f"Electrum server {key} presented a certificate no CA vouches for, "
+                    f"pinned sha256:{fingerprint}"
+                )
+        elif pinned != fingerprint:
+            _close_socket_safe(ssock)
+            if self._log:
+                self._log.error(
+                    f"Electrum server {key} certificate changed, refusing to connect"
+                )
+            raise ValueError(
+                f"certificate mismatch, pinned sha256:{pinned} got sha256:{fingerprint}. "
+                f"Remove {self._coin_name} / {key} from {CERT_PINS_FILENAME} to trust "
+                "the new certificate"
+            )
+        return ssock
 
     def connect(self):
         try:
-            use_proxy = (
-                self._proxy_host
-                and self._proxy_port
-                and not self._is_private_address(self._host)
-            )
-            if use_proxy:
-                import socks
-
-                sock = socks.socksocket()
-                sock.set_proxy(
-                    socks.SOCKS5, self._proxy_host, self._proxy_port, rdns=True
-                )
-                sock.settimeout(self._timeout)
-                sock.connect((self._host, self._port))
-                if self._log:
-                    self._log.debug(
-                        f"Electrum connecting via proxy {self._proxy_host}:{self._proxy_port} to {self._host}:{self._port}"
+            sock = self._open_socket()
+            if not self._use_ssl:
+                if self._log and not _is_authenticated_transport(self._host):
+                    self._log.warning(
+                        f"Electrum connection to {self._host}:{self._port} is unencrypted"
                     )
-            else:
-                sock = socket.create_connection(
-                    (self._host, self._port), timeout=self._timeout
-                )
-                if self._log and self._proxy_host and self._proxy_port:
-                    self._log.debug(
-                        f"Electrum connecting directly to LAN server {self._host}:{self._port} (bypassing proxy)"
-                    )
-            if self._use_ssl:
-                context = ssl.create_default_context()
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                self._socket = context.wrap_socket(sock, server_hostname=self._host)
-            else:
                 self._socket = sock
+                self._connected = True
+                return
+            try:
+                context = ssl.create_default_context()
+                ssock = context.wrap_socket(sock, server_hostname=self._host)
+                # Recorded so a CA-backed server cannot later be downgraded to
+                # an unvouched-for certificate by trust-on-first-use.
+                try:
+                    self._cert_pins.set(
+                        self._coin_name, self.server_key(), self._fingerprint(ssock)
+                    )
+                except Exception as store_error:
+                    if self._log:
+                        self._log.warning(
+                            f"Cannot record certificate pin for {self.server_key()}: "
+                            f"{store_error}"
+                        )
+                self._socket = ssock
+            except ssl.SSLCertVerificationError:
+                _close_socket_safe(sock)
+                self._socket = self._wrap_pinned(self._open_socket())
             self._connected = True
         except Exception as e:
             self._connected = False
@@ -163,15 +286,26 @@ class ElectrumConnection:
             self._listener_thread.join(timeout=2)
             self._listener_thread = None
 
+    def _readable(self, sock, timeout: float) -> bool:
+        if getattr(sock, "pending", None) and sock.pending() > 0:
+            return True
+        try:
+            return bool(select.select([sock], [], [], timeout)[0])
+        except (OSError, ValueError):
+            return False
+
     def _listener_loop(self):
         buffer = b""
         while self._listener_running and self._connected and self._socket:
             try:
-                self._socket.settimeout(1.0)
-                try:
-                    data = self._socket.recv(4096)
-                except socket.timeout:
+                sock = self._socket
+                if not self._readable(sock, 1.0):
                     continue
+                with self._io_lock:
+                    try:
+                        data = sock.recv(4096)
+                    except (socket.timeout, BlockingIOError, ssl.SSLWantReadError):
+                        continue
                 if not data:
                     self._connected = False
                     break
@@ -245,7 +379,8 @@ class ElectrumConnection:
             "params": params,
         }
         request_data = json.dumps(request) + "\n"
-        self._socket.sendall(request_data.encode())
+        with self._io_lock:
+            self._socket.sendall(request_data.encode())
         return request_id
 
     def _receive_response_sync(self, expected_id, timeout=30):
@@ -253,7 +388,8 @@ class ElectrumConnection:
         self._socket.settimeout(timeout)
         while True:
             try:
-                data = self._socket.recv(4096)
+                with self._io_lock:
+                    data = self._socket.recv(4096)
                 if not data:
                     raise TemporaryError("Connection closed")
                 buffer += data
@@ -298,7 +434,8 @@ class ElectrumConnection:
 
         while pending_ids:
             try:
-                data = self._socket.recv(4096)
+                with self._io_lock:
+                    data = self._socket.recv(4096)
                 if not data:
                     raise TemporaryError("Connection closed")
                 buffer += data
@@ -363,7 +500,8 @@ class ElectrumConnection:
                         "method": method,
                         "params": params if params else [],
                     }
-                    self._socket.sendall((json.dumps(request) + "\n").encode())
+                    with self._io_lock:
+                        self._socket.sendall((json.dumps(request) + "\n").encode())
                 result = self._receive_response_async(request_id, timeout=timeout)
                 return result
             else:
@@ -394,7 +532,8 @@ class ElectrumConnection:
                             "method": method,
                             "params": params if params else [],
                         }
-                        self._socket.sendall((json.dumps(req) + "\n").encode())
+                        with self._io_lock:
+                            self._socket.sendall((json.dumps(req) + "\n").encode())
             else:
                 for method, params in requests:
                     request_id = self._send_request(method, params if params else [])
@@ -471,15 +610,37 @@ def scripthash_from_address(address, network_params):
     raise ValueError(f"Unable to decode address: {address}")
 
 
+SSL_MARKERS = ("s", "ssl", "true", "1", "yes")
+PLAINTEXT_MARKERS = ("t", "tcp", "false", "0", "no")
+
+
 def _parse_server_string(server_str):
-    parts = server_str.strip().split(":")
-    host = parts[0]
-    port = int(parts[1]) if len(parts) > 1 else 50002
-    if len(parts) > 2:
-        ssl_str = parts[2].lower()
-        use_ssl = ssl_str in ("true", "1", "yes", "ssl")
+    # host:port[:s|t]. The port never implies the transport: an entry without a
+    # marker is TLS unless the transport is authenticated some other way.
+    remainder = server_str.strip()
+    host = ""
+    if remainder.startswith("[") and "]" in remainder:
+        host_end = remainder.index("]")
+        host = remainder[1:host_end]
+        remainder = remainder[host_end + 1 :]
+    parts = remainder.rsplit(":", 2)
+    host = host or parts[0]
+    if not host:
+        raise ValueError(f"No host in Electrum server entry: {server_str}")
+
+    marker = parts[2].lower() if len(parts) > 2 else None
+    if marker is None:
+        use_ssl = not _is_authenticated_transport(host)
+    elif marker in SSL_MARKERS:
+        use_ssl = True
+    elif marker in PLAINTEXT_MARKERS:
+        use_ssl = False
     else:
-        use_ssl = port != 50001
+        raise ValueError(f"Unknown Electrum transport marker: {server_str}")
+
+    port = (
+        int(parts[1]) if len(parts) > 1 and parts[1] else (50002 if use_ssl else 50001)
+    )
     return {"host": host, "port": port, "ssl": use_ssl}
 
 
@@ -492,9 +653,11 @@ class ElectrumServer:
         log=None,
         proxy_host=None,
         proxy_port=None,
+        cert_pins=None,
     ):
         self._coin_name = coin_name
         self._log = log
+        self._cert_pins = cert_pins if cert_pins is not None else CertPinStore()
         self._connection = None
         self._current_server_idx = 0
         self._lock = threading.Lock()
@@ -535,11 +698,6 @@ class ElectrumServer:
         self._min_request_interval = 0.02
         self._last_request_time = 0
 
-        self._user_connection = None
-        self._user_lock = threading.Lock()
-        self._user_last_activity = 0
-        self._user_connection_logged = False
-
         self._subscribed_height = 0
         self._subscribed_height_time = 0
         self._height_callback = None
@@ -548,21 +706,8 @@ class ElectrumServer:
 
         use_tor = proxy_host is not None and proxy_port is not None
 
-        user_clearnet = []
-        if clearnet_servers:
-            for srv in clearnet_servers:
-                if isinstance(srv, str):
-                    user_clearnet.append(_parse_server_string(srv))
-                elif isinstance(srv, dict):
-                    user_clearnet.append(srv)
-
-        user_onion = []
-        if onion_servers:
-            for srv in onion_servers:
-                if isinstance(srv, str):
-                    user_onion.append(_parse_server_string(srv))
-                elif isinstance(srv, dict):
-                    user_onion.append(srv)
+        user_clearnet = self._parse_servers(clearnet_servers)
+        user_onion = self._parse_servers(onion_servers)
 
         final_onion = (
             user_onion if user_onion else DEFAULT_ONION_SERVERS.get(coin_name, [])
@@ -597,76 +742,124 @@ class ElectrumServer:
                     f"ElectrumServer {coin_name}: {len(final_clearnet)} clearnet servers"
                 )
 
+    def _parse_servers(self, servers) -> list:
+        parsed = []
+        errors = []
+        for srv in servers if servers else []:
+            if isinstance(srv, dict):
+                parsed.append(srv)
+                continue
+            if not isinstance(srv, str):
+                errors.append(f"{srv!r} is not a server string")
+                continue
+            try:
+                parsed.append(_parse_server_string(srv))
+            except ValueError as e:
+                errors.append(str(e))
+        if errors:
+            raise ValueError("Invalid Electrum server config: " + "; ".join(errors))
+        return parsed
+
     def _get_server(self, index):
         if not self._servers:
             raise ValueError(f"No Electrum servers configured for {self._coin_name}")
         return self._servers[index % len(self._servers)]
 
+    def _try_connect_server(self, server) -> bool:
+        try:
+            start_time = time.time()
+            conn = ElectrumConnection(
+                server["host"],
+                server["port"],
+                server.get("ssl", True),
+                log=self._log,
+                proxy_host=self._proxy_host,
+                proxy_port=self._proxy_port,
+                cert_pins=self._cert_pins,
+                coin_name=self._coin_name,
+            )
+            conn.connect()
+            connect_time = (time.time() - start_time) * 1000
+            version_info = conn.get_server_version()
+            if version_info and len(version_info) > 0:
+                self._server_version = version_info[0]
+            prev_host = self._current_server_host
+            prev_port = self._current_server_port
+            self._current_server_host = server["host"]
+            self._current_server_port = server["port"]
+            self._connection = conn
+            self._current_server_idx = self._servers.index(server)
+            self._connection_failures = 0
+            self._last_connection_error = None
+            self._all_servers_failed = False
+            self._update_server_score(server, success=True, latency_ms=connect_time)
+            self._last_activity = time.time()
+            self._last_reconnect_time = time.time()
+            if self._log:
+                if not self._initial_connection_logged:
+                    self._log.info(
+                        f"Connected to Electrum server: {server['host']}:{server['port']} "
+                        f"({self._server_version}, {connect_time:.0f}ms)"
+                    )
+                    self._initial_connection_logged = True
+                elif server["host"] != prev_host or server["port"] != prev_port:
+                    self._log.info(
+                        f"Switched to Electrum server: {server['host']}:{server['port']} "
+                        f"({connect_time:.0f}ms)"
+                    )
+            if self._stopping:
+                conn.disconnect()
+                self._connection = None
+                return False
+            if self._realtime_enabled:
+                self._start_realtime_listener()
+            self._start_keepalive()
+            self._connection.register_header_callback(self._on_header_update)
+            self._subscribe_headers()
+            return True
+        except Exception as e:
+            self._connection_failures += 1
+            self._last_connection_error = str(e)
+            self._update_server_score(server, success=False)
+            if self._is_rate_limit_error(str(e)):
+                self._blacklist_server(server, str(e))
+            return False
+
     def connect(self):
         if self._stopping:
             return
-        sorted_servers = self.get_sorted_servers()
-        for server in sorted_servers:
-            try:
-                start_time = time.time()
-                conn = ElectrumConnection(
-                    server["host"],
-                    server["port"],
-                    server.get("ssl", True),
-                    log=self._log,
-                    proxy_host=self._proxy_host,
-                    proxy_port=self._proxy_port,
-                )
-                conn.connect()
-                connect_time = (time.time() - start_time) * 1000
-                version_info = conn.get_server_version()
-                if version_info and len(version_info) > 0:
-                    self._server_version = version_info[0]
-                prev_host = self._current_server_host
-                prev_port = self._current_server_port
-                self._current_server_host = server["host"]
-                self._current_server_port = server["port"]
-                self._connection = conn
-                self._current_server_idx = self._servers.index(server)
-                self._connection_failures = 0
-                self._last_connection_error = None
-                self._all_servers_failed = False
-                self._update_server_score(server, success=True, latency_ms=connect_time)
-                self._last_activity = time.time()
-                self._last_reconnect_time = time.time()
-                if self._log:
-                    if not self._initial_connection_logged:
-                        self._log.info(
-                            f"Connected to Electrum server: {server['host']}:{server['port']} "
-                            f"({self._server_version}, {connect_time:.0f}ms)"
-                        )
-                        self._initial_connection_logged = True
-                    elif server["host"] != prev_host or server["port"] != prev_port:
-                        self._log.info(
-                            f"Switched to Electrum server: {server['host']}:{server['port']} "
-                            f"({connect_time:.0f}ms)"
-                        )
-                if self._stopping:
-                    conn.disconnect()
-                    self._connection = None
-                    return
-                if self._realtime_enabled:
-                    self._start_realtime_listener()
-                self._start_keepalive()
-                self._connection.register_header_callback(self._on_header_update)
-                self._subscribe_headers()
+        for server in self.get_sorted_servers():
+            if self._try_connect_server(server):
                 return True
-            except Exception as e:
-                self._connection_failures += 1
-                self._last_connection_error = str(e)
-                self._update_server_score(server, success=False)
-                if self._is_rate_limit_error(str(e)):
-                    self._blacklist_server(server, str(e))
-                continue
         self._all_servers_failed = True
         raise TemporaryError(
             f"Failed to connect to any Electrum server for {self._coin_name}"
         )
+
+    def _reconnect(self, prefer_current: bool = True) -> bool:
+        if self._stopping:
+            return False
+        old = self._connection
+        self._connection = None
+        if old:
+            try:
+                old.disconnect()
+            except Exception:
+                pass
+        time.sleep(0.3)
+        servers = self.get_sorted_servers()
+        if prefer_current and self._current_server_host:
+            servers.sort(
+                key=lambda s: (
+                    s["host"] != self._current_server_host
+                    or s["port"] != self._current_server_port
+                )
+            )
+        for server in servers:
+            if self._try_connect_server(server):
+                return True
+        self._all_servers_failed = True
+        return False
 
     def getConnectionStatus(self):
         return {
@@ -852,18 +1045,12 @@ class ElectrumServer:
             time.sleep(self._min_request_interval - elapsed)
         self._last_request_time = time.time()
 
-    def _retry_on_failure(self):
-        if self._stopping:
-            return
-        self._current_server_idx = (self._current_server_idx + 1) % len(self._servers)
-        if self._connection:
-            try:
-                self._connection.disconnect()
-            except Exception:
-                pass
-        self._connection = None
-        time.sleep(0.3)
-        self.connect()
+    def _should_reconnect_after(self, e) -> bool:
+        if isinstance(e, TemporaryError):
+            return True
+        if self._is_rate_limit_error(str(e)):
+            return True
+        return self._connection is None or not self._connection.is_connected()
 
     def _check_connection_health(self, timeout=5) -> bool:
         if self._connection is None or not self._connection.is_connected():
@@ -893,7 +1080,7 @@ class ElectrumServer:
                         raise TemporaryError("Failed to establish Electrum connection")
                 elif (time.time() - self._last_activity) > 60:
                     if not self._check_connection_health():
-                        self._retry_on_failure()
+                        self._reconnect(prefer_current=True)
                         if self._connection is None:
                             raise TemporaryError(
                                 "Failed to re-establish Electrum connection"
@@ -906,8 +1093,10 @@ class ElectrumServer:
                     if self._is_rate_limit_error(str(e)):
                         server = self._get_server(self._current_server_idx)
                         self._blacklist_server(server, str(e))
-                    if attempt == 0:
-                        self._retry_on_failure()
+                    elif self._is_timeout_error(e):
+                        self._record_timeout()
+                    if attempt == 0 and self._should_reconnect_after(e):
+                        self._reconnect(prefer_current=True)
                     else:
                         raise
         finally:
@@ -930,7 +1119,7 @@ class ElectrumServer:
                         raise TemporaryError("Failed to establish Electrum connection")
                 elif (time.time() - self._last_activity) > 60:
                     if not self._check_connection_health():
-                        self._retry_on_failure()
+                        self._reconnect(prefer_current=True)
                         if self._connection is None:
                             raise TemporaryError(
                                 "Failed to re-establish Electrum connection"
@@ -943,47 +1132,18 @@ class ElectrumServer:
                     if self._is_rate_limit_error(str(e)):
                         server = self._get_server(self._current_server_idx)
                         self._blacklist_server(server, str(e))
-                    if attempt == 0:
-                        self._retry_on_failure()
+                    elif self._is_timeout_error(e):
+                        self._record_timeout()
+                    if attempt == 0 and self._should_reconnect_after(e):
+                        self._reconnect(prefer_current=True)
                     else:
                         raise
         finally:
             self._lock.release()
 
-    def _connect_user(self):
-        if self._stopping:
-            return False
-        sorted_servers = self.get_sorted_servers()
-        for server in sorted_servers:
-            try:
-                conn = ElectrumConnection(
-                    server["host"],
-                    server["port"],
-                    server.get("ssl", True),
-                    log=self._log,
-                    proxy_host=self._proxy_host,
-                    proxy_port=self._proxy_port,
-                )
-                conn.connect()
-                conn.get_server_version()
-                self._user_connection = conn
-                self._user_last_activity = time.time()
-                if self._log:
-                    if not self._user_connection_logged:
-                        self._log.debug(
-                            f"User connection established to {server['host']}"
-                        )
-                        self._user_connection_logged = True
-                    else:
-                        self._log.debug(
-                            f"User connection reconnected to {server['host']}"
-                        )
-                return True
-            except Exception as e:
-                if self._log:
-                    self._log.debug(f"User connection failed to {server['host']}: {e}")
-                continue
-        return False
+    @staticmethod
+    def _is_timeout_error(e) -> bool:
+        return isinstance(e, TemporaryError) and "timed out" in str(e).lower()
 
     def _record_timeout(self):
         if self._stopping:
@@ -1001,10 +1161,6 @@ class ElectrumServer:
             self._blacklist_server(server, reason)
             self._consecutive_timeouts = 0
             self._last_timeout_time = 0
-            try:
-                self._retry_on_failure()
-            except Exception:
-                pass
 
     def call_background(self, method, params=None, timeout=20):
         if self._stopping:
@@ -1029,18 +1185,18 @@ class ElectrumServer:
                 except TemporaryError as e:
                     if self._stopping:
                         raise TemporaryError("Electrum server is shutting down")
-                    if "timed out" in str(e).lower():
+                    if self._is_timeout_error(e):
                         self._record_timeout()
                     if attempt == 0:
-                        self._retry_on_failure()
+                        self._reconnect(prefer_current=True)
                     else:
                         raise
                 except Exception as e:
                     if self._is_rate_limit_error(str(e)):
                         server = self._get_server(self._current_server_idx)
                         self._blacklist_server(server, str(e))
-                    if attempt == 0:
-                        self._retry_on_failure()
+                    if attempt == 0 and self._should_reconnect_after(e):
+                        self._reconnect(prefer_current=True)
                     else:
                         raise
         finally:
@@ -1071,106 +1227,22 @@ class ElectrumServer:
                 except TemporaryError as e:
                     if self._stopping:
                         raise TemporaryError("Electrum server is shutting down")
-                    if "timed out" in str(e).lower():
+                    if self._is_timeout_error(e):
                         self._record_timeout()
                     if attempt == 0:
-                        self._retry_on_failure()
+                        self._reconnect(prefer_current=True)
                     else:
                         raise
                 except Exception as e:
                     if self._is_rate_limit_error(str(e)):
                         server = self._get_server(self._current_server_idx)
                         self._blacklist_server(server, str(e))
-                    if attempt == 0:
-                        self._retry_on_failure()
+                    if attempt == 0 and self._should_reconnect_after(e):
+                        self._reconnect(prefer_current=True)
                     else:
                         raise
         finally:
             self._lock.release()
-
-    def call_user(self, method, params=None, timeout=10):
-        if self._stopping:
-            raise TemporaryError("Electrum server is shutting down")
-        lock_acquired = self._user_lock.acquire(timeout=timeout + 2)
-        if not lock_acquired:
-            raise TemporaryError(f"User connection busy: {method}")
-
-        try:
-            if (
-                self._user_connection is None
-                or not self._user_connection.is_connected()
-            ):
-                if not self._connect_user():
-                    raise TemporaryError("User connection unavailable")
-
-            try:
-                result = self._user_connection.call(method, params, timeout=timeout)
-                self._user_last_activity = time.time()
-                return result
-            except Exception as e:
-                if self._log:
-                    self._log.debug(f"User call failed ({method}): {e}")
-                if self._user_connection:
-                    try:
-                        self._user_connection.disconnect()
-                    except Exception:
-                        pass
-                    self._user_connection = None
-
-                if self._connect_user():
-                    try:
-                        result = self._user_connection.call(
-                            method, params, timeout=timeout
-                        )
-                        self._user_last_activity = time.time()
-                        return result
-                    except Exception as e2:
-                        raise TemporaryError(f"User call failed: {e2}")
-
-                raise TemporaryError(f"User call failed: {e}")
-        finally:
-            self._user_lock.release()
-
-    def call_batch_user(self, requests, timeout=15):
-        if self._stopping:
-            raise TemporaryError("Electrum server is shutting down")
-        lock_acquired = self._user_lock.acquire(timeout=timeout + 2)
-        if not lock_acquired:
-            raise TemporaryError("User connection busy")
-
-        try:
-            if (
-                self._user_connection is None
-                or not self._user_connection.is_connected()
-            ):
-                if not self._connect_user():
-                    raise TemporaryError("User connection unavailable")
-
-            try:
-                result = self._user_connection.call_batch(requests)
-                self._user_last_activity = time.time()
-                return result
-            except Exception as e:
-                if self._log:
-                    self._log.debug(f"User batch call failed: {e}")
-                if self._user_connection:
-                    try:
-                        self._user_connection.disconnect()
-                    except Exception:
-                        pass
-                    self._user_connection = None
-
-                if self._connect_user():
-                    try:
-                        result = self._user_connection.call_batch(requests)
-                        self._user_last_activity = time.time()
-                        return result
-                    except Exception as e2:
-                        raise TemporaryError(f"User batch call failed: {e2}")
-
-                raise TemporaryError(f"User batch call failed: {e}")
-        finally:
-            self._user_lock.release()
 
     def disconnect(self):
         self._stop_keepalive()
@@ -1189,14 +1261,6 @@ class ElectrumServer:
                     conn.disconnect()
                 except Exception:
                     pass
-        with self._user_lock:
-            if self._user_connection:
-                try:
-                    self._user_connection.disconnect()
-                except Exception:
-                    pass
-                self._user_connection = None
-                self._user_connection_logged = False
 
     def shutdown(self):
         self._stopping = True
@@ -1240,9 +1304,12 @@ class ElectrumServer:
             self._resubscribe_all()
 
     def _resubscribe_all(self):
+        conn = self._connection
+        if not conn:
+            return
         for scripthash in list(self._subscribed_scripthashes):
             try:
-                self.call("blockchain.scripthash.subscribe", [scripthash])
+                conn.call("blockchain.scripthash.subscribe", [scripthash])
             except Exception as e:
                 if self._log:
                     self._log.debug(
@@ -1344,6 +1411,8 @@ class ElectrumServer:
                 log=self._log,
                 proxy_host=self._proxy_host,
                 proxy_port=self._proxy_port,
+                cert_pins=self._cert_pins,
+                coin_name=self._coin_name,
             )
             test_conn.connect()
             latency = test_conn.ping()

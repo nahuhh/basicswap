@@ -97,6 +97,19 @@ _wallet_info_cache = {}
 _fee_reserve_cache = {}
 
 
+def revoke_offer(offer_id, args, refuse_if_negotiating: bool = False) -> bool:
+    result = read_json_api(
+        f"revokeoffer/{offer_id}", {"refuse_if_negotiating": refuse_if_negotiating}
+    )
+    if args.debug:
+        print("revokeoffer", result)
+    error = result.get("error") if isinstance(result, dict) else None
+    if error:
+        print(f"Offer {offer_id} not revoked: {error}")
+        return False
+    return True
+
+
 def get_wallet_info(coin_ticker):
     if coin_ticker not in _wallet_info_cache:
         _wallet_info_cache[coin_ticker] = read_json_api_wallet(f"wallets/{coin_ticker}")
@@ -477,6 +490,16 @@ def readConfig(args, known_coins):
             print("Setting address to auto for bid", bid_template["name"])
             bid_template["address"] = "auto"
             num_changes += 1
+
+        if "maxrate" in bid_template:
+            print("Renaming maxrate to max_rate for bid template", bid_template["name"])
+            bid_template["max_rate"] = bid_template.pop("maxrate")
+            num_changes += 1
+
+        if bid_template.get("max_rate") is None:
+            print(
+                f"Bid template {bid_template['name']} has no max_rate set, it will not bid"
+            )
 
         if bid_template.get("enabled", True) is False:
             continue
@@ -893,17 +916,14 @@ def process_offers(args, config, script_state) -> None:
                     print(
                         f"Revoking offer {offer_id}, offer amount {offer_amount_from:.8f} > wallet balance {wallet_balance:.8f}"
                     )
-                    result = read_json_api(f"revokeoffer/{offer_id}", {})
-                    if args.debug:
-                        print("revokeoffer", result)
-                    else:
+                    if revoke_offer(offer_id, args):
                         print("Offer revoked, will repost with accurate amount")
-                    for i, prev_offer in enumerate(prev_template_offers):
-                        if prev_offer.get("offer_id") == offer_id:
-                            del prev_template_offers[i]
-                            break
-                    write_state(args.statefile, script_state)
-                    offers_found -= 1
+                        for i, prev_offer in enumerate(prev_template_offers):
+                            if prev_offer.get("offer_id") == offer_id:
+                                del prev_template_offers[i]
+                                break
+                        write_state(args.statefile, script_state)
+                        offers_found -= 1
                 elif template_fixed_remaining is not None and (
                     float(offer.get("tracking_filled_amount", 0))
                     + float(offer.get("tracking_in_flight_amount", 0))
@@ -916,20 +936,15 @@ def process_offers(args, config, script_state) -> None:
                         f"Revoking offer {offer_id}, budget changed, "
                         f"reposting with remaining {template_fixed_remaining:.8f}"
                     )
-                    result = read_json_api(f"revokeoffer/{offer_id}", {})
-                    if args.debug:
-                        print("revokeoffer", result)
-                    offers_found -= 1
+                    if revoke_offer(offer_id, args, refuse_if_negotiating=True):
+                        offers_found -= 1
                 elif wallet_balance <= min_coin_from_amt:
                     print(
                         "Revoking offer {}, wallet from balance below minimum".format(
                             offer_id
                         )
                     )
-                    result = read_json_api(f"revokeoffer/{offer_id}", {})
-                    if args.debug:
-                        print("revokeoffer", result)
-                    else:
+                    if revoke_offer(offer_id, args):
                         print("Offer revoked successfully")
             else:
                 coin_from_match = offer.get("coin_from") == coin_from_data["id"]
@@ -1097,6 +1112,13 @@ def process_offers(args, config, script_state) -> None:
             print(
                 f"Adjust rates mode for {offer_template['name']}: {adjust_rates_value}"
             )
+
+        if adjust_rates_value in ("minrate", "static", "true", "only"):
+            if float(offer_template.get("minrate") or 0) <= 0.0:
+                print(
+                    f"Skipping {offer_template['name']} - minrate must be > 0 for {adjust_rates_value} mode"
+                )
+                continue
 
         coingecko_rate = None
         # Get CoinGecko rates if needed (for "true", "false", "all", and unknown modes)
@@ -1312,28 +1334,19 @@ def process_offers(args, config, script_state) -> None:
                 )
                 continue
 
-        elif adjust_rates_value == "only":
-            # Use orderbook only, fail if no market rates
-            if market_rate:
-                use_rate = market_rate
-                print(f"Using market rate only: {use_rate}")
-            else:
-                print(
-                    f"ERROR: No market data available for 'only' mode for {offer_template['name']}"
-                )
-                print(
-                    f"Skipping {offer_template['name']} - market-only mode requires existing offers"
-                )
-                continue
-
-        elif adjust_rates_value == "minrate":
+        elif adjust_rates_value in ["minrate", "only"]:
             # Use orderbook, fallback to minrate if no market rates
             if market_rate:
                 use_rate = market_rate
-                print(f"Using market rate only: {use_rate}")
-            else:
+                print(f"Using market rate: {use_rate}")
+            elif adjust_rates_value == "minrate":
                 use_rate = offer_template["minrate"]
                 print(f"No market data available. Using minrate: {use_rate}")
+            elif adjust_rates_value == "only":
+                print(
+                    f"Skipping {offer_template['name']}, market-only requires existing offers"
+                )
+                continue
 
         elif adjust_rates_value == "static":
             # Use static / fixed rate + tweak
@@ -1747,9 +1760,16 @@ def process_bids(args, config, script_state) -> None:
                         print(f"Bid amount too high for offer {offer_id}")
                     continue
 
-            if offer_rate > bid_template["maxrate"]:
+            bid_max_rate = bid_template.get("max_rate")
+            if bid_max_rate is None:
                 if args.debug:
-                    print(f"Bid rate too low for offer {offer_id}")
+                    print(
+                        f"No max_rate set for template {bid_template['name']}, skipping offer {offer_id}"
+                    )
+                continue
+            if offer_rate > bid_max_rate:
+                if args.debug:
+                    print(f"Offer rate above bid max_rate for offer {offer_id}")
                 continue
 
             try:
