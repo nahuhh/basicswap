@@ -12567,6 +12567,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             BidStates.BID_SENT,
             BidStates.BID_RECEIVED,
             BidStates.BID_REQUEST_ACCEPTED,
+            BidStates.BID_RECEIVING_ACC,
         ]
         if bid.was_sent and offer.was_sent:
             allowed_states.append(
@@ -12576,6 +12577,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             bid.state in allowed_states,
             f"Invalid state for bid {bid.state}, {strBidState(bid.state)}",
         )
+
+        resent_accept: bool = bid.state == BidStates.BID_RECEIVING_ACC
+        if resent_accept:
+            self.log.info(
+                f"Replacing previous adaptor-sig bid accept for bid {self.log.id(bid.bid_id)}."
+            )
 
         try:
             pkal: bytes = msg_data.pkal
@@ -12740,14 +12747,24 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             xmr_swap.al_lock_refund_tx_sig = al_lock_refund_tx_sig
 
             bid.setState(BidStates.BID_RECEIVING_ACC)
-            self.saveBid(bid.bid_id, bid, xmr_swap=xmr_swap)
+            try:
+                cursor = self.openDB()
+                if resent_accept:
+                    cursor.execute(
+                        "DELETE FROM xmr_split_data WHERE bid_id = :bid_id AND msg_type = :msg_type AND addr_from = :addr_from AND created_at < :sent",
+                        {
+                            "bid_id": bid.bid_id,
+                            "msg_type": int(XmrSplitMsgTypes.BID_ACCEPT),
+                            "addr_from": addr_from,
+                            "sent": msg["sent"],
+                        },
+                    )
+                self.saveBidInSession(bid.bid_id, bid, cursor, xmr_swap)
 
-            if ci_to.curve_type() != Curves.ed25519:
-                try:
-                    cursor = self.openDB()
+                if ci_to.curve_type() != Curves.ed25519:
                     self.receiveXmrBidAccept(bid, cursor)
-                finally:
-                    self.closeDB(cursor)
+            finally:
+                self.closeDB(cursor)
         except Exception as ex:
             if self.debug:
                 self.log.error(traceback.format_exc())
@@ -14202,7 +14219,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
     def processXmrSplitMessage(self, msg) -> None:
         self.log.debug("Processing xmr split msg {}".format(self.log.id(msg["msgid"])))
-        now: int = self.getTime()
         msg_bytes = self.getSmsgMsgBytes(msg)
         msg_data = XmrSplitMessage(init_all=False)
         msg_data.from_bytes(msg_bytes)
@@ -14237,21 +14253,27 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ):
             cursor = self.openDB()
             try:
+                chunk_key = {
+                    "bid_id": msg_data.msg_id,
+                    "msg_type": msg_data.msg_type,
+                    "msg_sequence": msg_data.sequence,
+                    "addr_from": msg["from"],
+                }
                 q = cursor.execute(
-                    "SELECT COUNT(*) FROM xmr_split_data WHERE bid_id = :bid_id AND msg_type = :msg_type AND msg_sequence = :msg_sequence AND addr_from = :addr_from",
-                    {
-                        "bid_id": msg_data.msg_id,
-                        "msg_type": msg_data.msg_type,
-                        "msg_sequence": msg_data.sequence,
-                        "addr_from": msg["from"],
-                    },
+                    "SELECT MAX(created_at) FROM xmr_split_data WHERE bid_id = :bid_id AND msg_type = :msg_type AND msg_sequence = :msg_sequence AND addr_from = :addr_from",
+                    chunk_key,
                 ).fetchone()
-                num_exists = q[0]
-                if num_exists > 0:
-                    self.log.warning(
-                        f"Ignoring duplicate xmr_split_data entry: ({self.logIDM(msg_data.msg_id)}, {msg_data.msg_type}, {msg_data.sequence})."
+                if q[0] is not None:
+                    if q[0] >= msg["sent"]:
+                        self.log.warning(
+                            f"Ignoring duplicate xmr_split_data entry: ({self.logIDM(msg_data.msg_id)}, {msg_data.msg_type}, {msg_data.sequence})."
+                        )
+                        return
+                    # A resend carries a new proof, its chunks replace the older ones.
+                    cursor.execute(
+                        "DELETE FROM xmr_split_data WHERE bid_id = :bid_id AND msg_type = :msg_type AND msg_sequence = :msg_sequence AND addr_from = :addr_from",
+                        chunk_key,
                     )
-                    return
 
                 dbr = XmrSplitData()
                 dbr.addr_from = msg["from"]
@@ -14260,7 +14282,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 dbr.msg_type = msg_data.msg_type
                 dbr.msg_sequence = msg_data.sequence
                 dbr.dleag = msg_data.dleag
-                dbr.created_at = now
+                dbr.created_at = msg["sent"]
                 self.add(dbr, cursor, upsert=True)
             finally:
                 self.closeDB(cursor)
