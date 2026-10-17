@@ -693,39 +693,14 @@ class XMRInterface(CoinInterface):
                         rv = -1
             return rv
 
-    def findConfirmedTxnByHash(self, txid: str):
-        # TODO: Use get_transfer_by_txid and sending wallet when destination address is not owned
-        with self._mx_wallet:
-            self.openWallet(self._wallet_filename)
-            self.rpc_wallet("refresh")
-            self._log.debug(f"Refreshing {self.coin_name()} wallet")
-
-            try:
-                current_height: int = self.getChainHeight()
-                self._log.info(
-                    f"findConfirmedTxnByHash {self.ticker_str()} current_height {current_height}\nhash: {txid}"
-                )
-            except Exception as e:
-                self._log.info("rpc failed %s", str(e))
-                current_height = (
-                    None  # If the transfer is available it will be deep enough
-                )
-
-            params = {"transfer_type": "available"}
-            rv = self.rpc_wallet("incoming_transfers", params)
-            if "transfers" in rv:
-                for transfer in rv["transfers"]:
-                    if transfer["tx_hash"] == txid and (
-                        current_height is None
-                        or current_height - transfer["block_height"]
-                        > self.blocks_confirmed
-                    ):
-                        return {
-                            "txid": transfer["tx_hash"],
-                            "amount": transfer["amount"],
-                            "height": transfer["block_height"],
-                        }
+    def getTxDepth(self, txid: bytes) -> int | None:
+        rv = self.getTransaction(txid)
+        if txid.hex() in rv.get("missed_tx", []):
             return None
+        tx = rv["txs"][0]
+        if tx["in_pool"]:
+            return 0
+        return self.getChainHeight() - tx["block_height"]
 
     def spendBLockTx(
         self,
@@ -777,16 +752,15 @@ class XMRInterface(CoinInterface):
                 )
             if rv["balance"] < cb_swap_value:
                 self._log.warning("Balance is too low, checking for existing spend.")
-                txns = self.rpc_wallet("get_transfers", {"out": True})
-                if "out" in txns:
-                    txns = txns["out"]
-                    if len(txns) > 0:
-                        txid = txns[0]["txid"]
-                        self._log.warning(f"spendBLockTx detected spending tx: {txid}.")
+                txns = self.rpc_wallet("get_transfers", {"out": True, "pending": True})
+                txns = txns.get("out", []) + txns.get("pending", [])
+                if len(txns) > 0:
+                    txid = txns[0]["txid"]
+                    self._log.warning(f"spendBLockTx detected spending tx: {txid}.")
 
-                        # Should check for address_to, but only the from address is found in the output
-                        if txns[0]["address"] == address_b58:
-                            return bytes.fromhex(txid)
+                    # Should check for address_to, but only the from address is found in the output
+                    if txns[0]["address"] == address_b58:
+                        return self.ensureTxSeenByDaemon(bytes.fromhex(txid))
 
                 self._log.error(
                     "wallet {} balance {}, expected {}".format(
@@ -821,7 +795,7 @@ class XMRInterface(CoinInterface):
 
             rv = self.rpc_wallet("sweep_all", params)
 
-            return bytes.fromhex(rv["tx_hash_list"][0])
+            return self.ensureTxSeenByDaemon(bytes.fromhex(rv["tx_hash_list"][0]))
 
     def withdrawCoin(
         self, value, addr_to: str, sweepall: bool, estimate_fee: bool = False
@@ -1012,6 +986,13 @@ class XMRInterface(CoinInterface):
     def ensureFunds(self, amount: int) -> None:
         if self.getSpendableBalance() < amount:
             raise ValueError("Balance too low")
+
+    def ensureTxSeenByDaemon(self, txid: bytes) -> bytes:
+        if self.getTxDepth(txid) is None:
+            raise TemporaryError(
+                f"Tx {txid.hex()} not found by the {self.coin_name()} daemon"
+            )
+        return txid
 
     def getTransaction(self, txid: bytes):
         return self.rpc2(
