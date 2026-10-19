@@ -123,12 +123,15 @@ class XMRInterface(CoinInterface):
         self._wallet_filename = coin_settings.get("wallet_name", "swap_wallet")
         self._cached_main_wallet_address = None
 
+        self._coin_settings = coin_settings
+
         daemon_login = None
         if coin_settings.get("rpcuser", "") != "":
             daemon_login = (
                 coin_settings.get("rpcuser", ""),
                 coin_settings.get("rpcpassword", ""),
             )
+        self._daemon_login = daemon_login
 
         rpchost = coin_settings.get("rpchost", "127.0.0.1")
         proxy_host = None
@@ -170,24 +173,9 @@ class XMRInterface(CoinInterface):
         self._num_chaininfo_retries = coin_settings.get("numchaininforetries", 20)
         self._chaininfo_retry_delay = coin_settings.get("chaininforetrydelay", 1)
 
-        self.rpc = make_xmr_rpc_func(
-            coin_settings["rpcport"],
-            daemon_login,
-            host=rpchost,
-            proxy_host=proxy_host,
-            proxy_port=proxy_port,
-            default_timeout=self._rpctimeout,
-            tag="Node(j) ",
+        self._buildDaemonRpcFuncs(
+            rpchost, coin_settings["rpcport"], proxy_host, proxy_port
         )
-        self.rpc2 = make_xmr_rpc2_func(
-            coin_settings["rpcport"],
-            daemon_login,
-            host=rpchost,
-            proxy_host=proxy_host,
-            proxy_port=proxy_port,
-            default_timeout=self._rpctimeout,
-            tag="Node ",
-        )  # non-json endpoint
         self.rpc_wallet = make_xmr_rpc_func(
             coin_settings["walletrpcport"],
             coin_settings["walletrpcauth"],
@@ -195,6 +183,80 @@ class XMRInterface(CoinInterface):
             default_timeout=self._walletrpctimeout,
             tag="Wallet ",
         )
+
+    def _buildDaemonRpcFuncs(self, rpchost, rpcport, proxy_host, proxy_port) -> None:
+        # (Re)build the direct-daemon conns; rebound on a runtime daemon switch.
+        self._rpchost = rpchost
+        self._rpcport = rpcport
+        self.rpc = make_xmr_rpc_func(
+            rpcport,
+            self._daemon_login,
+            host=rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            default_timeout=self._rpctimeout,
+            tag="Node(j) ",
+        )
+        self.rpc2 = make_xmr_rpc2_func(
+            rpcport,
+            self._daemon_login,
+            host=rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            default_timeout=self._rpctimeout,
+            tag="Node ",
+        )  # non-json endpoint
+
+    def setDaemonAddress(self, rpchost: str, rpcport) -> None:
+        # set_daemon the wallet-rpc and rebuild the direct-daemon connections.
+        rpcport = int(rpcport)
+        with self._mx_wallet:
+            trusted: bool = True
+            proxy_host = None
+            proxy_port = None
+            if self._sc is not None:
+                trusted = self._sc.getXMRTrustedDaemon(self.coin_type(), rpchost)
+                proxy_host, proxy_port = self._sc.getXMRWalletProxy(
+                    self.coin_type(), rpchost
+                )
+
+            params = {
+                "address": f"{rpchost}:{rpcport}",
+                "trusted": trusted,
+            }
+            if self._daemon_login is not None:
+                params["username"] = self._daemon_login[0]
+                params["password"] = self._daemon_login[1]
+            if proxy_host:
+                params["proxy"] = f"{proxy_host}:{proxy_port}"
+                params["ssl_support"] = "autodetect"
+                params["ssl_allow_any_cert"] = True
+
+            try:
+                self.rpc_wallet("set_daemon", params)
+            except Exception as e:
+                if "proxy" not in params:
+                    raise
+                # Wownero's older wallet-rpc may not accept the 'proxy' argument.
+                self._log.warning(
+                    f"{self.coin_name()} set_daemon failed ({e}); retrying without proxy arg."
+                )
+                params.pop("proxy", None)
+                self.rpc_wallet("set_daemon", params)
+
+            self._log.info(
+                "Set {} daemon to {}:{} ({}){}.".format(
+                    self.coin_name(),
+                    rpchost,
+                    rpcport,
+                    "trusted" if trusted else "untrusted",
+                    " through proxy" if proxy_host else "",
+                )
+            )
+
+            self._buildDaemonRpcFuncs(rpchost, rpcport, proxy_host, proxy_port)
+            self._coin_settings["rpchost"] = rpchost
+            self._coin_settings["rpcport"] = rpcport
 
     def setFeePriority(self, new_priority):
         ensure(new_priority >= 0 and new_priority < 4, "Invalid fee_priority value")
@@ -452,6 +514,12 @@ class XMRInterface(CoinInterface):
 
         return float(self.format_amount(fee_per_k_bytes)), "get_fee_estimate"
 
+    def getRedeemFeeRate(self) -> int:
+        # A sweep ignores the offer's rate. Priority 0 is resolved by the
+        # wallet against the backlog, so assume the higher tier it can land on.
+        priority: int = self._fee_priority if self._fee_priority > 0 else 2
+        return self.rpc("get_fee_estimate")["fees"][priority - 1] * 1000
+
     def getNewRandomKey(self) -> bytes:
         # Note: Returned bytes are in big endian order
         return i2b(9 + secrets.randbelow(ed25519_l - 9))
@@ -498,6 +566,25 @@ class XMRInterface(CoinInterface):
     def encodeSharedAddress(self, Kbv: bytes, Kbs: bytes) -> str:
         return xmr_util.encode_address(Kbv, Kbs, self._addr_prefix)
 
+    def findPendingLockTx(self, lock_addrs):
+        """The first in-flight tx paying any of lock_addrs, and the subset it pays."""
+        # An in-flight send is invisible to findTxB: incoming_transfers reads
+        # m_transfers, which monero only fills for mined txs.
+        lock_addrs = set(lock_addrs)
+        txns = self.rpc_wallet("get_transfers", {"out": True, "pending": True})
+        for tag in ("pending", "out"):
+            for tx in txns.get(tag, []):
+                paid = {
+                    d.get("address", None) for d in tx.get("destinations", [])
+                } & lock_addrs
+                if paid:
+                    tx_hash: bytes = bytes.fromhex(tx["txid"])
+                    self._log.warning(
+                        f"Already sending to {len(paid)} of {len(lock_addrs)} lock address(es) in tx: {self._log.id(tx_hash)}"
+                    )
+                    return tx_hash, paid
+        return None
+
     def publishBLockTx(
         self,
         kbv: bytes,
@@ -514,19 +601,9 @@ class XMRInterface(CoinInterface):
             Kbv = self.getPubkey(kbv)
             shared_addr: str = xmr_util.encode_address(Kbv, Kbs, self._addr_prefix)
 
-            # Check that the wallet is not already sending to the lock address
-            txns = self.rpc_wallet("get_transfers", {"out": True, "pending": True})
-            for tag in ("pending", "out"):
-                if tag not in txns:
-                    continue
-                for tx in txns[tag]:
-                    for destination in tx.get("destinations", []):
-                        if destination.get("address", None) == shared_addr:
-                            tx_hash: bytes = bytes.fromhex(tx["txid"])
-                            self._log.warning(
-                                f"Already sending to lock address {shared_addr} in tx: {self._log.id(tx_hash)}"
-                            )
-                            return tx_hash
+            in_flight = self.findPendingLockTx({shared_addr})
+            if in_flight is not None:
+                return in_flight[0]
 
             params = {
                 "destinations": [{"amount": output_amount, "address": shared_addr}],
@@ -543,6 +620,53 @@ class XMRInterface(CoinInterface):
             )
             tx_hash: bytes = bytes.fromhex(rv["tx_hash"])
             return tx_hash
+
+    def max_batched_lock_outputs(self) -> int:
+        # Monero caps a tx at 16 outputs (BULLETPROOF_MAX_OUTPUTS); one is change.
+        return 15
+
+    def publishBLockTxs(self, locks, feerate: int = 0, unlock_time: int = 0):
+        """Lock for several swaps at once, so their change is not chained.
+
+        Returns the txid and the indexes of locks it pays.
+        """
+        with self._mx_wallet:
+            self.openWallet(self._wallet_filename)
+            self.rpc_wallet("refresh")
+
+            destinations = [
+                {
+                    "amount": output_amount,
+                    "address": xmr_util.encode_address(
+                        self.getPubkey(kbv), Kbs, self._addr_prefix
+                    ),
+                }
+                for kbv, Kbs, output_amount in locks
+            ]
+            in_flight = self.findPendingLockTx({d["address"] for d in destinations})
+            if in_flight is not None:
+                tx_hash, paid = in_flight
+                covered = [
+                    n for n, d in enumerate(destinations) if d["address"] in paid
+                ]
+                if len(covered) < len(destinations):
+                    self._log.warning(
+                        "In-flight lock tx {} pays {} of {} locks, the rest must send their own.".format(
+                            self._log.id(tx_hash), len(covered), len(destinations)
+                        )
+                    )
+                return tx_hash, covered
+
+            params = {"destinations": destinations, "unlock_time": unlock_time}
+            if self._fee_priority > 0:
+                params["priority"] = self._fee_priority
+            rv = self.rpc_wallet("transfer", params)
+            self._log.info(
+                "publishBLockTxs {} to {} lock addresses".format(
+                    self._log.id(rv["tx_hash"]), len(destinations)
+                )
+            )
+            return bytes.fromhex(rv["tx_hash"]), list(range(len(destinations)))
 
     def findTxB(
         self,
@@ -887,17 +1011,52 @@ class XMRInterface(CoinInterface):
         except Exception as e:  # noqa: F841
             self._wallet_password = orig_password
             raise
+        self._wallet_password = new_password
 
-    def unlockWallet(self, password: str, check_seed: bool = True) -> None:
+    def unlockWallet(
+        self,
+        password: str,
+        check_seed: bool = True,
+        encrypt_if_unencrypted: bool = False,
+    ) -> None:
         self._log.info("unlockWallet - {}".format(self.ticker()))
         self._wallet_password = password
+        if encrypt_if_unencrypted:
+            self.encryptIfUnencrypted(password)
 
         if check_seed and not self._have_checked_seed:
             self._sc.checkWalletSeed(self.coin_type())
 
     def lockWallet(self) -> None:
         self._log.info("lockWallet - {}".format(self.ticker()))
-        self._wallet_password = None
+        with self._mx_wallet:
+            self._wallet_password = None
+            self._cached_main_wallet_address = None
+            try:
+                self.rpc_wallet("close_wallet")
+            except Exception as e:
+                if "No wallet file" not in str(e):
+                    raise
+
+    def encryptIfUnencrypted(self, password: str) -> None:
+        with self._mx_wallet:
+            self._cached_main_wallet_address = None
+            try:
+                self.openWallet(self._wallet_filename)
+                return
+            except Exception as e:
+                if "invalid password" not in str(e).lower():
+                    self._log.warning(
+                        f"Could not open {self.coin_name()} wallet to check its password: {e}"
+                    )
+                    return
+        # Left without a password by a password change that failed partway
+        self._log.warning(f"{self.coin_name()} wallet has no password, setting it.")
+        self._wallet_password = ""
+        try:
+            self.changeWalletPassword("", password)
+        finally:
+            self._wallet_password = password
 
     def isAddressMine(self, address: str) -> bool:
         try:

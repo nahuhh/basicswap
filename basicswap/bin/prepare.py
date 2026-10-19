@@ -44,12 +44,8 @@ from basicswap.bin.run import (
 
 from basicswap.interface.prepare_util import (
     createGPG,
-    ensureFileHashInFile,
-    ensureValidSignatureBy,
     exitWithError,
     PrepareContext,
-    havePubkey,
-    getFileHash,
 )
 from basicswap.interface.btc.core import prepare_module as btc_prepare
 from basicswap.interface.ltc.core import prepare_module as ltc_prepare
@@ -74,6 +70,8 @@ from basicswap.interface.firo.core import prepare_module as firo_prepare
 from basicswap.interface.doge.core import prepare_module as doge_prepare
 from basicswap.interface.nav.core import prepare_module as nav_prepare
 from basicswap.interface.nmc.core import prepare_module as nmc_prepare
+from basicswap.network.nostr.prepare import prepare_module as nostr_prepare
+from basicswap.network.simplex.prepare import prepare_module as simplex_prepare
 
 coin_prepare_modules = {
     "particl": part_prepare,
@@ -163,30 +161,9 @@ disabled_coins = [
     "navcoin",
 ]
 
-# Network clients
-SIMPLEX_CHAT_VERSION = os.getenv("SIMPLEX_CHAT_VERSION", "6.3.5")
-SIMPLEX_WS_PORT = int(os.getenv("SIMPLEX_WS_PORT", 5225))
-SIMPLEX_SERVER_ADDRESS = os.getenv(
-    "SIMPLEX_CHAT_VERSION",
-    "smp://u2dS9sG8nMNURyZwqASV4yROM28Er0luVTx5X1CsMrU=@smp4.simplex.im",
-)
-SIMPLEX_SERVER_SOCKS_PROXY = os.getenv("SIMPLEX_SERVER_SOCKS_PROXY", "127.0.0.1:9150")
-SIMPLEX_GROUP_LINK = os.getenv("SIMPLEX_GROUP_LINK", None)
-
-
-known_networks = ["smsg", "simplex"]
+known_networks = ["smsg", "simplex", "nostr"]
 disabled_networks = []
 
-
-expected_key_ids = {
-    "tecnovert": ("8E517DC12EC1CC37F6423A8A13F13651C9CF0D6B",),
-    "nicolasdorier": (
-        "AB4CFA9895ACA0DBE27F6B346618763EF09186FE",
-        "015B4C837B245509E4AC8995223FDA69DEBEA82D",
-        "7121BDE3555D9BE06BDDC68162FE85647DEDDA2E",
-    ),
-    "SimpleX_Chat": ("FB44AF81A45BDE327319797C85107E357D4A17FC",),
-}
 
 GUIX_SSL_CERT_DIR = None
 OVERRIDE_DISABLED_COINS = toBool(os.getenv("OVERRIDE_DISABLED_COINS", False))
@@ -470,6 +447,24 @@ def importPubkey(gpg, pubkey_filename, pubkeyurls):
             logging.warning(f"Import from url failed: {e}")
 
 
+def addNetworkConfig(
+    network_config_list: list, network_settings: dict, network_defaults: dict = {}
+) -> None:
+    # Merge into an existing entry, keeping settings prepare does not manage.
+    network_type: str = network_settings["type"]
+    for i, network in enumerate(network_config_list):
+        if network.get("type", "unknown") == network_type:
+            if network.get("enabled", True) is True:
+                logger.warning(f"Network {network_type} is already active.")
+            network_config_list[i] = {
+                **network_defaults,
+                **network,
+                **network_settings,
+            }
+            return
+    network_config_list.append({**network_defaults, **network_settings})
+
+
 def testTorConnection():
     test_url = "https://check.torproject.org/"
     logger.info("Testing TOR connection at: " + test_url)
@@ -494,39 +489,42 @@ def testOnionLink():
     logger.info("Onion links work.")
 
 
-def prepareCore(coin, version_data, settings, data_dir, extra_opts={}):
-    version, version_tag, signers = version_data
+def prepareCore(coin, settings, extra_opts={}):
+    prepare_module = coin_prepare_modules.get(coin)
+    if prepare_module is None:
+        raise ValueError("Unknown coin")
+    bin_dir = os.path.expanduser(settings["chainclients"][coin]["bindir"])
+    prepareRelease(prepare_module, bin_dir, extra_opts)
+
+
+def prepareRelease(prepare_module, bin_dir, extra_opts={}):
+    name = prepare_module.name
+    version = prepare_module.version + prepare_module.version_tag
+    signers = prepare_module.signers.keys()
 
     passed: bool = False
     for signer in signers:
         try:
-            tryPrepareCore(
-                coin, version_data, signer, settings, data_dir, extra_opts=extra_opts
-            )
+            tryPrepareRelease(prepare_module, signer, bin_dir, extra_opts=extra_opts)
             passed = True
             break
         except Exception as e:
             if len(signers) < 2:
                 raise
             logger.warning(
-                f"Prepare core failed: {coin} v{version}{version_tag} - Signer: {signer}. Error: {e}"
+                f"Prepare core failed: {name} v{version} - Signer: {signer}. Error: {e}"
             )
     if passed is False:
-        raise RuntimeError(f"Prepare core failed: {coin} v{version}{version_tag}")
+        raise RuntimeError(f"Prepare core failed: {name} v{version}")
 
 
-def tryPrepareCore(coin, version_data, signer, settings, data_dir, extra_opts={}):
-    version, version_tag, signers = version_data
-    logger.info(f"Prepare core: {coin} v{version}{version_tag} - Signer: {signer}")
+def tryPrepareRelease(prepare_module, signing_key_name, bin_dir, extra_opts={}):
+    logger.info(
+        f"Prepare core: {prepare_module.name} v{prepare_module.version}{prepare_module.version_tag} - Signer: {signing_key_name}"
+    )
 
-    bin_dir = os.path.expanduser(settings["chainclients"][coin]["bindir"])
     if not os.path.exists(bin_dir):
         os.makedirs(bin_dir)
-
-    signing_key_name = signer
-    prepare_module = coin_prepare_modules.get(coin)
-    if prepare_module is None:
-        raise ValueError("Unknown coin")
 
     release_path, assert_path, assert_sig_path = prepare_module.downloadCore(
         extra_opts["prepare_ctx"],
@@ -775,7 +773,9 @@ def printHelp():
         "--upgradecores           Upgrade all coin cores present in basicswap.json. Optionally use alongside --withcoin= or --withoutcoin="
     )
     print("--preparebinonly         Don't prepare settings or datadirs.")
-    print("--nocores                Don't download and extract any coin clients.")
+    print(
+        "--nocores                Don't download and extract any coin or network clients."
+    )
     print("--addnetwork             Add network.")
     print("--disablenetwork         Remove network.")
     print("--usecontainers          Expect each core to run in a unique container.")
@@ -887,7 +887,7 @@ def test_particl_encryption(data_dir, settings, chain, use_tor_proxy, extra_opts
                     extra_config=extra_config,
                 )
             )
-            swap_client.setDaemonPID(c, daemons[-1].handle.pid)
+            swap_client.setDaemon(c, daemons[-1])
         swap_client.setCoinRunParams(c)
         swap_client.createCoinInterface(c)
         swap_client.waitForDaemonRPC(c, with_wallet=True)
@@ -982,7 +982,7 @@ def initialise_wallets(
                             extra_config=extra_config,
                         )
                     )
-                swap_client.setDaemonPID(c, daemons[-1].handle.pid)
+                swap_client.setDaemon(c, daemons[-1])
             swap_client.setCoinRunParams(c)
             swap_client.createCoinInterface(c)
 
@@ -1465,7 +1465,13 @@ def main():
 
     # Automatically enable usetorproxy for certain commands if it's set in basicswap config
     if (
-        not (initwalletsonly or enable_tor or disable_tor or disable_coin)
+        not (
+            initwalletsonly
+            or enable_tor
+            or disable_tor
+            or disable_coin
+            or extra_opts.get("disablenetwork")
+        )
         and not use_tor_proxy
         and os.path.exists(config_path)
     ):
@@ -1743,9 +1749,7 @@ def main():
             settings["chainclients"][add_coin] = chainclients[add_coin]
 
             if not no_cores:
-                prepareCore(
-                    add_coin, known_coins[add_coin], settings, data_dir, extra_opts
-                )
+                prepareCore(add_coin, settings, extra_opts)
 
             if not (prepare_bin_only or upgrade_cores):
                 prepareDataDir(
@@ -1794,117 +1798,25 @@ def main():
         if len(network_config_list) < 1:
             network_config_list = [{"type": "smsg", "enabled": True}]
 
-        network_enabled: bool = False
+        network_defaults = {}
         if network_name == "simplex":
-            if SIMPLEX_GROUP_LINK is None:
-                raise ValueError("SIMPLEX_GROUP_LINK must be set.")
-
-            simplex_chat_bin_dir = os.path.join(bin_dir, "simplex")
-            simplex_chat_client_path = os.path.join(
-                simplex_chat_bin_dir, "simplex-chat"
-            )
-            simplex_chat_release_dir = os.path.join(
-                simplex_chat_bin_dir, SIMPLEX_CHAT_VERSION
-            )
-            if not os.path.exists(simplex_chat_release_dir):
-                os.makedirs(simplex_chat_release_dir)
-
-            if USE_PLATFORM == "Linux":
-                simplex_chat_release_file = "simplex-chat-ubuntu-24_04-x86-64"
-            elif USE_PLATFORM == "Darwin":
-                simplex_chat_release_file = "simplex-chat-macos-x86-64"
-            elif USE_PLATFORM == "Windows":
-                simplex_chat_release_file = "simplex-chat-windows-x86-64"
-            else:
-                raise ValueError(f"Unknown platform {USE_PLATFORM}")
-
-            simplex_chat_release_url = f"https://github.com/simplex-chat/simplex-chat/releases/download/v{SIMPLEX_CHAT_VERSION}/{simplex_chat_release_file}"
-            simplex_chat_release_path = os.path.join(
-                simplex_chat_release_dir, simplex_chat_release_file
-            )
-            downloadRelease(
-                simplex_chat_release_url, simplex_chat_release_path, extra_opts
-            )
-
-            assert_filename = "_sha256sums"
-            assert_path = os.path.join(simplex_chat_release_dir, assert_filename)
-            assert_url = f"https://github.com/simplex-chat/simplex-chat/releases/download/v{SIMPLEX_CHAT_VERSION}/_sha256sums"
-            if not os.path.exists(assert_path):
-                downloadFile(assert_url, assert_path)
-
-            release_hash: str = getFileHash(simplex_chat_release_path)
-            logger.info(f"{simplex_chat_release_file} hash: {release_hash}")
-            ensureFileHashInFile(release_hash, assert_path, logger)
-
-            assert_sig_filename = assert_filename + ".asc"
-            assert_sig_url = assert_url + ".asc"
-            assert_sig_path = os.path.join(bin_dir, assert_sig_filename)
-            if not os.path.exists(assert_sig_path):
-                downloadFile(assert_sig_url, assert_sig_path)
-
-            gpg = createGPG(gnupg, extra_opts["prepare_ctx"].gpg_homedir)
-            pubkey_filename = "SimpleX_Chat.pgp"
-            pubkeyurls = []
-            if not havePubkey(gpg, expected_key_ids["SimpleX_Chat"][0]):
-                importPubkey(gpg, pubkey_filename, pubkeyurls)
-            with open(assert_sig_path, "rb") as fp:
-                verified = gpg.verify_file(fp, assert_path)
-            ensureValidSignatureBy(
-                verified, "SimpleX_Chat", expected_key_ids, logger, filepath=assert_path
-            )
-
-            shutil.copyfile(simplex_chat_release_path, simplex_chat_client_path)
-
-            simplex_settings = {
-                "type": "simplex",
-                "server_address": SIMPLEX_SERVER_ADDRESS,
-                "client_path": simplex_chat_client_path,
-                "ws_port": SIMPLEX_WS_PORT,
-                "group_link": SIMPLEX_GROUP_LINK,
-                "enabled": True,
-            }
-            if SIMPLEX_SERVER_SOCKS_PROXY is not None:
-                simplex_settings["socks_proxy_override"] = SIMPLEX_SERVER_SOCKS_PROXY
-
-            found_network: bool = False
-            for network in network_config_list:
-                network_type: str = network.get("type", "unknown")
-                if network_type == "simplex":
-                    found_network = True
-                    if network.get("enabled", False) is True:
-                        logger.warning(f"Network {network_type} is already active.")
-                    network = simplex_settings
-                else:
-                    # TODO: Allow multiple active networks
-                    network["enabled"] = False
-                    logger.info(f"Disabling network {network_type}.")
-            if found_network is False:
-                network_config_list.append(simplex_settings)
+            network_settings = simplex_prepare.getConfigSegment(prepare_ctx)
+            if not no_cores:
+                prepareRelease(
+                    simplex_prepare, simplex_prepare.getBinDir(prepare_ctx), extra_opts
+                )
+        elif network_name == "nostr":
+            network_settings = nostr_prepare.getConfigSegment(prepare_ctx)
+            network_defaults = nostr_prepare.getConfigDefaults()
         elif network_name == "smsg":
-            found_network: bool = False
-            for network in network_config_list:
-                network_type: str = network.get("type", "unknown")
-                if network_type == "smsg":
-                    found_network = True
-                    if network.get("enabled", False) is True:
-                        logger.warning(f"Network {network_type} is already active.")
-                    else:
-                        network["enabled"] = True
-                else:
-                    # TODO: Allow multiple active networks
-                    network["enabled"] = False
-                    logger.info(f"Disabling network {network_type}.")
-            if found_network is False:
-                network_config_list.append({"type": "smsg", "enabled": True})
+            network_settings = {"type": "smsg", "enabled": True}
         else:
             raise ValueError(f"Unknown network {network_name}")
 
+        addNetworkConfig(network_config_list, network_settings, network_defaults)
         settings["networks"] = network_config_list
         save_config(config_path, settings)
-        if network_enabled:
-            logger.info(f"Done. Network {network_name} successfully added.")
-        else:
-            logger.info("Done.")
+        logger.info(f"Done. Network {network_name} successfully added.")
         return 0
 
     if "disablenetwork" in extra_opts:
@@ -1915,6 +1827,26 @@ def main():
         if len(network_config_list) < 1:
             network_config_list = [{"type": "smsg", "enabled": True}]
 
+        found_network: bool = False
+        num_enabled: int = 0
+        for network in network_config_list:
+            if network.get("enabled", True) is True:
+                num_enabled += 1
+        for network in network_config_list:
+            network_type: str = network.get("type", "unknown")
+            if network_type == network_name:
+                found_network = True
+                if network.get("enabled", True) is False:
+                    logger.warning(f"Network {network_type} is already disabled.")
+                elif num_enabled <= 1:
+                    exitWithError("Cannot disable the last enabled network.")
+                else:
+                    network["enabled"] = False
+        if found_network is False:
+            exitWithError(f"Network {network_name} not found in config.")
+
+        settings["networks"] = network_config_list
+        save_config(config_path, settings)
         logger.info(f"Done. Network {network_name} successfully disabled.")
         return 0
 
@@ -1984,7 +1916,7 @@ def main():
             save_config(old_config_path, settings, add_options=False)
 
             for c in with_coins:
-                prepareCore(c, known_coins[c], settings, data_dir, extra_opts)
+                prepareCore(c, settings, extra_opts)
                 current_coin_settings = chainclients[c]
                 current_version = current_coin_settings["core_version_no"]
                 current_version_group = current_coin_settings.get(
@@ -2061,7 +1993,7 @@ def main():
 
     if not no_cores:
         for c in with_coins:
-            prepareCore(c, known_coins[c], settings, data_dir, extra_opts)
+            prepareCore(c, settings, extra_opts)
 
     if prepare_bin_only:
         logger.info("Done.")

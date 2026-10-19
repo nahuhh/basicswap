@@ -238,6 +238,15 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         return 110
 
     @staticmethod
+    def est_tx_input_vsize() -> int:
+        # est_lock_tx_vsize covers one input, each further input adds this.
+        return 68
+
+    @staticmethod
+    def supports_add_inputs() -> bool:
+        return True
+
+    @staticmethod
     def xmr_swap_a_lock_spend_tx_vsize() -> int:
         return 147
 
@@ -499,7 +508,11 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                 self._backend.getBlockHeight()
                 return
             raise ValueError(f"No electrum backend available for {self.coin_name()}")
-        self.rpc_wallet("getwalletinfo" if with_wallet else "getblockchaininfo")
+        # Use a longer timeout than the default: at startup the daemon can be slow
+        # to answer while it loads/rescans the wallet.
+        self.rpc_wallet(
+            "getwalletinfo" if with_wallet else "getblockchaininfo", timeout=30
+        )
 
     def getDaemonVersion(self):
         if self._core_version is None:
@@ -1168,8 +1181,15 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
     def isValidAddress(self, address: str) -> bool:
         if self._connection_type == "electrum":
             try:
-                self.decodeAddress(address)
+                self.getDestForAddress(address)
                 return True
+            except Exception:
+                return False
+
+        # validateaddress accepts every witness version, not only those this coin can pay
+        if self.isSegwitAddress(address):
+            try:
+                self.getDestForAddress(address)
             except Exception:
                 return False
 
@@ -1292,19 +1312,29 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
             )
 
     def isSegwitAddress(self, address: str) -> bool:
-        return address.startswith(self.chainparams_network()["hrp"] + "1")
+        bech32_prefix: str = self.chainparams_network().get("hrp", "")
+        return len(bech32_prefix) > 0 and address.lower().startswith(
+            bech32_prefix + "1"
+        )
+
+    def supportsTaproot(self) -> bool:
+        return True
 
     def decodeAddress(self, address: str) -> bytes:
-        bech32_prefix = self.chainparams_network()["hrp"]
-        if len(bech32_prefix) > 0 and address.startswith(bech32_prefix + "1"):
-            return bytes(segwit_addr.decode(bech32_prefix, address)[1])
+        if self.isSegwitAddress(address):
+            version, program = segwit_addr.decode_segwit_address(
+                self.chainparams_network()["hrp"], address
+            )
+            ensure(program is not None, "Invalid segwit address")
+            ensure(version == 0, f"Not a version 0 segwit address: {address}")
+            return bytes(program)
         return decodeAddress(address)[1:]
 
     def pubkey_to_segwit_address(self, pk: bytes) -> str:
         bech32_prefix = self.chainparams_network()["hrp"]
         version = 0
         pkh = hash160(pk)
-        return segwit_addr.encode(bech32_prefix, version, pkh)
+        return segwit_addr.encode_segwit_address(bech32_prefix, version, pkh)
 
     def encode_secret_extkey(self, ek_data: bytes, prefix=None) -> str:
         ensure(len(ek_data) == 74, "Invalid extkey size")
@@ -1340,16 +1370,23 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         bech32_prefix = self.chainparams_network()["hrp"]
         version = 0
         program = script[2:]  # strip version and length
-        return segwit_addr.encode(bech32_prefix, version, program)
+        return segwit_addr.encode_segwit_address(bech32_prefix, version, program)
 
     def encodeScriptDest(self, script: bytes) -> str:
         return self.encode_p2wsh(script)
 
     def getDestForAddress(self, address: str) -> bytes:
-        bech32_prefix: str | None = self.chainparams_network().get("hrp", None)
-        if bech32_prefix and address.startswith(bech32_prefix + "1"):
-            _, witprog = segwit_addr.decode(bech32_prefix, address)
-            return CScript([OP_0, bytes(witprog)])
+        if self.isSegwitAddress(address):
+            version, witprog = segwit_addr.decode_segwit_address(
+                self.chainparams_network()["hrp"], address
+            )
+            ensure(witprog is not None, "Invalid segwit address")
+            ensure(
+                version == 0
+                or (version == 1 and len(witprog) == 32 and self.supportsTaproot()),
+                f"{self.coin_name()} cannot pay a version {version} segwit address",
+            )
+            return CScript([CScriptOp.encode_op_n(version), bytes(witprog)])
 
         addr_data = decodeAddress(address)
         prefix_byte = addr_data[0]
@@ -1364,6 +1401,21 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
             return CScript([OP_HASH160, addr_hash, OP_EQUAL])
         else:
             return CScript([OP_DUP, OP_HASH160, addr_hash, OP_EQUALVERIFY, OP_CHECKSIG])
+
+    def decodeSwapDest(self, address: str) -> bytes:
+        dest_script: bytes = bytes(self.getDestForAddress(address))
+        if not self.isScriptP2TR(dest_script):
+            pkh: bytes = self.decodeAddress(address)
+            if (
+                len(pkh) == 20
+                and bytes(self.getScriptForPubkeyHash(pkh)) == dest_script
+            ):
+                return pkh
+        ensure(
+            self.isValidTxoDest(dest_script),
+            f"{self.coin_name()} cannot pay a swap to {address}",
+        )
+        return dest_script
 
     def addressToScripthash(self, address: str) -> str:
         script = self.getDestForAddress(address)
@@ -1402,10 +1454,16 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         return toWIF(wif_prefix, key_bytes)
 
     def encodeSegwitAddress(self, key_hash: bytes) -> str:
-        return segwit_addr.encode(self.chainparams_network()["hrp"], 0, key_hash)
+        return segwit_addr.encode_segwit_address(
+            self.chainparams_network()["hrp"], 0, key_hash
+        )
 
     def decodeSegwitAddress(self, addr: str) -> bytes:
-        return bytes(segwit_addr.decode(self.chainparams_network()["hrp"], addr)[1])
+        return bytes(
+            segwit_addr.decode_segwit_address(self.chainparams_network()["hrp"], addr)[
+                1
+            ]
+        )
 
     def decodeKey(self, k: str) -> bytes:
         return decodeWif(k)
@@ -1431,9 +1489,17 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         return tx.serialize()
 
     def fundSCLockTx(
-        self, tx_bytes, feerate, vkbv=None, bid_id: bytes = None, cursor=None
+        self,
+        tx_bytes,
+        feerate,
+        vkbv=None,
+        bid_id: bytes = None,
+        cursor=None,
+        prevouts=None,
     ) -> bytes:
-        funded_tx = self.fundTx(tx_bytes, feerate, bid_id=bid_id, cursor=cursor)
+        funded_tx = self.fundTx(
+            tx_bytes, feerate, bid_id=bid_id, cursor=cursor, prevouts=prevouts
+        )
 
         if self._disable_lock_tx_rbf:
             tx = self.loadTx(funded_tx)
@@ -1501,10 +1567,25 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
             return False
         return True
 
+    def isScriptP2TR(self, script: bytes) -> bool:
+        if len(script) != 34:
+            return False
+        if script[0] != OP_1:
+            return False
+        if script[1] != 32:
+            return False
+        return True
+
     def isValidTxoDest(self, script: bytes) -> bool:
+        if self.isScriptP2PKH(script):
+            return True
+        if self.isScriptP2SH(script):
+            return True
         if self.isScriptP2WPKH(script):
             return True
         if self.isScriptP2WSH(script):
+            return True
+        if self.supportsTaproot() and self.isScriptP2TR(script):
             return True
         return False
 
@@ -2162,6 +2243,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         subfee: bool = False,
         bid_id: bytes = None,
         cursor=None,
+        prevouts=None,
     ) -> bytes:
         if self.useBackend():
             return self._fundTxElectrum(
@@ -2171,6 +2253,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                 subfee=subfee,
                 bid_id=bid_id,
                 cursor=cursor,
+                prevouts=prevouts,
             )
 
         feerate_str = self.format_amount(feerate)
@@ -2180,6 +2263,17 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
             "lockUnspents": lock_unspents,
             "feeRate": feerate_str,
         }
+        if prevouts:
+            tx_obj = self.loadTx(tx, allow_witness=False)
+            for prevout in prevouts:
+                tx_obj.vin.append(
+                    CTxIn(
+                        COutPoint(b2i(bytes.fromhex(prevout["txid"])), prevout["vout"])
+                    )
+                )
+            tx = tx_obj.serialize_without_witness()
+            if self.supports_add_inputs():
+                options["add_inputs"] = False
         if subfee:
             tx_obj = self.loadTx(tx, allow_witness=False)
             num_vouts: int = len(tx_obj.vout)
@@ -2197,6 +2291,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         subfee: bool = False,
         bid_id: bytes = None,
         cursor=None,
+        prevouts=None,
     ) -> bytes:
         wm = self.getWalletManager()
         backend = self.getBackend()
@@ -2235,7 +2330,11 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                             f"_fundTxElectrum: scripthash mismatch for {addr}: "
                             f"stored={sh}, computed={computed_sh}"
                         )
-                if utxo.get("confirmations", 0) < 1 and addr not in internal_addrs:
+                if (
+                    utxo.get("confirmations", 0) < 1
+                    and not prevouts
+                    and addr not in internal_addrs
+                ):
                     unconfirmed_count += 1
                     continue
                 if wm.isUTXOLocked(
@@ -2243,10 +2342,17 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                     utxo.get("txid", ""),
                     utxo.get("vout", 0),
                     cursor=cursor,
+                    bid_id=bid_id,
                 ):
                     locked_count += 1
                     continue
                 utxos.append(utxo)
+
+        if prevouts:
+            wanted = {(p["txid"], p["vout"]) for p in prevouts}
+            utxos = [u for u in utxos if (u["txid"], u["vout"]) in wanted]
+            if len(utxos) < len(wanted):
+                raise ValueError("Preselected inputs are not spendable")
 
         if not utxos:
             if locked_count > 0 or unconfirmed_count > 0:
@@ -2374,6 +2480,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                         utxo.get("txid", ""),
                         utxo.get("vout", 0),
                         cursor=cursor,
+                        bid_id=bid_id,
                     ):
                         raise ValueError(
                             "UTXO reserved by a concurrent operation, retry funding"
@@ -2545,6 +2652,69 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                 self._log.debug("UTXO already locked")
             else:
                 self._log.warning(f"Error locking UTXOs: {e}")
+
+    def splitOutputs(self, values):
+        """Pay each value to a new address of this wallet in one transaction and
+        broadcast it. Returns the outputs it created, which are spendable as
+        preselected inputs before they confirm."""
+        fee_rate, fee_src = self.get_fee_rate(self._conf_target)
+        self._ensureFeeRateWithinMax(fee_rate, fee_src)
+
+        tx = CTransaction()
+        tx.nVersion = self.txVersion()
+        scripts = []
+        for value in values:
+            addr = self.getNewAddress(self._use_segwit, "plan_split")
+            scripts.append(self.getScriptForPubkeyHash(self.decodeAddress(addr)))
+            tx.vout.append(self.txoType()(value, scripts[-1]))
+
+        funded_tx = self.fundTx(tx.serialize(), self.make_int(fee_rate))
+        signed_tx = self.signTxWithWallet(funded_tx)
+        txid: str = self.publishTx(signed_tx)
+        self._log.info(f"Split {len(values)} plan outputs in tx {self._log.id(txid)}")
+
+        outputs, tx_obj = [], self.loadTx(signed_tx)
+        for script in scripts:
+            n = next(
+                i for i, txo in enumerate(tx_obj.vout) if txo.scriptPubKey == script
+            )
+            outputs.append({"txid": txid, "vout": n, "value": tx_obj.vout[n].nValue})
+        return outputs
+
+    def getSpendableOutputs(self):
+        if self.useBackend():
+            wm = self.getWalletManager()
+            backend = self.getBackend()
+            if not wm or not backend:
+                raise ValueError("Electrum backend or WalletManager not available")
+            rv = []
+            addr_to_sh = wm.getSignableAddresses(self.coin_type())
+            for sh_utxos in backend.getBatchUnspent(list(addr_to_sh.values())).values():
+                for utxo in sh_utxos:
+                    if utxo.get("confirmations", 0) < 1:
+                        continue
+                    if wm.isUTXOLocked(
+                        self.coin_type(), utxo.get("txid", ""), utxo.get("vout", 0)
+                    ):
+                        continue
+                    rv.append(
+                        {
+                            "txid": utxo["txid"],
+                            "vout": utxo["vout"],
+                            "value": utxo["value"],
+                        }
+                    )
+            return rv
+
+        return [
+            {
+                "txid": u["txid"],
+                "vout": u["vout"],
+                "value": self.make_int(u["amount"]),
+            }
+            for u in self.rpc_wallet("listunspent", [1])
+            if u.get("spendable", False) and u.get("safe", True)
+        ]
 
     def lockOutput(self, txid_hex: str, vout: int, bid_id=None, cursor=None) -> None:
         if self.useBackend():
@@ -3297,6 +3467,44 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         txid = bytes.fromhex(self.publishTx(b_lock_tx))
         return txid, lock_vout
 
+    def publishBLockTxs(self, locks, feerate: int, unlock_time: int = 0):
+        """Lock several swaps in one transaction, so their change is not chained.
+
+        Returns the txid and the indexes of locks it pays.
+        """
+        tx = CTransaction()
+        tx.nVersion = self.txVersion()
+        for _kbv, Kbs, output_amount in locks:
+            tx.vout.append(self.txoType()(output_amount, self.getPkDest(Kbs)))
+
+        b_lock_tx = self.fundTx(tx.serialize(), feerate)
+        b_lock_tx = self.signTxWithWallet(b_lock_tx)
+        txid = bytes.fromhex(self.publishTx(b_lock_tx))
+        self._log.info(
+            "publishBLockTxs {} to {} lock outputs".format(
+                self._log.id(txid), len(locks)
+            )
+        )
+        return txid, list(range(len(locks)))
+
+    def getHTLCDest(self, script):
+        return (
+            self.getScriptDest(script)
+            if self.using_segwit()
+            else self.get_p2sh_script_pubkey(script)
+        )
+
+    def fundHTLCTxs(self, htlcs, feerate: int) -> bytes:
+        """Lock several HTLCs in one transaction, so their change is not chained.
+        Returned signed but unpublished, so every leg is recorded first."""
+        tx = CTransaction()
+        tx.nVersion = self.txVersion()
+        for script, output_amount in htlcs:
+            tx.vout.append(self.txoType()(output_amount, self.getHTLCDest(script)))
+
+        funded_tx = self.fundTx(tx.serialize(), feerate)
+        return self.signTxWithWallet(funded_tx)
+
     def getTxVSize(self, tx, add_bytes: int = 0, add_witness_bytes: int = 0) -> int:
         wsf = self.witnessScaleFactor()
         len_full = len(tx.serialize_with_witness()) + add_bytes + add_witness_bytes
@@ -3417,7 +3625,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                 )
             spend_value = actual_value
 
-        pkh_to = self.decodeAddress(address_to)
+        dest_script: bytes = self.getDestForAddress(address_to)
 
         tx = CTransaction()
         tx.nVersion = self.txVersion()
@@ -3432,7 +3640,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                 scriptSig=self.getScriptScriptSig(script_lock),
             )
         )
-        tx.vout.append(self.txoType()(spend_value, self.getScriptForPubkeyHash(pkh_to)))
+        tx.vout.append(self.txoType()(spend_value, dest_script))
 
         pay_fee = self.getBLockSpendTxFee(tx, b_fee)
         tx.vout[0].nValue = spend_value - pay_fee
@@ -4069,7 +4277,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                     and out.scriptPubKey[1] == 20
                 ):
                     pkh = bytes(out.scriptPubKey[2:22])
-                    addr = segwit_addr.encode(bech32_prefix, 0, pkh)
+                    addr = segwit_addr.encode_segwit_address(bech32_prefix, 0, pkh)
                     scriptPubKey["address"] = addr
                 elif (
                     len(out.scriptPubKey) == 34
@@ -4077,7 +4285,19 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                     and out.scriptPubKey[1] == 32
                 ):
                     script_hash = bytes(out.scriptPubKey[2:34])
-                    addr = segwit_addr.encode(bech32_prefix, 0, script_hash)
+                    addr = segwit_addr.encode_segwit_address(
+                        bech32_prefix, 0, script_hash
+                    )
+                    scriptPubKey["address"] = addr
+                elif (
+                    len(out.scriptPubKey) == 34
+                    and out.scriptPubKey[0] == OP_1
+                    and out.scriptPubKey[1] == 32
+                    and self.supportsTaproot()
+                ):
+                    addr = segwit_addr.encode_segwit_address(
+                        bech32_prefix, 1, bytes(out.scriptPubKey[2:34])
+                    )
                     scriptPubKey["address"] = addr
             except Exception as e:
                 self._log.debug(
@@ -4811,7 +5031,12 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
             "walletpassphrasechange", [old_password, new_password], timeout=120
         )
 
-    def unlockWallet(self, password: str, check_seed: bool = True) -> None:
+    def unlockWallet(
+        self,
+        password: str,
+        check_seed: bool = True,
+        encrypt_if_unencrypted: bool = False,
+    ) -> None:
         if password == "":
             return
         self._log.info(f"unlockWallet - {self.ticker()}")
@@ -4885,10 +5110,19 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                 self.setWalletSeedWarning(False)
                 check_seed = False
 
+        if encrypt_if_unencrypted:
+            self.encryptIfUnencrypted(password)
         if self.isWalletEncrypted():
             self.rpc_wallet("walletpassphrase", [password, 100000000], timeout=120)
         if check_seed:
             self._sc.checkWalletSeed(self.coin_type())
+
+    def encryptIfUnencrypted(self, password: str) -> None:
+        if self.isWalletEncrypted():
+            return
+        # Left unencrypted by a password change that failed partway
+        self._log.warning(f"{self.coin_name()} wallet is unencrypted, encrypting.")
+        self.changeWalletPassword("", password)
 
     def lockWallet(self):
         self._log.info(f"lockWallet - {self.ticker()}")
@@ -5102,9 +5336,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         # paid to a key derived for the swap has to name a destination instead,
         # or the coin stays on a key the wallet knows nothing about.
         dest_script: bytes = (
-            prevout_script
-            if addr_to is None
-            else self.getScriptForPubkeyHash(self.decodeAddress(addr_to))
+            prevout_script if addr_to is None else self.getDestForAddress(addr_to)
         )
         tx.vout.append(self.txoType()(0, dest_script))
 
@@ -5293,6 +5525,15 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
         except Exception as e:
             self._log.debug(f"_findConfirmedTxnByHashElectrum failed: {e}")
         return None
+
+    def getTxOut(self, txid: bytes, n: int):
+        txout = self.rpc("gettxout", [txid.hex(), n])
+        if txout is None:
+            return None
+        return self.txoType()(
+            self.make_int(txout["value"]),
+            bytes.fromhex(txout["scriptPubKey"]["hex"]),
+        )
 
     def getTxOutInfo(
         self, txid: bytes, n: int, include_mempool: bool = False

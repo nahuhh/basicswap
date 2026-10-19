@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import zmq
 
 
@@ -38,7 +39,6 @@ from .basicswap_util import (
     DebugTypes,
     describeEventEntry,
     EventLogTypes,
-    fiatTicker,
     get_api_key_setting,
     getLastBidState,
     getVoutByAddress,
@@ -84,6 +84,12 @@ from .offer_tracking import (
     strOfferTrackingMode,
     validate_offer_budget,
 )
+from .oracles import (
+    getExchangeName,
+    oracle_fetchers,
+    rate_source_names,
+    rate_sources_ordered,
+)
 from .db_util import remove_expired_data
 from .http_server import HttpThread
 from .rpc import escape_rpcauth
@@ -125,7 +131,6 @@ from .util.network import (
 from .util.smsg import smsgGetID
 from .interface.base import Curves
 from .interface.part.part import PARTInterface, PARTInterfaceAnon, PARTInterfaceBlind
-from .explorers import default_coingecko_api_key
 from .script import OpCodes
 from .messages_npb import (
     ADSBidIntentAcceptMessage,
@@ -150,7 +155,6 @@ from .db import (
     Concepts,
     create_db,
     CURRENT_DB_VERSION,
-    DirectMessageRoute,
     DirectMessageRouteLink,
     EventLog,
     getOrderByStr,
@@ -169,6 +173,13 @@ from .db import (
     XmrSplitData,
     XmrSwap,
 )
+from .multibid import (
+    CONFIRM_INTERVAL_MULTIPLE,
+    MAX_CONFIRM_WAIT_SECONDS,
+    MIN_LEG_TIMEOUT_SECONDS,
+    plan_batch_decision,
+    plan_htlc_batch,
+)
 from .wallet_manager import WalletManager
 
 from .explorers import (
@@ -176,11 +187,19 @@ from .explorers import (
     ExplorerBitAps,
     ExplorerChainz,
 )
-from .network.simplex import (
-    encryptMsg,
-    getJoinedSimplexLink,
-    getResponseData,
+from .network.nostr.nostr import newNostrRouteKey
+from .network.nostr.client import MAX_POW_TARGET_BITS
+from .network.nostr.prepare import prepare_module as nostr_prepare
+from .network.nostr.routes import (
+    prepareNostrMessageRoute,
+    processConnectRequestAck,
+    processNostrConnectRequest,
 )
+from .network.simplex.routes import (
+    prepareSimplexMessageRoute,
+    processSimplexConnectRequest,
+)
+from .network.simplex.simplex import encryptMsg
 from .network.bsx_network import BSXNetwork, networkTypeToID
 from .network.util import getMsgPubkey
 import basicswap.config as cfg
@@ -191,8 +210,10 @@ import basicswap.protocols.xmr_swap_1 as xmr_swap_1
 PROTOCOL_VERSION_SECRET_HASH = 5
 MINPROTO_VERSION_SECRET_HASH = 4
 
-PROTOCOL_VERSION_ADAPTOR_SIG = 6
+PROTOCOL_VERSION_ADAPTOR_SIG = 7
 MINPROTO_VERSION_ADAPTOR_SIG = 6
+# Split messages to a peer at this version or later carry parent_msg_id
+PROTOCOL_VERSION_SPLIT_PARENT = 7
 
 MINPROTO_VERSION = min(MINPROTO_VERSION_SECRET_HASH, MINPROTO_VERSION_ADAPTOR_SIG)
 MAXPROTO_VERSION = 10
@@ -298,6 +319,7 @@ def threadPollXMRChainState(swap_client, coin_type):
             swap_client.log.warning(
                 f"threadPollXMRChainState {ci.ticker()}, error: {e}"
             )
+            swap_client.tryXMRDaemonFailover(coin_type, e)
         swap_client.chainstate_delay_event.wait(
             random.randrange(20, 30)
         )  # Random to stagger updates
@@ -471,6 +493,16 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self.check_delayed_auto_accept_seconds = self.get_int_setting(
             "check_delayed_auto_accept_seconds", 60, 1, 20 * 60
         )
+        self.check_pending_routes_seconds = self.get_int_setting(
+            "check_pending_routes_seconds", 30, 1, 10 * 60
+        )
+        self._connect_req_retry_seconds = self.get_int_setting(
+            "connect_req_retry_seconds", 30, 5, 60 * 60
+        )
+        self._connect_req_max_retry_seconds = 10 * 60
+        self._connect_req_max_attempts = self.get_int_setting(
+            "connect_req_max_attempts", 6, 1, 20
+        )
         if "allowed_hosts" in self.settings:
             self.settings["allowed_hosts"] = normalize_allowed_hosts(
                 self.settings["allowed_hosts"]
@@ -485,6 +517,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self._last_checked_watched = 0
         self._last_checked_split_messages = 0
         self._last_checked_delayed_auto_accept = 0
+        self._last_checked_pending_routes = 0
         self._last_checked_pending_sweeps = 0
         self._pending_sweeps = {}
         self._possibly_revoked_offers = collections.deque([], maxlen=1000)
@@ -551,8 +584,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self._volume_cache = {}
         self._pending_bid_notifications = set()
         self._price_cache_lock = threading.Lock()
-        self._rate_limit_backoff_until = 0
-        self._rate_limit_backoff_step = 1
+        self._rate_limit_backoff = {}
         self._price_fetch_thread = None
         self._price_fetch_running = False
         self._last_price_fetch = 0
@@ -621,12 +653,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self._max_check_loop_blocks = self.settings.get("max_check_loop_blocks", 100000)
         self._force_db_upgrade = self.settings.get("force_db_upgrade", False)
         self._bid_expired_leeway = 5
+        self._plan_leg_timeout = self.get_int_setting(
+            "plan_leg_timeout",
+            10 * 60,
+            MIN_LEG_TIMEOUT_SECONDS,
+            MAX_CONFIRM_WAIT_SECONDS,
+        )
 
         self.swaps_in_progress = dict()
-        self._connect_request_times = []
-        self._max_connect_requests_per_hour = self.settings.get(
-            "max_connect_requests_per_hour", 30
-        )
 
         self.threads = []
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(
@@ -909,7 +943,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             "use_segwit": chain_client_settings.get("use_segwit", default_segwit),
             "use_csv": chain_client_settings.get("use_csv", default_csv),
             "core_version_group": chain_client_settings.get("core_version_group", 0),
-            "pid": None,
+            "daemon": None,
             "core_version": None,
             "explorers": [],
             "chain_lookups": chain_client_settings.get("chain_lookups", "local"),
@@ -1033,55 +1067,89 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 proxy_port = self.tor_proxy_port
         return proxy_host, proxy_port
 
-    def selectXMRRemoteDaemon(self, coin):
-        self.log.info("Selecting remote XMR daemon.")
-        chain_client_settings = self.getChainClientSettings(coin)
-        remote_daemon_urls = chain_client_settings.get("remote_daemon_urls", [])
-
+    def probeXMRDaemon(self, coin, rpchost, rpcport) -> dict:
         coin_settings = self.coin_clients[coin]
-        rpchost: str = coin_settings["rpchost"]
-        rpcport: int = coin_settings["rpcport"]
-        timeout: int = coin_settings["rpctimeout"]
-
-        def get_rpc_func(rpcport, daemon_login, rpchost):
-
-            proxy_host, proxy_port = self.getXMRWalletProxy(coin, rpchost)
-            if proxy_host:
-                self.log.info(f"Connecting through proxy at {proxy_host}.")
-
-            if coin in self.xmr_based_coins:
-                return make_xmr_rpc2_func(
-                    rpcport,
-                    daemon_login,
-                    rpchost,
-                    proxy_host=proxy_host,
-                    proxy_port=proxy_port,
-                )
-
         daemon_login = None
         if coin_settings.get("rpcuser", "") != "":
             daemon_login = (
                 coin_settings.get("rpcuser", ""),
                 coin_settings.get("rpcpassword", ""),
             )
+        proxy_host, proxy_port = self.getXMRWalletProxy(coin, rpchost)
+        if proxy_host:
+            self.log.debug(
+                f"Probing {getCoinName(coin)} daemon through proxy at {proxy_host}."
+            )
+        timeout: int = self.getChainClientSettings(coin).get(
+            "daemon_select_timeout", 10
+        )
+        rpc2 = make_xmr_rpc2_func(
+            int(rpcport),
+            daemon_login,
+            rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+        )
+        start_time = time.time()
+        try:
+            _ = rpc2("get_height", timeout=timeout)["height"]
+            latency_ms = int(round((time.time() - start_time) * 1000))
+            return {"reachable": True, "latency_ms": latency_ms}
+        except Exception as e:
+            self.log.warning(
+                f"{getCoinName(coin)} daemon {rpchost}:{rpcport} unreachable: {e}"
+            )
+            return {"reachable": False, "error": str(e)}
+
+    def isXMRDaemonReachable(self, coin, rpchost, rpcport) -> bool:
+        return self.probeXMRDaemon(coin, rpchost, rpcport)["reachable"]
+
+    @staticmethod
+    def normaliseRemoteDaemonUrls(entries) -> list:
+        # Legacy "host:port" strings normalise to failover-enabled dicts.
+        normalised = []
+        seen = set()
+        for entry in entries or []:
+            if isinstance(entry, str):
+                url = entry.strip()
+                failover = True
+            elif isinstance(entry, dict):
+                url = str(entry.get("url", "")).strip()
+                failover = bool(entry.get("failover", True))
+            else:
+                continue
+            if url == "" or url in seen:
+                continue
+            seen.add(url)
+            normalised.append({"url": url, "failover": failover})
+        return normalised
+
+    def getFailoverDaemonUrls(self, coin) -> list:
+        # URLs of the nodes marked for automatic failover/selection. Nodes kept in
+        # the list with failover disabled are only used for manual selection.
+        nodes = self.normaliseRemoteDaemonUrls(
+            self.getChainClientSettings(coin).get("remote_daemon_urls", [])
+        )
+        return [n["url"] for n in nodes if n["failover"]]
+
+    def selectXMRRemoteDaemon(self, coin):
+        self.log.info("Selecting remote XMR daemon.")
+        failover_urls = self.getFailoverDaemonUrls(coin)
+
+        coin_settings = self.coin_clients[coin]
+        rpchost: str = coin_settings["rpchost"]
+        rpcport: int = coin_settings["rpcport"]
+
         current_daemon_url = f"{rpchost}:{rpcport}"
-        if current_daemon_url in remote_daemon_urls:
+        if current_daemon_url in failover_urls:
             self.log.info(f"Trying last used url {rpchost}:{rpcport}.")
-            try:
-                rpc2 = get_rpc_func(rpcport, daemon_login, rpchost)
-                _ = rpc2("get_height", timeout=timeout)["height"]
+            if self.isXMRDaemonReachable(coin, rpchost, rpcport):
                 return True
-            except Exception as e:
-                self.log.warning(
-                    f"Failed to set XMR remote daemon to {rpchost}:{rpcport}, {e}"
-                )
-        random.shuffle(remote_daemon_urls)
-        for url in remote_daemon_urls:
+        random.shuffle(failover_urls)
+        for url in failover_urls:
             self.log.info(f"Trying url {url}.")
-            try:
-                rpchost, rpcport = url.rsplit(":", 1)
-                rpc2 = get_rpc_func(rpcport, daemon_login, rpchost)
-                _ = rpc2("get_height", timeout=timeout)["height"]
+            rpchost, rpcport = url.rsplit(":", 1)
+            if self.isXMRDaemonReachable(coin, rpchost, rpcport):
                 coin_settings["rpchost"] = rpchost
                 coin_settings["rpcport"] = rpcport
                 data = {
@@ -1090,10 +1158,60 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 }
                 self.editSettings(self.coin_clients[coin]["name"], data)
                 return True
-            except Exception as e:
-                self.log.warning(f"Failed to set XMR remote daemon to {url}, {e}")
 
         raise ValueError("Failed to select a working XMR daemon url.")
+
+    def tryXMRDaemonFailover(self, coin_type, exc) -> bool:
+        # Error-driven failover: switch to another remote_daemon_urls entry via set_daemon.
+        if coin_type not in (Coins.XMR, Coins.WOW):
+            return False
+        if not self.isCoinActive(coin_type):
+            return False
+        chain_client_settings = self.getChainClientSettings(coin_type)
+        if not chain_client_settings.get("automatically_select_daemon", False):
+            return False
+        if len(self.getFailoverDaemonUrls(coin_type)) < 1:
+            return False
+
+        ci = self.ci(coin_type)
+        if not ci.is_transient_error(exc):
+            return False
+        self.log.warning(f"{ci.coin_name()} daemon error, attempting failover: {exc}")
+        try:
+            self.selectXMRRemoteDaemon(coin_type)
+            return True
+        except Exception as e:
+            self.log.error(f"{ci.coin_name()} daemon failover failed: {e}")
+            return False
+
+    def setXMRWalletDaemon(self, coin) -> bool:
+        # set_daemon needs an open wallet; retried a few times for a not-yet-ready node.
+        ci = self.ci(coin)
+        auto_select = self.getChainClientSettings(coin).get(
+            "automatically_select_daemon", False
+        )
+        for i in range(3):
+            try:
+                rpchost = self.coin_clients[coin]["rpchost"]
+                rpcport = self.coin_clients[coin]["rpcport"]
+                # Confirm the daemon answers before set_daemon; fail over if it's down.
+                if auto_select and not self.isXMRDaemonReachable(
+                    coin, rpchost, rpcport
+                ):
+                    self.selectXMRRemoteDaemon(coin)
+                    rpchost = self.coin_clients[coin]["rpchost"]
+                    rpcport = self.coin_clients[coin]["rpcport"]
+                ci.setDaemonAddress(rpchost, rpcport)
+                self.log.debug(
+                    f"set_daemon for {ci.coin_name()} succeeded, daemon set to {rpchost}:{rpcport}"
+                )
+                return True
+            except Exception as e:
+                self.log.warning(
+                    f"set_daemon for {ci.coin_name()} failed (attempt {i + 1}): {e}"
+                )
+                self.delay_event.wait(2)
+        return False
 
     def isCoinActive(self, coin):
         use_coinid = coin
@@ -1298,6 +1416,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             self.log.debug(
                 f"Reading {Coins(coin).name} rpc credentials from auth cookie {authcookiepath}",
             )
+            daemon = cc["daemon"]
+            daemon_pid = None if daemon is None else daemon.handle.pid
             # Wait for daemon to start
             # Test pids to ensure authcookie is read for the correct process
             datadir_pid = -1
@@ -1309,10 +1429,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     else:
                         with open(pidfilepath, "rb") as fp:
                             datadir_pid = int(fp.read().decode("UTF-8"))
-                        ensure(datadir_pid == cc["pid"], "Mismatched pid")
+                        ensure(datadir_pid == daemon_pid, "Mismatched pid")
                     ensure(os.path.exists(authcookiepath), "Missing auth cookie file")
                     break
                 except Exception as e:
+                    if daemon is not None and daemon.handle.poll() is not None:
+                        self.log.error(
+                            f"{daemon.name} exited during startup with code {daemon.handle.returncode}:\n{daemon.readOutput()}"
+                        )
+                        raise ValueError("Error, terminating")
                     if self.debug:
                         self.log.warning(f"Error, iteration {i}: {e}")
                     self.delay_event.wait(0.5)
@@ -1320,7 +1445,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 if (
                     os.name != "nt" or cc["core_version_group"] > 17
                 ):  # Litecoin on windows doesn't write a pid file
-                    ensure(datadir_pid == cc["pid"], "Mismatched pid")
+                    ensure(datadir_pid == daemon_pid, "Mismatched pid")
                 with open(authcookiepath, "rb") as fp:
                     cc["rpcauth"] = escape_rpcauth(fp.read().decode("UTF-8"))
             except Exception as e:
@@ -1329,7 +1454,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     Coins(coin).name,
                     authcookiepath,
                     datadir_pid,
-                    cc["pid"],
+                    daemon_pid,
                     str(e),
                 )
                 raise ValueError("Error, terminating")
@@ -1431,7 +1556,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                         self.log.warning(
                             f"Can't open {ci.coin_name()} wallet, could be locked."
                         )
+                        # Wallet isn't open, so skip set_daemon.
                         continue
+                    self.setXMRWalletDaemon(c)
                 elif c == Coins.LTC:
                     ci_mweb = self.ci(Coins.LTC_MWEB)
                     is_encrypted, _ = self.getLockedState()
@@ -1926,7 +2053,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ] + [c for c in self.activeCoins() if c != Coins.PART]
         if Coins.LTC in coins_list:
             if self.coin_clients[Coins.LTC].get("connection_type") != "electrum":
-                coins_list.append(Coins.LTC_MWEB)
+                coins_list.insert(coins_list.index(Coins.LTC) + 1, Coins.LTC_MWEB)
         return coins_list
 
     def changeWalletPasswords(
@@ -1954,31 +2081,64 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             except Exception as e:  # noqa: F841
                 raise ValueError("Failed to unlock {}".format(ci.coin_name()))
 
-        for c in coins_list:
-            if coin and c != coin:
-                continue
-            self.ci(c).changeWalletPassword(old_password, new_password)
+        changed = []
+        try:
+            for c in coins_list:
+                if coin and c != coin:
+                    continue
+                try:
+                    self.ci(c).changeWalletPassword(old_password, new_password)
+                except Exception as e:
+                    self.log.error(
+                        f"Failed to change password for {getCoinName(c)}: {e}"
+                    )
+                    if old_password != "":
+                        self._revertWalletPasswords(changed, old_password, new_password)
+                    raise
+                changed.append(c)
+        finally:
+            # Update cached state
+            if coin is None or coin == Coins.PART:
+                self._is_encrypted, self._is_locked = self.ci(
+                    Coins.PART
+                ).isWalletEncryptedLocked()
 
-        # Update cached state
-        if coin is None or coin == Coins.PART:
-            self._is_encrypted, self._is_locked = self.ci(
-                Coins.PART
-            ).isWalletEncryptedLocked()
+    def _revertWalletPasswords(
+        self, coins_list, old_password: str, new_password: str
+    ) -> None:
+        for c in reversed(coins_list):
+            try:
+                self.ci(c).changeWalletPassword(new_password, old_password)
+            except Exception as e:
+                self.log.error(
+                    f"Failed to revert password for {getCoinName(c)}, it uses the new password: {e}"
+                )
 
     def unlockWallets(self, password: str, coin=None) -> None:
         try:
             self._read_zmq_queue = False
+            # Set once Particl has verified the password
+            encrypt_if_unencrypted: bool = False
             for c in self.getListOfWalletCoins():
                 if coin and c != coin:
                     continue
                 try:
-                    self.ci(c).unlockWallet(password)
+                    self.ci(c).unlockWallet(
+                        password, encrypt_if_unencrypted=encrypt_if_unencrypted
+                    )
                 except Exception as e:  # noqa: F841
                     self.log.warning(f"Failed to unlock wallet {getCoinName(c)}")
                     raise
+                if c == Coins.PART:
+                    encrypt_if_unencrypted = self.ci(c).isWalletEncrypted()
 
             if coin is None or coin == Coins.PART:
                 self._is_locked = False
+
+            # Encrypted wallets skip the startup set_daemon (locked); send it now.
+            for c in self.activeCoins():
+                if c in (Coins.XMR, Coins.WOW) and (coin is None or coin == c):
+                    self.setXMRWalletDaemon(c)
 
             self.loadFromDB()
 
@@ -2804,7 +2964,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 from basicswap.util.crypto import hash160
                 from basicswap.contrib.test_framework.script import (
                     CScript,
-                    OP_0,
                     SIGHASH_ALL,
                     SegwitV0SignatureHash,
                 )
@@ -2852,20 +3011,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     )
                     tx.vin.append(CTxIn(outpoint, b"", 0xFFFFFFFF))
 
-                from basicswap.contrib import segwit_addr
-                from basicswap.chainparams import chainparams
-
-                coin_params = chainparams.get(coin_type, {})
-                network_params = coin_params.get(
-                    self.chain, coin_params.get("mainnet", {})
-                )
-                hrp = network_params.get("hrp", "bc")
-                witver, witprog = segwit_addr.decode(hrp, rpc_address)
-                if witver is None:
-                    self.log.error(f"Cannot decode address {rpc_address}")
-                    return None
-
-                output_script = CScript([OP_0, bytes(witprog)])
+                output_script = self.ci(coin_type).getDestForAddress(rpc_address)
                 tx.vout.append(CTxOut(send_amount, output_script))
 
                 from basicswap.contrib.test_framework.messages import (
@@ -3606,6 +3752,20 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         # TODO process addresspool if bid has previously been abandoned
 
+    def unlockPlanReservedOutputs(self, bid_id: bytes, coin_type, cursor) -> None:
+        """Release the outputs a plan reserved for one leg. The other unlock
+        paths work from a transaction, and a leg whose bid was never accepted
+        has not built one."""
+        raw_prevouts = self.getStringKV(f"bid_prevouts:{bid_id.hex()}", cursor)
+        if not raw_prevouts:
+            return
+        ci = self.ci(coin_type)
+        for prevout in json.loads(raw_prevouts):
+            try:
+                ci.unlockOutput(prevout["txid"], prevout["vout"], cursor=cursor)
+            except Exception as e:
+                self.log.warning(f"Plan reserved output unlock failed {e}")
+
     def unlockPrefundedTxInputs(self, bid_id: bytes, coin_to, cursor) -> None:
         for tx_type, type_str in (
             (TxTypes.ITX_PRE_FUNDED, "ITx"),
@@ -3704,6 +3864,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 # Check prefunded txns
                 # The prefunded itx should already be unlocked above (a_lock_tx), repeat to catch edge cases
                 self.unlockPrefundedTxInputs(bid.bid_id, offer.coin_to, use_cursor)
+                self.unlockPlanReservedOutputs(bid.bid_id, offer.coin_to, use_cursor)
             elif SwapTypes.SELLER_FIRST:
                 pass  # No prevouts are locked
 
@@ -5893,7 +6054,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
             self.saveBidInSession(bid_id, bid, cursor)
 
-            self.log.info(f"Sent BID {self.log.id(bid_id)}")
+            if bid.state == BidStates.CONNECT_REQ_SENT:
+                self.log.info(
+                    f"BID {self.log.id(bid_id)} waiting for direct message route"
+                )
+            else:
+                self.log.info(f"Sent BID {self.log.id(bid_id)}")
             return bid_id
         finally:
             self.closeDB(cursor)
@@ -5938,6 +6104,103 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             xmr_swap = self.queryOne(XmrSwap, cursor, {"bid_id": bid_id})
             self.loadBidTxns(bid, cursor)
         return bid, xmr_swap
+
+    def getPlanLegs(self, plan_id: bytes, cursor):
+        legs = list(self.query(Bid, cursor, {"plan_id": plan_id}))
+        for leg in legs:
+            self.loadBidTxns(leg, cursor)
+            # Only a retried leg stores a cohort, earlier placements share the plan.
+            raw_cohort = self.getStringKV(f"bid_cohort:{leg.bid_id.hex()}", cursor)
+            leg.cohort = bytes.fromhex(raw_cohort) if raw_cohort else plan_id
+            leg.coin_a_seen = (
+                leg.xmr_a_lock_tx is not None
+                and leg.xmr_a_lock_tx.state
+                in (
+                    TxStates.TX_IN_MEMPOOL,
+                    TxStates.TX_IN_CHAIN,
+                    TxStates.TX_CONFIRMED,
+                )
+            )
+            leg.xmr_swap = self.queryOne(XmrSwap, cursor, {"bid_id": leg.bid_id})
+            leg.is_adaptor = leg.xmr_swap is not None
+            # Only the coin B payer may lock a leg; on a reverse bid that is the receiver.
+            leg_offer = self.queryOne(Offer, cursor, {"offer_id": leg.offer_id})
+            reverse_bid: bool = leg_offer is not None and self.is_reverse_ads_bid(
+                leg_offer.coin_from, leg_offer.coin_to
+            )
+            leg.locks_coin_b = leg_offer is not None and (
+                leg.was_received if reverse_bid else leg.was_sent
+            )
+            leg.lock_remaining_seconds = self.getLegLockRemaining(
+                leg, leg_offer, reverse_bid, cursor
+            )
+        return legs
+
+    def getPlanConfirmTimeout(self, ci_from, ready_timeout: int) -> int:
+        """How long a ready cohort waits for a seen coin A lock to confirm,
+        sized from coin A's own block time."""
+        blocks_target = ci_from.chainparams().get("blocks_target")
+        if blocks_target is None:
+            return ready_timeout
+        expected: int = int(
+            ci_from.blocks_confirmed * blocks_target * CONFIRM_INTERVAL_MULTIPLE
+        )
+        return min(max(expected, ready_timeout), MAX_CONFIRM_WAIT_SECONDS)
+
+    def getLegLockRemaining(self, leg, leg_offer, reverse_bid: bool, cursor):
+        """Seconds left on a ready leg's coin A lock refund timelock, or None
+        when it cannot be determined."""
+        if leg.state != BidStates.XMR_SWAP_SCRIPT_COIN_LOCKED:
+            return None
+        if leg_offer is None or leg_offer.lock_type != TxLockTypes.SEQUENCE_LOCK_TIME:
+            return None
+        if leg.xmr_a_lock_tx is None:
+            return None
+        leg_xmr_offer = self.queryOne(
+            XmrOffer, cursor, {"offer_id": leg_offer.offer_id}
+        )
+        if leg_xmr_offer is None:
+            return None
+        chain_a_ci = self.ci(leg_offer.coin_to if reverse_bid else leg_offer.coin_from)
+        return chain_a_ci.csvLockRemaining(
+            leg_offer.lock_type,
+            leg_xmr_offer.lock_time_1,
+            leg.xmr_a_lock_tx.block_height,
+            leg.xmr_a_lock_tx.block_time,
+        )
+
+    def getCoinALockChainInfo(self, bid, xmr_swap, ci_from):
+        """Live-check the leader's coin A lock tx against the node. Returns the
+        node's view of the tx, None if unseen, and whether that view carries a
+        verified value/index to validate against."""
+        a_lock_tx_addr = ci_from.getSCLockScriptAddress(xmr_swap.a_lock_tx_script)
+        double_check_value: bool = (
+            ci_from.get_connection_type() == "rpc"
+            and ci_from.interface_type() != Coins.PART_BLIND
+        )
+        lock_tx_chain_info = ci_from.getLockTxHeight(
+            bid.xmr_a_lock_tx.txid,
+            a_lock_tx_addr,
+            bid.amount,
+            bid.chain_a_height_start,
+            vout=bid.xmr_a_lock_tx.vout,
+            find_index=double_check_value,
+        )
+        return lock_tx_chain_info, double_check_value
+
+    def coinALockSeen(self, bid, cursor) -> bool:
+        """Whether the leader's coin A lock is on chain or in the mempool right
+        now, checked live rather than from the persisted tx state."""
+        if bid.xmr_a_lock_tx is None or bid.xmr_a_lock_tx.txid is None:
+            return False
+        xmr_swap = self.queryOne(XmrSwap, cursor, {"bid_id": bid.bid_id})
+        offer, _ = self.getXmrOfferFromSession(cursor, bid.offer_id)
+        if xmr_swap is None or offer is None:
+            return False
+        reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
+        ci_from = self.ci(offer.coin_to if reverse_bid else offer.coin_from)
+        lock_tx_chain_info, _ = self.getCoinALockChainInfo(bid, xmr_swap, ci_from)
+        return lock_tx_chain_info is not None
 
     def getXmrBid(self, bid_id: bytes, cursor=None):
         try:
@@ -6256,6 +6519,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         cursor,
         message_nets,
         payload_version,
+        parent_msg_id: bytes = b"",
     ) -> None:
 
         dleag_split_size_init, dleag_split_size = xmr_swap.getMsgSplitInfo()
@@ -6269,6 +6533,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 msg_type=msg_type,
                 sequence=num_sent,
                 dleag=dleag[sent_bytes : sent_bytes + size_to_send],
+                parent_msg_id=parent_msg_id,
             )
             msg_bytes = msg_buf.to_bytes()
             payload_hex = (
@@ -6400,6 +6665,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 cursor,
                 message_nets=bid.message_nets,
                 payload_version=offer.smsg_payload_version,
+                parent_msg_id=(
+                    bid_id
+                    if offer.protocol_version >= PROTOCOL_VERSION_SPLIT_PARENT
+                    else b""
+                ),
             )
         for k, msg_id in bid_msg_ids.items():
             self.addMessageLink(
@@ -6501,7 +6771,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 # )
         else:
             network_id: int = networkTypeToID(message_nets)
-        if network_id not in (MessageNetworks.SIMPLEX,):
+        if network_id not in (MessageNetworks.SIMPLEX, MessageNetworks.NOSTR):
             return None, False
         try:
             net_i = self.getActiveNetworkInterface(network_id)
@@ -6512,64 +6782,28 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             )
             return None, False
 
-        # Look for active route
-        message_route = self.getMessageRoute(1, addr_from, addr_to, cursor=cursor)
-        self.log.debug(f"Using active message route: {message_route}")
-        if message_route:
-            return message_route.record_id, True
+        if network_id == MessageNetworks.NOSTR:
+            return prepareNostrMessageRoute(
+                self,
+                net_i,
+                req_data,
+                addr_from,
+                addr_to,
+                cursor,
+                valid_for_seconds,
+                message_nets,
+            )
 
-        # Look for route being established
-        message_route = self.getMessageRoute(2, addr_from, addr_to, cursor=cursor)
-        self.log.debug(f"Waiting for message route: {message_route}")
-        if message_route:
-            return message_route.record_id, False
-
-        cmd_id = net_i.send_command("/connect")
-        response = net_i.wait_for_command_response(cmd_id)
-        connReqInvitation = getJoinedSimplexLink(response)
-        pccConnId = getResponseData(response, "connection")["pccConnId"]
-        req_data["bsx_address"] = addr_from
-        req_data["connection_req"] = connReqInvitation
-
-        msg_buf = ConnectReqMessage()
-        msg_buf.network_type = MessageNetworks.SIMPLEX
-        msg_buf.network_data = b"bsx"
-        msg_buf.request_type = ConnectionRequestTypes.BID
-        msg_buf.request_data = json.dumps(req_data).encode("UTF-8")
-
-        bid_bytes = msg_buf.to_bytes()
-        payload_hex = str.format("{:02x}", MessageTypes.CONNECT_REQ) + bid_bytes.hex()
-
-        msg_valid: int = max(self.SMSG_SECONDS_IN_HOUR, valid_for_seconds)
-        connect_req_msgid = self.sendMessage(
+        return prepareSimplexMessageRoute(
+            self,
+            net_i,
+            req_data,
             addr_from,
             addr_to,
-            payload_hex,
-            msg_valid,
             cursor,
-            message_nets=message_nets,
+            valid_for_seconds,
+            message_nets,
         )
-
-        now: int = self.getTime()
-        message_route = DirectMessageRoute(
-            active_ind=2,
-            network_id=network_id,
-            linked_type=Concepts.OFFER,
-            smsg_addr_local=addr_from,
-            smsg_addr_remote=addr_to,
-            route_data=json.dumps(
-                {
-                    "connection_req": connReqInvitation,
-                    "connect_req_msgid": connect_req_msgid.hex(),
-                    "pccConnId": pccConnId,
-                }
-            ).encode("UTF-8"),
-            created_at=now,
-        )
-        message_route_id = self.add(message_route, cursor)
-
-        self.log.info(f"Sent CONNECT_REQ {self.logIDB(connect_req_msgid)}")
-        return message_route_id, False
 
     def postXmrBid(
         self, offer_id: bytes, amount: int, addr_send_from: str = None, extra_options={}
@@ -6646,7 +6880,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             fee_rate_to = xmr_offer.b_fee_rate
             estimated_fee: int = fee_rate_to * ci_to.est_lock_tx_vsize() // 1000
 
-            if "prefunded_tx" not in extra_options:
+            # A plan leg's reserved outputs were sized to fund its lock.
+            if (
+                "prefunded_tx" not in extra_options
+                and "reserved_prevouts" not in extra_options
+            ):
                 self.ensureWalletCanSend(
                     ci_to,
                     offer.swap_type,
@@ -6759,7 +6997,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 self.saveBidInSession(xmr_swap.bid_id, bid, cursor, xmr_swap)
                 self.commitDB()
 
-                self.log.info(f"Sent ADS_BID_LF {self.logIDB(xmr_swap.bid_id)}")
+                if bid.state == BidStates.CONNECT_REQ_SENT:
+                    self.log.info(
+                        f"ADS_BID_LF {self.logIDB(xmr_swap.bid_id)} waiting for direct message route"
+                    )
+                else:
+                    self.log.info(f"Sent ADS_BID_LF {self.logIDB(xmr_swap.bid_id)}")
                 return xmr_swap.bid_id
 
             xmr_swap = XmrSwap()
@@ -6928,7 +7171,12 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 )
 
             self.saveBidInSession(bid.bid_id, bid, cursor, xmr_swap)
-            self.log.info(f"Sent XMR_BID_FL {self.logIDB(xmr_swap.bid_id)}")
+            if bid.state == BidStates.CONNECT_REQ_SENT:
+                self.log.info(
+                    f"XMR_BID_FL {self.logIDB(xmr_swap.bid_id)} waiting for direct message route"
+                )
+            else:
+                self.log.info(f"Sent XMR_BID_FL {self.logIDB(xmr_swap.bid_id)}")
             return xmr_swap.bid_id
         finally:
             self.closeDB(cursor)
@@ -6964,6 +7212,19 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             ensure(offer.active_ind == 1, "Offer not active")
 
             reverse_bid: bool = self.is_reverse_ads_bid(offer.coin_from, offer.coin_to)
+            coin_from = Coins(offer.coin_to if reverse_bid else offer.coin_from)
+            coin_to = Coins(offer.coin_from if reverse_bid else offer.coin_to)
+            ci_from = self.ci(coin_from)
+            ci_to = self.ci(coin_to)
+
+            if xmr_swap.accept_prepared_at is not None:
+                self.log.info(
+                    f"Resending the prepared accept for bid {self.log.id(bid_id)}"
+                )
+                return self.sendXmrBidAccept(
+                    bid, xmr_swap, offer, reverse_bid, ci_to, use_cursor
+                )
+
             budget_amount: int = bid.amount_to if reverse_bid else bid.amount
             validate_offer_budget(
                 self,
@@ -6973,11 +7234,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 in_flight=self.getOfferInFlightAmount(offer, use_cursor, bid_id),
             )
             self.validateOfferWalletFloor(offer, budget_amount, use_cursor, bid_id)
-
-            coin_from = Coins(offer.coin_to if reverse_bid else offer.coin_from)
-            coin_to = Coins(offer.coin_from if reverse_bid else offer.coin_to)
-            ci_from = self.ci(coin_from)
-            ci_to = self.ci(coin_to)
 
             a_fee_rate: int = (
                 xmr_offer.b_fee_rate if reverse_bid else xmr_offer.a_fee_rate
@@ -7090,6 +7346,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 )
                 self.log.info(f"Using pre-funded {ci_from.ticker()} tx")
             else:
+                stored_prevouts = self.getStringKV(
+                    f"bid_prevouts:{bid_id.hex()}", use_cursor
+                )
                 xmr_swap.a_lock_tx = ci_from.createSCLockTx(
                     bid.amount, xmr_swap.a_lock_tx_script, xmr_swap.vkbv
                 )
@@ -7099,6 +7358,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     xmr_swap.vkbv,
                     bid_id=bid.bid_id,
                     cursor=use_cursor,
+                    prevouts=json.loads(stored_prevouts) if stored_prevouts else None,
                 )
                 funded_a_lock_tx = xmr_swap.a_lock_tx
 
@@ -7198,15 +7458,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 **refundExtraArgs,
             )
 
-            msg_buf = XmrBidAcceptMessage()
-            msg_buf.bid_msg_id = bid_id
-            msg_buf.pkal = xmr_swap.pkal
-            msg_buf.kbvl = kbvl
-
-            dleag_split_size_init, _ = xmr_swap.getMsgSplitInfo()
             if ci_to.curve_type() == Curves.ed25519:
                 xmr_swap.kbsl_dleag = ci_to.proveDLEAG(kbsl)
-                msg_buf.kbsl_dleag = xmr_swap.kbsl_dleag[:dleag_split_size_init]
             elif ci_to.curve_type() == Curves.secp256k1:
                 xmr_swap.kbsl_dleag = ci_to.signRecoverable(
                     kbsl, "proof kbsl owned for swap"
@@ -7215,71 +7468,19 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     xmr_swap.kbsl_dleag, "proof kbsl owned for swap"
                 )
                 ensure(pk_recovered == xmr_swap.pkbsl, "kbsl recovered pubkey mismatch")
-                msg_buf.kbsl_dleag = xmr_swap.kbsl_dleag
             else:
                 raise ValueError("Unknown curve")
 
-            # MSG2F
-            msg_buf.a_lock_tx = xmr_swap.a_lock_tx
-            msg_buf.a_lock_tx_script = xmr_swap.a_lock_tx_script
-            msg_buf.a_lock_refund_tx = xmr_swap.a_lock_refund_tx
-            msg_buf.a_lock_refund_tx_script = bytes(xmr_swap.a_lock_refund_tx_script)
-            msg_buf.a_lock_refund_spend_tx = xmr_swap.a_lock_refund_spend_tx
-            msg_buf.al_lock_refund_tx_sig = xmr_swap.al_lock_refund_tx_sig
-
-            msg_bytes = msg_buf.to_bytes()
-            payload_hex = (
-                str.format("{:02x}", MessageTypes.XMR_BID_ACCEPT_LF) + msg_bytes.hex()
+            xmr_swap.accept_prepared_at = now
+            self.saveBidInSession(
+                bid_id, bid, use_cursor, xmr_swap=xmr_swap, notify=False
             )
+            self.commitDB()
+            funded_a_lock_tx = None
 
-            addr_from: str = bid.bid_addr if reverse_bid else offer.addr_from
-            addr_to: str = offer.addr_from if reverse_bid else bid.bid_addr
-
-            msg_valid: int = self.getAcceptBidMsgValidTime(bid)
-            bid_msg_ids = {}
-            bid_msg_ids[0] = self.sendMessage(
-                addr_from,
-                addr_to,
-                payload_hex,
-                msg_valid,
-                use_cursor,
-                message_nets=bid.message_nets,
-                payload_version=offer.smsg_payload_version,
+            return self.sendXmrBidAccept(
+                bid, xmr_swap, offer, reverse_bid, ci_to, use_cursor
             )
-
-            if ci_to.curve_type() == Curves.ed25519:
-                self.sendXmrSplitMessages(
-                    XmrSplitMsgTypes.BID_ACCEPT,
-                    addr_from,
-                    addr_to,
-                    xmr_swap,
-                    xmr_swap.kbsl_dleag,
-                    msg_valid,
-                    bid_msg_ids,
-                    use_cursor,
-                    bid.message_nets,
-                    payload_version=offer.smsg_payload_version,
-                )
-
-            with self.dbSavepoint(use_cursor, "accept_xmr_bid"):
-                bid.setState(BidStates.BID_ACCEPTED)  # ADS
-                self.saveBidInSession(
-                    bid_id, bid, use_cursor, xmr_swap=xmr_swap, notify=False
-                )
-                for k, msg_id in bid_msg_ids.items():
-                    self.addMessageLink(
-                        Concepts.BID,
-                        bid_id,
-                        MessageTypes.BID_ACCEPT,
-                        msg_id,
-                        msg_sequence=k,
-                        cursor=use_cursor,
-                    )
-            self.notifyBidChanged(bid_id)
-
-            # Add to swaps_in_progress only when waiting on txns
-            self.log.info(f"Sent XMR_BID_ACCEPT_LF {self.log.id(bid_id)}")
-            return bid_id
         except Exception:
             if funded_a_lock_tx is not None:
                 # a_lock_tx was not saved, nothing else will unlock these
@@ -7291,6 +7492,86 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         finally:
             if cursor is None:
                 self.closeDB(use_cursor)
+
+    def sendXmrBidAccept(
+        self, bid, xmr_swap, offer, reverse_bid: bool, ci_to, cursor
+    ) -> bytes:
+        bid_id: bytes = bid.bid_id
+        msg_buf = XmrBidAcceptMessage()
+        msg_buf.bid_msg_id = bid_id
+        msg_buf.pkal = xmr_swap.pkal
+        msg_buf.kbvl = xmr_swap.vkbvl
+        if ci_to.curve_type() == Curves.ed25519:
+            dleag_split_size_init, _ = xmr_swap.getMsgSplitInfo()
+            msg_buf.kbsl_dleag = xmr_swap.kbsl_dleag[:dleag_split_size_init]
+        else:
+            msg_buf.kbsl_dleag = xmr_swap.kbsl_dleag
+
+        # MSG2F
+        msg_buf.a_lock_tx = xmr_swap.a_lock_tx
+        msg_buf.a_lock_tx_script = xmr_swap.a_lock_tx_script
+        msg_buf.a_lock_refund_tx = xmr_swap.a_lock_refund_tx
+        msg_buf.a_lock_refund_tx_script = bytes(xmr_swap.a_lock_refund_tx_script)
+        msg_buf.a_lock_refund_spend_tx = xmr_swap.a_lock_refund_spend_tx
+        msg_buf.al_lock_refund_tx_sig = xmr_swap.al_lock_refund_tx_sig
+
+        msg_bytes = msg_buf.to_bytes()
+        payload_hex = (
+            str.format("{:02x}", MessageTypes.XMR_BID_ACCEPT_LF) + msg_bytes.hex()
+        )
+
+        addr_from: str = bid.bid_addr if reverse_bid else offer.addr_from
+        addr_to: str = offer.addr_from if reverse_bid else bid.bid_addr
+
+        msg_valid: int = self.getAcceptBidMsgValidTime(bid)
+        bid_msg_ids = {}
+        bid_msg_ids[0] = self.sendMessage(
+            addr_from,
+            addr_to,
+            payload_hex,
+            msg_valid,
+            cursor,
+            message_nets=bid.message_nets,
+            payload_version=offer.smsg_payload_version,
+        )
+
+        if ci_to.curve_type() == Curves.ed25519:
+            self.sendXmrSplitMessages(
+                XmrSplitMsgTypes.BID_ACCEPT,
+                addr_from,
+                addr_to,
+                xmr_swap,
+                xmr_swap.kbsl_dleag,
+                msg_valid,
+                bid_msg_ids,
+                cursor,
+                bid.message_nets,
+                payload_version=offer.smsg_payload_version,
+                parent_msg_id=(
+                    bid_msg_ids[0]
+                    if (offer if reverse_bid else bid).protocol_version
+                    >= PROTOCOL_VERSION_SPLIT_PARENT
+                    else b""
+                ),
+            )
+
+        with self.dbSavepoint(cursor, "accept_xmr_bid"):
+            bid.setState(BidStates.BID_ACCEPTED)  # ADS
+            self.saveBidInSession(bid_id, bid, cursor, xmr_swap=xmr_swap, notify=False)
+            for k, msg_id in bid_msg_ids.items():
+                self.addMessageLink(
+                    Concepts.BID,
+                    bid_id,
+                    MessageTypes.BID_ACCEPT,
+                    msg_id,
+                    msg_sequence=k,
+                    cursor=cursor,
+                )
+        self.notifyBidChanged(bid_id)
+
+        # Add to swaps_in_progress only when waiting on txns
+        self.log.info(f"Sent XMR_BID_ACCEPT_LF {self.log.id(bid_id)}")
+        return bid_id
 
     def acceptADSReverseBid(self, bid_id: bytes, cursor=None) -> None:
         self.log.info(f"Accepting reverse adaptor-sig bid {self.log.id(bid_id)}")
@@ -7320,6 +7601,19 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             ensure(offer.expire_at > now, "Offer has expired")
             ensure(offer.active_ind == 1, "Offer not active")
 
+            # Bid is reversed
+            coin_from = Coins(offer.coin_to)
+            coin_to = Coins(offer.coin_from)
+            ci_from = self.ci(coin_from)
+            ci_to = self.ci(coin_to)
+
+            if xmr_swap.intent_accept_prepared_at is not None:
+                self.log.info(
+                    f"Resending the prepared accept for bid {self.log.id(bid_id)}"
+                )
+                self.sendADSBidIntentAccept(bid, xmr_swap, offer, ci_to, use_cursor)
+                return
+
             validate_offer_budget(
                 self,
                 offer,
@@ -7329,12 +7623,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             )
             self.validateOfferWalletFloor(offer, bid.amount_to, use_cursor, bid_id)
 
-            # Bid is reversed
-            coin_from = Coins(offer.coin_to)
-            coin_to = Coins(offer.coin_from)
-            ci_from = self.ci(coin_from)
-            ci_to = self.ci(coin_to)
-
             # TODO: Better tx size estimate
             fee_rate, fee_src = self.getFeeRateForCoin(coin_to, conf_target=2)
             fee_rate_from = ci_to.make_int(fee_rate)
@@ -7342,7 +7630,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             self.ensureWalletCanSend(
                 ci_to,
                 offer.swap_type,
-                offer.amount_from,
+                bid.amount_to,
                 estimated_fee,
                 for_offer=False,
             )
@@ -7394,67 +7682,82 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             xmr_swap_1.setDLEAG(xmr_swap, ci_to, kbsf)
             ensure(xmr_swap.pkasf == ci_from.getPubkey(kbsf), "pkasf != kbsf")
 
-            dleag_split_size_init, _ = xmr_swap.getMsgSplitInfo()
-            msg_buf = ADSBidIntentAcceptMessage()
-            msg_buf.bid_msg_id = bid_id
-            msg_buf.dest_af = xmr_swap.dest_af
-            msg_buf.pkaf = xmr_swap.pkaf
-            msg_buf.kbvf = kbvf
-            msg_buf.kbsf_dleag = (
-                xmr_swap.kbsf_dleag
-                if len(xmr_swap.kbsf_dleag) < dleag_split_size_init
-                else xmr_swap.kbsf_dleag[:dleag_split_size_init]
+            xmr_swap.intent_accept_prepared_at = now
+            self.saveBidInSession(
+                bid_id, bid, use_cursor, xmr_swap=xmr_swap, notify=False
             )
+            self.commitDB()
 
-            bid_bytes = msg_buf.to_bytes()
-            payload_hex = (
-                str.format("{:02x}", MessageTypes.ADS_BID_ACCEPT_FL) + bid_bytes.hex()
-            )
-
-            addr_from: str = offer.addr_from
-            addr_to: str = bid.bid_addr
-            msg_valid: int = self.getAcceptBidMsgValidTime(bid)
-            bid_msg_ids = {}
-            bid_msg_ids[0] = self.sendMessage(
-                addr_from,
-                addr_to,
-                payload_hex,
-                msg_valid,
-                use_cursor,
-                message_nets=bid.message_nets,
-                payload_version=offer.smsg_payload_version,
-            )
-
-            if ci_to.curve_type() == Curves.ed25519:
-                self.sendXmrSplitMessages(
-                    XmrSplitMsgTypes.BID,
-                    addr_from,
-                    addr_to,
-                    xmr_swap,
-                    xmr_swap.kbsf_dleag,
-                    msg_valid,
-                    bid_msg_ids,
-                    use_cursor,
-                    message_nets=bid.message_nets,
-                    payload_version=offer.smsg_payload_version,
-                )
-
-            bid.setState(BidStates.BID_REQUEST_ACCEPTED)
-
-            for k, msg_id in bid_msg_ids.items():
-                self.addMessageLink(
-                    Concepts.BID,
-                    bid_id,
-                    MessageTypes.ADS_BID_ACCEPT_FL,
-                    msg_id,
-                    msg_sequence=k,
-                    cursor=use_cursor,
-                )
-            self.log.info(f"Sent ADS_BID_ACCEPT_FL {self.logIDM(bid_msg_ids[0])}")
-            self.saveBidInSession(bid_id, bid, use_cursor, xmr_swap=xmr_swap)
+            self.sendADSBidIntentAccept(bid, xmr_swap, offer, ci_to, use_cursor)
         finally:
             if cursor is None:
                 self.closeDB(use_cursor)
+
+    def sendADSBidIntentAccept(self, bid, xmr_swap, offer, ci_to, cursor) -> None:
+        bid_id: bytes = bid.bid_id
+        dleag_split_size_init, _ = xmr_swap.getMsgSplitInfo()
+        msg_buf = ADSBidIntentAcceptMessage()
+        msg_buf.bid_msg_id = bid_id
+        msg_buf.dest_af = xmr_swap.dest_af
+        msg_buf.pkaf = xmr_swap.pkaf
+        msg_buf.kbvf = xmr_swap.vkbvf
+        msg_buf.kbsf_dleag = (
+            xmr_swap.kbsf_dleag
+            if len(xmr_swap.kbsf_dleag) < dleag_split_size_init
+            else xmr_swap.kbsf_dleag[:dleag_split_size_init]
+        )
+
+        bid_bytes = msg_buf.to_bytes()
+        payload_hex = (
+            str.format("{:02x}", MessageTypes.ADS_BID_ACCEPT_FL) + bid_bytes.hex()
+        )
+
+        addr_from: str = offer.addr_from
+        addr_to: str = bid.bid_addr
+        msg_valid: int = self.getAcceptBidMsgValidTime(bid)
+        bid_msg_ids = {}
+        bid_msg_ids[0] = self.sendMessage(
+            addr_from,
+            addr_to,
+            payload_hex,
+            msg_valid,
+            cursor,
+            message_nets=bid.message_nets,
+            payload_version=offer.smsg_payload_version,
+        )
+
+        if ci_to.curve_type() == Curves.ed25519:
+            self.sendXmrSplitMessages(
+                XmrSplitMsgTypes.BID,
+                addr_from,
+                addr_to,
+                xmr_swap,
+                xmr_swap.kbsf_dleag,
+                msg_valid,
+                bid_msg_ids,
+                cursor,
+                message_nets=bid.message_nets,
+                payload_version=offer.smsg_payload_version,
+                parent_msg_id=(
+                    bid_msg_ids[0]
+                    if bid.protocol_version >= PROTOCOL_VERSION_SPLIT_PARENT
+                    else b""
+                ),
+            )
+
+        bid.setState(BidStates.BID_REQUEST_ACCEPTED)
+
+        for k, msg_id in bid_msg_ids.items():
+            self.addMessageLink(
+                Concepts.BID,
+                bid_id,
+                MessageTypes.ADS_BID_ACCEPT_FL,
+                msg_id,
+                msg_sequence=k,
+                cursor=cursor,
+            )
+        self.log.info(f"Sent ADS_BID_ACCEPT_FL {self.logIDM(bid_msg_ids[0])}")
+        self.saveBidInSession(bid_id, bid, cursor, xmr_swap=xmr_swap)
 
     def deactivateBidForReason(self, bid_id: bytes, new_state, cursor=None) -> None:
         try:
@@ -7642,6 +7945,144 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             addr_to = ci.encode_p2sh(participate_script)
 
         txn_signed = ci.createRawSignedTransaction(addr_to, amount_to)
+        self.recordParticipateTxn(bid_id, bid, offer, participate_script, txn_signed)
+
+        return txn_signed
+
+    def getPlanHTLCLegs(self, plan_id: bytes, cursor):
+        """Plan legs whose participate txn we owe, tagged with what the batch
+        decision reads: whether each has sent one, whether its initiate txn has
+        been seen, and how long its contract has left. Readiness itself is
+        decided from the bid state."""
+        legs = list(self.query(Bid, cursor, {"plan_id": plan_id}))
+        for leg in legs:
+            self.loadBidTxns(leg, cursor)
+            raw_cohort = self.getStringKV(f"bid_cohort:{leg.bid_id.hex()}", cursor)
+            leg.cohort = bytes.fromhex(raw_cohort) if raw_cohort else plan_id
+            leg.sends_ptx = leg.was_sent
+            leg.ptx_sent = (
+                leg.participate_tx is not None and leg.participate_tx.txid is not None
+            )
+            leg.itx_seen = leg.initiate_tx is not None and leg.initiate_tx.state in (
+                TxStates.TX_IN_MEMPOOL,
+                TxStates.TX_IN_CHAIN,
+                TxStates.TX_CONFIRMED,
+            )
+            leg_offer = self.queryOne(Offer, cursor, {"offer_id": leg.offer_id})
+            leg.lock_value = leg_offer.lock_value if leg_offer else 0
+            leg.lock_remaining_seconds = self.getITxLockRemaining(
+                leg, leg_offer, cursor
+            )
+        return legs
+
+    def getITxLockRemaining(self, leg, leg_offer, cursor):
+        """Seconds left on a leg's initiate txn refund timelock, or None when it
+        cannot be determined."""
+        if leg_offer is None or leg_offer.lock_type != TxLockTypes.SEQUENCE_LOCK_TIME:
+            return None
+        if leg.initiate_tx is None or leg.initiate_tx.block_height is None:
+            return None
+        ci_from = self.ci(leg_offer.coin_from)
+        # csvLockRemaining decodes a sequence, it is not given a lock value.
+        return ci_from.csvLockRemaining(
+            leg_offer.lock_type,
+            ci_from.getExpectedSequence(leg_offer.lock_type, leg_offer.lock_value),
+            leg.initiate_tx.block_height,
+            leg.initiate_tx.block_time,
+        )
+
+    def sendPlanParticipateTx(self, bid_id: bytes, cursor) -> None:
+        """Send this leg's participate txn together with every sibling leg of the
+        same plan that is also waiting to send one, as a single transaction."""
+        bid, offer = self.getBidAndOffer(bid_id, cursor)
+        ensure(bid, f"Bid not found: {self.log.id(bid_id)}.")
+        ensure(offer, f"Offer not found: {self.log.id(bid.offer_id)}.")
+
+        if bid.participate_tx is not None and bid.participate_tx.txid is not None:
+            self.log.warning(
+                f"Participate tx {self.log.id(bid.participate_tx.txid)} exists for bid {self.log.id(bid_id)}."
+            )
+            return
+
+        ci_to = self.ci(offer.coin_to)
+        participate_script = self.deriveParticipateScript(bid_id, bid, offer)
+
+        ready_timeout: int = self._plan_leg_timeout
+        stored_timeout = self.getStringKV(
+            f"plan_leg_timeout:{bid.plan_id.hex()}", cursor
+        )
+        if stored_timeout:
+            ready_timeout = int(stored_timeout)
+
+        plan = plan_htlc_batch(
+            self.getPlanHTLCLegs(bid.plan_id, cursor),
+            bid_id,
+            cap=ci_to.max_batched_lock_outputs(),
+            now=self.getTime(),
+            ready_timeout=ready_timeout,
+            confirm_timeout=self.getPlanConfirmTimeout(
+                self.ci(offer.coin_from), ready_timeout
+            ),
+        )
+        if plan.wait:
+            self.log.info(
+                f"Holding the participate tx for bid {self.log.id(bid_id)}, the rest of its cohort is not ready yet."
+            )
+            self.createActionInSession(
+                self.get_delay_event_seconds(),
+                ActionTypes.SEND_PARTICIPATE_TX,
+                bid_id,
+                cursor,
+            )
+            return
+
+        legs = []
+        for leg in plan.batch:
+            leg_offer = self.queryOne(Offer, cursor, {"offer_id": leg.offer_id})
+            if leg_offer is None or leg_offer.coin_to != offer.coin_to:
+                continue
+            legs.append(
+                (
+                    leg,
+                    leg_offer,
+                    self.deriveParticipateScript(leg.bid_id, leg, leg_offer),
+                )
+            )
+
+        htlcs = [(participate_script, bid.amount_to)] + [
+            (script, leg.amount_to) for leg, _, script in legs
+        ]
+        fee_rate, fee_src = ci_to.get_fee_rate(ci_to._conf_target)
+        ci_to._ensureFeeRateWithinMax(fee_rate, fee_src)
+        txn_signed: str = ci_to.fundHTLCTxs(htlcs, ci_to.make_int(fee_rate)).hex()
+
+        self.recordParticipateTxn(bid_id, bid, offer, participate_script, txn_signed)
+        for leg, leg_offer, script in legs:
+            self.recordParticipateTxn(leg.bid_id, leg, leg_offer, script, txn_signed)
+
+        txid = ci_to.publishTx(bytes.fromhex(txn_signed))
+        self.log.debug(
+            f"Submitted participate tx {self.logIDT(txid)} to {ci_to.coin_name()} chain for {len(htlcs)} plan legs"
+        )
+
+        bid.setPTxState(TxStates.TX_SENT)
+        self.saveBidInSession(bid_id, bid, cursor, save_in_progress=offer)
+        for leg, leg_offer, script in legs:
+            leg.setPTxState(TxStates.TX_SENT)
+            self.saveBidInSession(leg.bid_id, leg, cursor, save_in_progress=leg_offer)
+
+        for leg_bid_id in [bid_id] + [leg.bid_id for leg, _, _ in legs]:
+            self.logEvent(
+                Concepts.BID, leg_bid_id, EventLogTypes.PTX_PUBLISHED, "", cursor
+            )
+
+    def recordParticipateTxn(
+        self, bid_id: bytes, bid, offer, participate_script: bytearray, txn_signed: str
+    ) -> None:
+        """Attach a leg's output of a participate txn to its bid. The txn may
+        carry an output per leg, so the vout is found by this leg's script."""
+        coin_to = Coins(offer.coin_to)
+        ci = self.ci(coin_to)
 
         refund_txn = self.createRefundTxn(
             coin_to,
@@ -7655,17 +8096,16 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         chain_height = ci.getChainHeight()
         txjs = ci.decodeRawTransaction(txn_signed)
-        txid = txjs["txid"]
 
         if ci.using_segwit():
-            vout = getVoutByScriptPubKey(txjs, p2wsh.hex())
+            vout = getVoutByScriptPubKey(
+                txjs, ci.getScriptDest(participate_script).hex()
+            )
         else:
-            vout = getVoutByAddress(txjs, addr_to)
-        self.addParticipateTxn(bid_id, bid, coin_to, txid, vout, chain_height)
+            vout = getVoutByAddress(txjs, ci.encode_p2sh(participate_script))
+        self.addParticipateTxn(bid_id, bid, coin_to, txjs["txid"], vout, chain_height)
         bid.participate_tx.script = participate_script
         bid.participate_tx.tx_data = bytes.fromhex(txn_signed)
-
-        return txn_signed
 
     def createRedeemTxn(
         self,
@@ -8005,16 +8445,26 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         # Seller first mode, buyer participates
         participate_script = self.deriveParticipateScript(bid_id, bid, offer)
         if bid.was_sent:
+            ci_to = self.ci(offer.coin_to)
             if bid.participate_tx is not None:
-                self.log.warning(
-                    f"Participate tx {self.log.id(bid.participate_tx.txid)} already exists for bid {self.log.id(bid_id)}"
+                # A plan leg holds a script-only tx until its queued action sends it.
+                if bid.participate_tx.txid is not None:
+                    self.log.warning(
+                        f"Participate tx {self.log.id(bid.participate_tx.txid)} already exists for bid {self.log.id(bid_id)}"
+                    )
+            elif bid.plan_id and hasattr(ci_to, "fundHTLCTxs"):
+                bid.participate_tx = SwapTx(
+                    bid_id=bid_id,
+                    tx_type=TxTypes.PTX,
+                    script=participate_script,
                 )
+                delay = self.get_delay_event_seconds()
+                self.createAction(delay, ActionTypes.SEND_PARTICIPATE_TX, bid_id)
             else:
                 self.log.debug(
                     f"Preparing participate txn for bid {self.log.id(bid_id)}"
                 )
 
-                ci_to = self.ci(offer.coin_to)
                 txn = self.createParticipateTxn(bid_id, bid, offer, participate_script)
                 txid = ci_to.publishTx(bytes.fromhex(txn))
                 self.log.debug(
@@ -8741,9 +9191,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
                 # TODO: Timeout waiting for transactions
                 bid_changed: bool = False
-                a_lock_tx_addr = ci_from.getSCLockScriptAddress(
-                    xmr_swap.a_lock_tx_script
-                )
                 # Lock TX A should have been verified already
                 if (
                     bid.xmr_a_lock_tx is None
@@ -8753,18 +9200,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 ):
                     raise ValueError("Lock TX A details missing.")
 
-                double_check_value: bool = True
-                if ci_from.get_connection_type() != "rpc":
-                    double_check_value = False
-                if ci_from.interface_type() == Coins.PART_BLIND:
-                    double_check_value = False
-                lock_tx_chain_info = ci_from.getLockTxHeight(
-                    bid.xmr_a_lock_tx.txid,
-                    a_lock_tx_addr,
-                    bid.amount,
-                    bid.chain_a_height_start,
-                    vout=bid.xmr_a_lock_tx.vout,
-                    find_index=double_check_value,
+                lock_tx_chain_info, double_check_value = self.getCoinALockChainInfo(
+                    bid, xmr_swap, ci_from
                 )
                 if lock_tx_chain_info is None:
                     return rv
@@ -10685,7 +11122,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                             t, block_hash, block["height"], chain_blocks
                         )
 
-                for s in c["watched_scripts"]:
+                for s in list(c["watched_scripts"]):
                     for i, txo in enumerate(tx["vout"]):
                         if "scriptPubKey" in txo and "hex" in txo["scriptPubKey"]:
                             # TODO: Optimise by loading rawtx in CTransaction
@@ -10696,7 +11133,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                                 )
                                 self.processFoundScript(coin_type, s, txid_bytes, i)
 
-                for o in c["watched_outputs"]:
+                for o in list(c["watched_outputs"]):
                     for i, inp in enumerate(tx["vin"]):
                         inp_txid = inp.get("txid", None)
                         if inp_txid is None:  # Coinbase
@@ -10888,77 +11325,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         chain_blocks = results.get("chain_blocks", 0)
         if chain_blocks > 0:
             c["last_height_checked"] = chain_blocks
-
-    def expireMessageRoutes(self) -> None:
-        if self._is_locked is True:
-            self.log.debug("Not expiring message routes while system is locked")
-            return
-
-        num_removed: int = 0
-        now: int = self.getTime()
-        cursor = self.openDB()
-        try:
-            query_str = (
-                "SELECT record_id, network_id, created_at, active_ind, route_data FROM direct_message_routes "
-                + "WHERE 1 = 1 "
-            )
-            rows = cursor.execute(query_str).fetchall()
-            for row in rows:
-                record_id, network_id, created_at, active_ind, route_data = row
-
-                route_data = json.loads(route_data.decode("UTF-8"))
-
-                if now - created_at < self._expire_message_routes_after:
-                    continue
-
-                # unestablished routes
-                if active_ind == 2:
-                    pass
-                else:
-                    query_str = (
-                        "SELECT MAX(created_at) FROM direct_message_route_links "
-                        + "WHERE direct_message_route_id = :message_route_id "
-                    )
-                    max_link_created_at = cursor.execute(
-                        query_str, {"message_route_id": record_id}
-                    ).fetchone()[0]
-
-                    if now - max_link_created_at < self._expire_message_routes_after:
-                        continue
-
-                    query_str = (
-                        "SELECT COUNT(*) FROM direct_message_route_links rl "
-                        + "INNER JOIN bids b ON b.bid_id = rl.linked_id "
-                        + "INNER JOIN bidstates s ON s.state_id = b.state "
-                        + "WHERE rl.direct_message_route_id = :message_route_id AND rl.linked_type = :link_type_bid "
-                        + "AND (b.in_progress OR s.in_progress OR (s.swap_ended = 0 AND b.expire_at > :now))"
-                    )
-                    num_active_bids = cursor.execute(
-                        query_str,
-                        {
-                            "message_route_id": record_id,
-                            "link_type_bid": Concepts.BID,
-                            "now": now,
-                        },
-                    ).fetchone()[0]
-                    if num_active_bids > 0:
-                        self.log.warning(
-                            f"Not expiring message route {record_id} with {num_active_bids} active bids."
-                        )
-                        continue
-
-                self.closeMessageRoute(record_id, network_id, route_data, cursor)
-                num_removed += 1
-        finally:
-            self.closeDB(cursor)
-
-        if num_removed > 0:
-            self.log.info(
-                "Expired {} message route{}.".format(
-                    num_removed,
-                    "s" if num_removed != 1 else "",
-                )
-            )
 
     def expireMessages(self) -> None:
         if self._is_locked is True:
@@ -11152,6 +11518,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                         self.sendXmrBidCoinALockTx(linked_id, cursor)
                     elif action_type == ActionTypes.SEND_XMR_SWAP_LOCK_TX_B:
                         self.sendXmrBidCoinBLockTx(linked_id, cursor)
+                    elif action_type == ActionTypes.SEND_PARTICIPATE_TX:
+                        self.sendPlanParticipateTx(linked_id, cursor)
                     elif action_type == ActionTypes.SEND_XMR_LOCK_RELEASE:
                         self.sendXmrBidLockRelease(linked_id, cursor)
                     elif action_type == ActionTypes.REDEEM_XMR_SWAP_LOCK_TX_A:
@@ -11263,13 +11631,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             )
             for bid in q_bids:
                 q = cursor.execute(
-                    "SELECT LENGTH(kbsl_dleag), LENGTH(kbsf_dleag) FROM xmr_swaps WHERE bid_id = :bid_id",
+                    "SELECT LENGTH(kbsl_dleag), LENGTH(kbsf_dleag), split_parent_msg_id FROM xmr_swaps WHERE bid_id = :bid_id",
                     {
                         "bid_id": bid.bid_id,
                     },
                 ).fetchone()
                 kbsl_dleag_len: int = q[0]
                 kbsf_dleag_len: int = q[1]
+                split_parent_msg_id = q[2]
 
                 q = cursor.execute(
                     "SELECT addr_from FROM offers WHERE offer_id = :offer_id",
@@ -11291,12 +11660,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 q = cursor.execute(
                     "SELECT COUNT(*), SUM(LENGTH(dleag)) AS total_dleag_size FROM xmr_split_data "
                     + " WHERE bid_id = :bid_id AND msg_type = :msg_type "
-                    + " AND ((addr_from = :bid_addr AND addr_to = :offer_addr) OR (addr_from = :offer_addr AND addr_to = :bid_addr))",
+                    + " AND ((addr_from = :bid_addr AND addr_to = :offer_addr) OR (addr_from = :offer_addr AND addr_to = :bid_addr))"
+                    + " AND (:parent_msg_id IS NULL OR parent_msg_id IS NULL OR parent_msg_id = :parent_msg_id)",
                     {
                         "bid_id": bid.bid_id,
                         "msg_type": msg_type,
                         "bid_addr": bid.bid_addr,
                         "offer_addr": offer_addr_from,
+                        "parent_msg_id": split_parent_msg_id,
                     },
                 ).fetchone()
                 total_dleag_size += 0 if q[1] is None else q[1]
@@ -11920,11 +12291,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             return
         conn_id = msg["conn_id"]
         query_str = (
-            "SELECT record_id, network_id, route_data FROM direct_message_routes"
+            "SELECT record_id, network_id, route_data FROM direct_message_routes "
+            + "WHERE network_id = :network_id"
         )
         try:
             use_cursor = self.openDB(cursor)
-            rows = use_cursor.execute(query_str).fetchall()
+            rows = use_cursor.execute(
+                query_str, {"network_id": int(MessageNetworks.SIMPLEX)}
+            ).fetchall()
 
             for row in rows:
                 record_id, network_id, route_data = row
@@ -12253,6 +12627,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     {"msg_sequence": "asc"},
                 )
                 for row in q:
+                    if not self.splitDataBelongs(row, xmr_swap):
+                        continue
                     xmr_swap.kbsf_dleag += row.dleag
 
             if not ci_to.verifyDLEAG(xmr_swap.kbsf_dleag):
@@ -12335,6 +12711,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     order_by={"msg_sequence": "asc"},
                 )
                 for row in q:
+                    if not self.splitDataBelongs(row, xmr_swap):
+                        continue
                     xmr_swap.kbsl_dleag += row.dleag
             if not ci_to.verifyDLEAG(xmr_swap.kbsl_dleag):
                 raise ValueError("Invalid DLEAG proof.")
@@ -12505,6 +12883,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             bid.pk_bid_addr = pk_from
             bid.was_received = True
 
+        xmr_swap.split_parent_msg_id = bid_id
         bid.setState(BidStates.BID_RECEIVING)
 
         self.log.info(
@@ -12567,6 +12946,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             BidStates.BID_SENT,
             BidStates.BID_RECEIVED,
             BidStates.BID_REQUEST_ACCEPTED,
+            BidStates.BID_RECEIVING_ACC,
         ]
         if bid.was_sent and offer.was_sent:
             allowed_states.append(
@@ -12576,6 +12956,40 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             bid.state in allowed_states,
             f"Invalid state for bid {bid.state}, {strBidState(bid.state)}",
         )
+
+        replace_unlinked: bool = False
+        if bid.state == BidStates.BID_RECEIVING_ACC:
+            current_id: bytes = xmr_swap.split_parent_msg_id
+            if current_id is None:
+                self.log.info(
+                    f"Ignoring an adaptor-sig bid accept for bid {self.log.id(bid.bid_id)}, the one being received was stored without its message id."
+                )
+                return
+            current_sent: int = int.from_bytes(current_id[:8], byteorder="big")
+            if current_id == bytes.fromhex(msg["msgid"]):
+                self.log.info(
+                    f"Ignoring a repeat adaptor-sig bid accept for bid {self.log.id(bid.bid_id)}."
+                )
+                return
+            if msg["sent"] < current_sent:
+                self.log.info(
+                    f"Ignoring an adaptor-sig bid accept for bid {self.log.id(bid.bid_id)} sent before the one being received."
+                )
+                return
+            linked: bool = (
+                min(offer.protocol_version, bid.protocol_version)
+                >= PROTOCOL_VERSION_SPLIT_PARENT
+            )
+            # Unlinked parts are told apart by send time alone
+            if not linked and msg["sent"] == current_sent:
+                self.log.info(
+                    f"Ignoring an adaptor-sig bid accept for bid {self.log.id(bid.bid_id)} sent in the same second as the one being received."
+                )
+                return
+            replace_unlinked = not linked
+            self.log.info(
+                f"Replacing the adaptor-sig bid accept for bid {self.log.id(bid.bid_id)} with a later one."
+            )
 
         try:
             pkal: bytes = msg_data.pkal
@@ -12714,6 +13128,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             xmr_swap.vkbv = vkbv
             xmr_swap.pkbvl = pkbvl
             xmr_swap.kbsl_dleag = kbsl_dleag
+            xmr_swap.split_parent_msg_id = bytes.fromhex(msg["msgid"])
             xmr_swap.a_lock_tx = a_lock_tx
             xmr_swap.a_lock_tx_id = a_lock_tx_id
             xmr_swap.a_lock_tx_vout = a_lock_tx_vout
@@ -12740,7 +13155,21 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             xmr_swap.al_lock_refund_tx_sig = al_lock_refund_tx_sig
 
             bid.setState(BidStates.BID_RECEIVING_ACC)
-            self.saveBid(bid.bid_id, bid, xmr_swap=xmr_swap)
+            cursor = self.openDB()
+            try:
+                if replace_unlinked:
+                    cursor.execute(
+                        "DELETE FROM xmr_split_data WHERE bid_id = :bid_id AND msg_type = :msg_type AND addr_from = :addr_from AND parent_msg_id IS NULL AND created_at < :sent",
+                        {
+                            "bid_id": bid.bid_id,
+                            "msg_type": int(XmrSplitMsgTypes.BID_ACCEPT),
+                            "addr_from": addr_from,
+                            "sent": msg["sent"],
+                        },
+                    )
+                self.saveBid(bid.bid_id, bid, xmr_swap=xmr_swap, cursor=cursor)
+            finally:
+                self.closeDB(cursor)
 
             if ci_to.curve_type() != Curves.ed25519:
                 try:
@@ -12932,6 +13361,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             bid.setState(BidStates.XMR_SWAP_MSG_SCRIPT_LOCK_TX_SIGS)
             self.watchXmrSwap(bid, offer, xmr_swap, cursor)
             self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
+        except TemporaryError:
+            # Nothing is persisted before the send, leave the queued action to retry
+            raise
         except Exception as e:  # noqa: F841
             if self.debug:
                 self.log.error(traceback.format_exc())
@@ -13088,6 +13520,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
 
+    def setBidBLockTx(self, bid, xmr_swap, b_lock_tx_id: bytes, cursor, vout=None):
+        bid.xmr_b_lock_tx = SwapTx(
+            bid_id=bid.bid_id,
+            tx_type=TxTypes.XMR_SWAP_B_LOCK,
+            txid=b_lock_tx_id,
+            vout=vout,
+        )
+        bid.xmr_b_lock_tx.setState(TxStates.TX_SENT)
+        xmr_swap.b_lock_tx_id = b_lock_tx_id
+        self.logBidEvent(bid.bid_id, EventLogTypes.LOCK_TX_B_PUBLISHED, "", cursor)
+
     def sendXmrBidCoinBLockTx(self, bid_id: bytes, cursor) -> None:
         # Follower sending coin B lock tx
         self.log.debug(
@@ -13113,7 +13556,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         if bid.xmr_b_lock_tx:
             self.log.warning(
-                f"Coin B lock tx {self.log.id(bid.xmr_b_lock_tx.b_lock_tx_id)} exists for adaptor-sig bid {self.log.id(bid_id)}."
+                f"Coin B lock tx {self.log.id(bid.xmr_b_lock_tx.txid)} exists for adaptor-sig bid {self.log.id(bid_id)}."
             )
             return
 
@@ -13165,8 +13608,71 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             cursor=cursor,
         )
 
+        batch = []
+        if bid.plan_id and prefunded_tx is None and hasattr(ci_to, "publishBLockTxs"):
+            ready_timeout = self._plan_leg_timeout
+            stored_timeout = self.getStringKV(
+                f"plan_leg_timeout:{bid.plan_id.hex()}", cursor
+            )
+            if stored_timeout:
+                ready_timeout = int(stored_timeout)
+
+            ci_from = self.ci(offer.coin_to if reverse_bid else offer.coin_from)
+            plan = plan_batch_decision(
+                self.getPlanLegs(bid.plan_id, cursor),
+                bid_id,
+                cap=ci_to.max_batched_lock_outputs(),
+                now=self.getTime(),
+                ready_timeout=ready_timeout,
+                confirm_timeout=self.getPlanConfirmTimeout(ci_from, ready_timeout),
+                lock_margin=max(
+                    self._sc_lock_release_min_margin, self._sc_lock_spend_min_margin
+                ),
+            )
+            for leg in plan.drop:
+                leg_bid, _ = self.getXmrBidFromSession(cursor, leg.bid_id)
+                # The persisted seen flag can lag the lock landing.
+                if leg_bid is None or self.coinALockSeen(leg_bid, cursor):
+                    continue
+                self.log.info(
+                    f"Abandoning plan leg {self.log.id(leg.bid_id)}, coin A lock unseen while a ready leg waited {ready_timeout} seconds."
+                )
+                self.deactivateBidForReason(
+                    leg.bid_id, BidStates.BID_ABANDONED, cursor=cursor
+                )
+            if plan.wait:
+                delay = self.get_delay_event_seconds()
+                self.log.info(
+                    f"Holding the coin B lock for bid {self.log.id(bid_id)}, the rest of its cohort is not locked yet."
+                )
+                self.createActionInSession(
+                    delay, ActionTypes.SEND_XMR_SWAP_LOCK_TX_B, bid_id, cursor
+                )
+                return
+            batch = plan.batch
+
+        leg_swaps = []
+        for leg in batch:
+            if (
+                self.getPreFundedTx(
+                    Concepts.BID, leg.bid_id, TxTypes.PTX_PRE_FUNDED, cursor=cursor
+                )
+                is not None
+            ):
+                continue
+            leg_offer, _ = self.getXmrOfferFromSession(cursor, leg.offer_id)
+            leg_sent: bool = leg.was_received if reverse_bid else leg.was_sent
+            # A leg whose lock is already on chain must not be paid a second time.
+            if self.findTxB(ci_to, leg.xmr_swap, leg, cursor, leg_sent) is True:
+                self.saveBidInSession(
+                    leg.bid_id, leg, cursor, leg.xmr_swap, save_in_progress=leg_offer
+                )
+                continue
+            leg_swaps.append((leg, leg.xmr_swap, leg_offer))
+
         try:
             b_lock_vout = None
+            covered = None
             if prefunded_tx:
                 self.log.info("Using pre-funded tx")
                 pi = self.pi(offer.swap_type)
@@ -13178,6 +13684,16 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 )
                 b_lock_tx = ci_to.signTxWithWallet(b_lock_tx)
                 b_lock_tx_id = bytes.fromhex(ci_to.publishTx(b_lock_tx))
+            elif leg_swaps:
+                b_lock_tx_id, covered = ci_to.publishBLockTxs(
+                    [(xmr_swap.vkbv, xmr_swap.pkbs, bid.amount_to)]
+                    + [
+                        (leg_swap.vkbv, leg_swap.pkbs, leg.amount_to)
+                        for leg, leg_swap, _ in leg_swaps
+                    ],
+                    b_fee_rate,
+                    unlock_time=unlock_time,
+                )
             else:
                 result = ci_to.publishBLockTx(
                     xmr_swap.vkbv,
@@ -13243,15 +13759,40 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         self.log.debug(
             f"Submitted lock txn {self.logIDT(b_lock_tx_id)} to {ci_to.coin_name()} chain for bid {self.log.id(bid_id)}."
         )
-        bid.xmr_b_lock_tx = SwapTx(
-            bid_id=bid_id,
-            tx_type=TxTypes.XMR_SWAP_B_LOCK,
-            txid=b_lock_tx_id,
-            vout=b_lock_vout,
-        )
-        xmr_swap.b_lock_tx_id = b_lock_tx_id
-        bid.xmr_b_lock_tx.setState(TxStates.TX_SENT)
-        self.logBidEvent(bid.bid_id, EventLogTypes.LOCK_TX_B_PUBLISHED, "", cursor)
+        # An unrecorded lock is re-queued by checkXmrBidState.
+        if covered is None:
+            stamp_bid: bool = True
+            stamp_legs = leg_swaps
+        else:
+            stamp_bid = 0 in covered
+            stamp_legs = [
+                leg_swap
+                for n, leg_swap in enumerate(leg_swaps, start=1)
+                if n in covered
+            ]
+            if not stamp_bid or len(stamp_legs) < len(leg_swaps):
+                self.log.warning(
+                    f"Lock tx {self.log.id(b_lock_tx_id)} pays {len(covered)} of {len(leg_swaps) + 1} planned locks for bid {self.log.id(bid_id)}, the rest will lock separately."
+                )
+
+        for leg, leg_swap, leg_offer in stamp_legs:
+            # The in-progress copy must be replaced or the leg re-queues its lock.
+            self.setBidBLockTx(leg, leg_swap, b_lock_tx_id, cursor)
+            self.saveBidInSession(
+                leg.bid_id, leg, cursor, leg_swap, save_in_progress=leg_offer
+            )
+
+        if not stamp_bid:
+            delay = self.get_delay_retry_seconds()
+            self.log.info(
+                f"Retrying the coin B lock for bid {self.log.id(bid_id)} in {delay} seconds, the in-flight tx does not pay it."
+            )
+            self.createActionInSession(
+                delay, ActionTypes.SEND_XMR_SWAP_LOCK_TX_B, bid_id, cursor
+            )
+            return
+
+        self.setBidBLockTx(bid, xmr_swap, b_lock_tx_id, cursor, vout=b_lock_vout)
         if bid.debug_ind == DebugTypes.BID_STOP_AFTER_COIN_B_LOCK:
             self.log.debug(
                 f"Adaptor-sig bid {self.log.id(bid_id)}: Stalling bid for testing: {bid.debug_ind}."
@@ -14200,6 +14741,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         # Update copy of bid in swaps_in_progress
         self.swaps_in_progress[bid_id] = (bid, offer)
 
+    def splitDataBelongs(self, row, xmr_swap) -> bool:
+        # Chunks from a peer before PROTOCOL_VERSION_SPLIT_PARENT carry no parent
+        return (
+            xmr_swap.split_parent_msg_id is None
+            or row.parent_msg_id is None
+            or row.parent_msg_id == xmr_swap.split_parent_msg_id
+        )
+
     def processXmrSplitMessage(self, msg) -> None:
         self.log.debug("Processing xmr split msg {}".format(self.log.id(msg["msgid"])))
         now: int = self.getTime()
@@ -14209,11 +14758,16 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         # Validate data
         ensure(len(msg_data.msg_id) == 28, "Bad msg_id length")
+        parent_msg_id = msg_data.parent_msg_id or None
+        ensure(
+            parent_msg_id is None or len(parent_msg_id) == 28,
+            "Bad parent_msg_id length",
+        )
         self.log.debug(f"for bid {self.log.id(msg_data.msg_id)}")
 
         max_dleag_proof_len: int = 48893  # coincurve.dleag.dleag_proof_len()
         network_type: str = msg.get("msg_net", "smsg")
-        if network_type == "simplex":
+        if network_type in ("simplex", "nostr"):
             max_data_size: int = 11000
             min_data_size: int = 9000
         else:
@@ -14237,21 +14791,29 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ):
             cursor = self.openDB()
             try:
+                chunk_key = {
+                    "bid_id": msg_data.msg_id,
+                    "msg_type": msg_data.msg_type,
+                    "msg_sequence": msg_data.sequence,
+                    "addr_from": msg["from"],
+                    "parent_msg_id": parent_msg_id,
+                }
                 q = cursor.execute(
-                    "SELECT COUNT(*) FROM xmr_split_data WHERE bid_id = :bid_id AND msg_type = :msg_type AND msg_sequence = :msg_sequence AND addr_from = :addr_from",
-                    {
-                        "bid_id": msg_data.msg_id,
-                        "msg_type": msg_data.msg_type,
-                        "msg_sequence": msg_data.sequence,
-                        "addr_from": msg["from"],
-                    },
+                    "SELECT COUNT(*), MAX(created_at) FROM xmr_split_data WHERE bid_id = :bid_id AND msg_type = :msg_type AND msg_sequence = :msg_sequence AND addr_from = :addr_from AND parent_msg_id IS :parent_msg_id",
+                    chunk_key,
                 ).fetchone()
                 num_exists = q[0]
                 if num_exists > 0:
-                    self.log.warning(
-                        f"Ignoring duplicate xmr_split_data entry: ({self.logIDM(msg_data.msg_id)}, {msg_data.msg_type}, {msg_data.sequence})."
+                    # Unlinked parts are stored at their send time, and a later one replaces
+                    if parent_msg_id is not None or q[1] >= msg["sent"]:
+                        self.log.warning(
+                            f"Ignoring duplicate xmr_split_data entry: ({self.logIDM(msg_data.msg_id)}, {msg_data.msg_type}, {msg_data.sequence})."
+                        )
+                        return
+                    cursor.execute(
+                        "DELETE FROM xmr_split_data WHERE bid_id = :bid_id AND msg_type = :msg_type AND msg_sequence = :msg_sequence AND addr_from = :addr_from AND parent_msg_id IS NULL",
+                        chunk_key,
                     )
-                    return
 
                 dbr = XmrSplitData()
                 dbr.addr_from = msg["from"]
@@ -14260,7 +14822,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 dbr.msg_type = msg_data.msg_type
                 dbr.msg_sequence = msg_data.sequence
                 dbr.dleag = msg_data.dleag
-                dbr.created_at = now
+                dbr.parent_msg_id = parent_msg_id
+                dbr.created_at = now if parent_msg_id else msg["sent"]
                 self.add(dbr, cursor, upsert=True)
             finally:
                 self.closeDB(cursor)
@@ -14560,6 +15123,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         xmr_swap.vkbvf = msg_data.kbvf
         xmr_swap.pkbvf = ci_to.getPubkey(msg_data.kbvf)
         xmr_swap.kbsf_dleag = msg_data.kbsf_dleag
+        xmr_swap.split_parent_msg_id = bytes.fromhex(msg["msgid"])
 
         bid.chain_a_height_start: int = ci_from.getChainHeight()
         bid.chain_b_height_start: int = ci_to.getChainHeight()
@@ -14596,10 +15160,19 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         req_data = json.loads(msg_data.request_data)
 
+        if msg_data.request_type == ConnectionRequestTypes.ACK:
+            processConnectRequestAck(self, msg, msg_data, req_data)
+            return
+
         offer_id = bytes.fromhex(req_data["offer_id"])
         bidder_addr = req_data["bsx_address"]
 
-        net_i = self.getActiveNetworkInterface(MessageNetworks.SIMPLEX)
+        network_id: int = int(msg_data.network_type)
+        ensure(
+            network_id in (MessageNetworks.SIMPLEX, MessageNetworks.NOSTR),
+            f"Unsupported connect request network: {network_id}",
+        )
+        net_i = self.getActiveNetworkInterface(network_id)
         try:
             cursor = self.openDB()
             offer = self.getOffer(offer_id, cursor)
@@ -14608,129 +15181,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             ensure(msg["from"] == bidder_addr, "Mismatched from address")
             ensure(msg["to"] == offer.addr_from, "Mismatched to address")
 
-            self.log.debug(
-                f"Opening direct message route from {offer.addr_from} to {bidder_addr}"
-            )
-            message_route = self.getMessageRoute(
-                2, bidder_addr, offer.addr_from, cursor=cursor
-            )
-            if message_route:
-                raise ValueError("Direct message route already exists")
-
-            connReqInvitation = req_data["connection_req"]
-            ensure(
-                isinstance(connReqInvitation, str), "Invalid connection request type"
-            )
-            ensure(
-                0 < len(connReqInvitation) <= 4096, "Invalid connection request length"
-            )
-            ensure(
-                all(33 <= ord(c) <= 126 for c in connReqInvitation),
-                "Invalid characters in connection request",
-            )
-
-            now_rl: int = self.getTime()
-            self._connect_request_times = [
-                t for t in self._connect_request_times if now_rl - t < 3600
-            ]
-            ensure(
-                len(self._connect_request_times) < self._max_connect_requests_per_hour,
-                "Connection request rate limit exceeded",
-            )
-            self._connect_request_times.append(now_rl)
-
-            cmd_id = net_i.send_command(f"/connect {connReqInvitation}")
-            response = net_i.wait_for_command_response(cmd_id)
-            pccConnId = getResponseData(response, "connection")["pccConnId"]
-
-            now: int = self.getTime()
-            message_route = DirectMessageRoute(
-                active_ind=2,
-                network_id=2,
-                linked_type=Concepts.OFFER,
-                smsg_addr_local=offer.addr_from,
-                smsg_addr_remote=bidder_addr,
-                route_data=json.dumps(
-                    {"connection_req": connReqInvitation, "pccConnId": pccConnId}
-                ).encode("UTF-8"),
-                created_at=now,
-            )
-            message_route_id = self.add(message_route, cursor)
-
-            message_route_link = DirectMessageRouteLink(
-                active_ind=1,
-                direct_message_route_id=message_route_id,
-                linked_type=Concepts.OFFER,
-                linked_id=offer_id,
-                created_at=now,
-            )
-            self.add(message_route_link, cursor)
-
-        finally:
-            self.closeDB(cursor)
-
-    def processContactConnected(self, event_data) -> None:
-        contact_data = getResponseData(event_data, "contact")
-        connId = contact_data["activeConn"]["connId"]
-        localDisplayName = contact_data["localDisplayName"]
-        self.log.debug(
-            f"Processing Contact Connected event, ID: {connId}, contact name: {localDisplayName}."
-        )
-
-        try:
-            cursor = self.openDB()
-
-            query_str = (
-                "SELECT record_id, network_id, smsg_addr_local, smsg_addr_remote, route_data FROM direct_message_routes "
-                + "WHERE active_ind = 2"
-            )
-            rows = cursor.execute(query_str).fetchall()
-
-            found_direct_message_route = None
-            for row in rows:
-                record_id, network_id, smsg_addr_local, smsg_addr_remote, route_data = (
-                    row
-                )
-                route_data = json.loads(route_data.decode("UTF-8"))
-
-                if connId == route_data["pccConnId"]:
-                    self.log.debug(
-                        f"Direct message route established local: {smsg_addr_local}, remote: {smsg_addr_remote}."
-                    )
-                    # route_data["localDisplayName"] = localDisplayName
-
-                    cursor.execute(query_str)
-                    # query = "UPDATE direct_message_routes SET active_ind = 1, route_data = :route_data WHERE record_id = :record_id "
-                    query = "UPDATE direct_message_routes SET active_ind = 1 WHERE record_id = :record_id "
-                    cursor.execute(query, {"record_id": record_id})
-                    found_direct_message_route = record_id
-                    break
-
-            if found_direct_message_route:
-                query_str = (
-                    "SELECT record_id, linked_type, linked_id FROM direct_message_route_links "
-                    + "WHERE active_ind = 1 AND direct_message_route_id = :route_id"
-                )
-                rows = cursor.execute(
-                    query_str, {"route_id": found_direct_message_route}
-                ).fetchall()
-                for row in rows:
-                    record_id, linked_type, linked_id = row
-
-                    if linked_type == Concepts.BID:
-                        self.routeEstablishedForBid(linked_id, cursor)
-                        query = "UPDATE direct_message_route_links SET active_ind = 2 WHERE record_id = :record_id "
-                        cursor.execute(query, {"record_id": record_id})
-                    elif linked_type == Concepts.OFFER:
-                        pass
-                    else:
-                        self.log.warning(
-                            f"Unknown direct_message_route_link type: {linked_type}, {self.log.id(linked_id)}."
-                        )
+            if network_id == MessageNetworks.NOSTR:
+                processNostrConnectRequest(self, net_i, msg, req_data, offer, cursor)
             else:
-                self.log.warning(
-                    f"Unknown direct message route connected, connId: {connId}"
-                )
+                processSimplexConnectRequest(self, net_i, req_data, offer, cursor)
         finally:
             self.closeDB(cursor)
 
@@ -14740,6 +15194,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         bid, offer = self.getBidAndOffer(bid_id, cursor)
         ensure(bid, f"Bid not found: {self.log.id(bid_id)}.")
         ensure(offer, f"Offer not found: {self.log.id(bid.offer_id)}.")
+
+        if bid.state != BidStates.CONNECT_REQ_SENT:
+            self.log.debug(
+                f"Bid {self.log.id(bid_id)} is not waiting for a route, state {BidStates(bid.state).name}."
+            )
+            return
+        if bid.expire_at <= self.getTime():
+            self.log.info(f"Not sending expired bid {self.log.id(bid_id)}.")
+            return
 
         coin_from = Coins(offer.coin_from)
         coin_to = Coins(offer.coin_to)
@@ -14777,8 +15240,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             network_type: str = msg.get("msg_net", "smsg")
             if network_type == "smsg":
                 self.num_smsg_messages_received += 1
-            elif network_type == "simplex":
-                pass  # Counted earlier, split between group and direct
+            elif network_type in ("simplex", "nostr"):
+                pass  # Counted when parsed
             else:
                 self.log.warning(f"processMsg unknown network: {network_type}")
             msg_type: int = int(msg["hex"][:2], 16)
@@ -14944,6 +15407,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     coin_rows = cursor.execute(query, {"bid_id": bid_id}).fetchall()
                     if len(coin_rows) > 0:
                         self.unlockPrefundedTxInputs(
+                            bid_id, Coins(coin_rows[0][0]), cursor
+                        )
+                        self.unlockPlanReservedOutputs(
                             bid_id, Coins(coin_rows[0][0]), cursor
                         )
             for offer_id in offers_to_expire:
@@ -15145,6 +15611,13 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 self._last_checked_actions = now
 
             if (
+                now - self._last_checked_pending_routes
+                >= self.check_pending_routes_seconds
+            ):
+                self.checkPendingMessageRoutes()
+                self._last_checked_pending_routes = now
+
+            if (
                 now - self._last_checked_split_messages
                 >= self.check_split_messages_seconds
             ):
@@ -15340,6 +15813,16 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                             settings_copy.pop("coingecko_api_key")
                         settings_changed = True
 
+            if "coingecko_api_plan" in data:
+                new_value = data["coingecko_api_plan"]
+                ensure(
+                    new_value in ("demo", "pro"),
+                    "New coingecko_api_plan value not demo or pro",
+                )
+                if settings_copy.get("coingecko_api_plan", "demo") != new_value:
+                    settings_copy["coingecko_api_plan"] = new_value
+                    settings_changed = True
+
             if "enabled_chart_coins" in data:
                 new_value = data["enabled_chart_coins"].strip()
                 ensure(
@@ -15360,6 +15843,16 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                         seen_tickers.append(upcased_ticker)
                 if settings_copy.get("enabled_chart_coins", "") != new_value:
                     settings_copy["enabled_chart_coins"] = new_value
+                    settings_changed = True
+
+            if "rate_sources" in data:
+                new_value = data["rate_sources"]
+                ensure(isinstance(new_value, dict), "New rate_sources value not a dict")
+                for k, v in new_value.items():
+                    ensure(k in rate_sources_ordered, f"Unknown rate source {k}")
+                    ensure(isinstance(v, bool), f"Rate source {k} value not boolean")
+                if settings_copy.get("rate_sources", {}) != new_value:
+                    settings_copy["rate_sources"] = new_value
                     settings_changed = True
 
             if "notifications_new_offers" in data:
@@ -15504,6 +15997,188 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 self.settings = settings_copy
         return settings_changed, suggest_reboot
 
+    def editNetworkSettings(self, network_type: str, data):
+        self.log.info(f"Updating network settings {network_type}.")
+        ensure(
+            network_type in ("smsg", "simplex", "nostr"),
+            f"Unknown network type {network_type}",
+        )
+        settings_changed = False
+        suggest_reboot = False
+        with self.mxDB:
+            settings_copy = copy.deepcopy(self.settings)
+            network_config_list = settings_copy.get("networks", [])
+            if len(network_config_list) < 1:
+                network_config_list = [{"type": "smsg", "enabled": True}]
+                settings_copy["networks"] = network_config_list
+
+            network = None
+            for n in network_config_list:
+                if n.get("type", "unknown") == network_type:
+                    network = n
+                    break
+            if network is None:
+                if data.get("add") is True:
+                    if network_type == "nostr":
+                        network = {
+                            **nostr_prepare.getConfigDefaults(),
+                            **nostr_prepare.getConfigSegment(None),
+                        }
+                    elif network_type == "smsg":
+                        network = {"type": "smsg", "enabled": True}
+                    else:
+                        raise ValueError(
+                            f"Network {network_type} cannot be added from the UI. "
+                            f"Use basicswap-prepare --addnetwork={network_type} first."
+                        )
+                    network_config_list.append(network)
+                    settings_changed = True
+                    suggest_reboot = True
+                elif network_type == "smsg":
+                    network = {"type": "smsg", "enabled": False}
+                    network_config_list.append(network)
+                else:
+                    raise ValueError(
+                        f"Network {network_type} is not configured. Use basicswap-prepare --addnetwork={network_type} first."
+                    )
+
+            if "enabled" in data:
+                new_value = data["enabled"]
+                ensure(isinstance(new_value, bool), "New enabled value not boolean")
+                if new_value is False:
+                    num_enabled: int = sum(
+                        1 for n in network_config_list if n.get("enabled", True)
+                    )
+                    if num_enabled <= 1 and network.get("enabled", True):
+                        raise ValueError("Cannot disable the last enabled network.")
+                if network.get("enabled", True) != new_value:
+                    network["enabled"] = new_value
+                    settings_changed = True
+                    suggest_reboot = True
+
+            if network_type == "nostr":
+                if "relays" in data:
+                    new_value = data["relays"]
+                    ensure(isinstance(new_value, list), "New relays value not a list")
+                    ensure(len(new_value) > 0, "At least one relay is required")
+                    for relay in new_value:
+                        ensure(
+                            isinstance(relay, str)
+                            and relay.startswith(("ws://", "wss://")),
+                            f"Invalid relay url: {relay}",
+                        )
+                    if network.get("relays", []) != new_value:
+                        network["relays"] = new_value
+                        settings_changed = True
+                        suggest_reboot = True
+
+                if "pow_target" in data:
+                    new_value = data["pow_target"]
+                    ensure(
+                        isinstance(new_value, int), "New pow_target value not integer"
+                    )
+                    ensure(
+                        0 <= new_value <= MAX_POW_TARGET_BITS,
+                        f"pow_target must be between 0 and {MAX_POW_TARGET_BITS}",
+                    )
+                    if network.get("pow_target", 0) != new_value:
+                        network["pow_target"] = new_value
+                        settings_changed = True
+                        suggest_reboot = True
+
+                if "min_incoming_pow" in data:
+                    new_value = data["min_incoming_pow"]
+                    ensure(
+                        isinstance(new_value, int),
+                        "New min_incoming_pow value not integer",
+                    )
+                    ensure(
+                        0 <= new_value <= MAX_POW_TARGET_BITS,
+                        f"min_incoming_pow must be between 0 and {MAX_POW_TARGET_BITS}",
+                    )
+                    if network.get("min_incoming_pow", 0) != new_value:
+                        network["min_incoming_pow"] = new_value
+                        settings_changed = True
+                        suggest_reboot = True
+
+                if data.get("regenerate_key", False) is True:
+                    network["private_key"] = newNostrRouteKey()[0]
+                    settings_changed = True
+                    suggest_reboot = True
+
+            if network_type == "simplex":
+                if "server_address" in data:
+                    new_value = data["server_address"]
+                    ensure(
+                        isinstance(new_value, str) and new_value.startswith("smp://"),
+                        "Invalid server address",
+                    )
+                    if network.get("server_address", "") != new_value:
+                        network["server_address"] = new_value
+                        settings_changed = True
+                        suggest_reboot = True
+
+                if "ws_port" in data:
+                    new_value = data["ws_port"]
+                    ensure(isinstance(new_value, int), "New ws_port value not integer")
+                    ensure(1 <= new_value <= 65535, "Invalid ws_port")
+                    if network.get("ws_port", 0) != new_value:
+                        network["ws_port"] = new_value
+                        settings_changed = True
+                        suggest_reboot = True
+
+                if "group_link" in data:
+                    new_value = data["group_link"]
+                    ensure(isinstance(new_value, str), "Invalid group link")
+                    ensure(new_value.strip() != "", "Group link must not be empty")
+                    if network.get("group_link", "") != new_value:
+                        network["group_link"] = new_value
+                        settings_changed = True
+                        suggest_reboot = True
+
+            if settings_changed:
+                settings_path = os.path.join(self.data_dir, cfg.CONFIG_FILENAME)
+                settings_path_new = settings_path + ".new"
+                shutil.copyfile(settings_path, settings_path + ".last")
+                with open(settings_path_new, "w") as fp:
+                    json.dump(settings_copy, fp, indent=4)
+                shutil.move(settings_path_new, settings_path)
+                self.settings = settings_copy
+        return settings_changed, suggest_reboot
+
+    def editBridgeNetworksSetting(self, enabled: bool):
+        ensure(isinstance(enabled, bool), "New bridge_networks value not boolean")
+        self.log.info(f"Setting bridge_networks: {enabled}.")
+        settings_changed = False
+        suggest_reboot = False
+        with self.mxDB:
+            settings_copy = copy.deepcopy(self.settings)
+            if settings_copy.get("bridge_networks", False) != enabled:
+                if enabled:
+                    num_enabled: int = sum(
+                        1
+                        for n in settings_copy.get(
+                            "networks", [{"type": "smsg", "enabled": True}]
+                        )
+                        if n.get("enabled", True)
+                    )
+                    if num_enabled < 2:
+                        raise ValueError(
+                            "Bridging requires at least two enabled networks."
+                        )
+                settings_copy["bridge_networks"] = enabled
+                settings_changed = True
+                suggest_reboot = True
+
+                settings_path = os.path.join(self.data_dir, cfg.CONFIG_FILENAME)
+                settings_path_new = settings_path + ".new"
+                shutil.copyfile(settings_path, settings_path + ".last")
+                with open(settings_path_new, "w") as fp:
+                    json.dump(settings_copy, fp, indent=4)
+                shutil.move(settings_path_new, settings_path)
+                self.settings = settings_copy
+        return settings_changed, suggest_reboot
+
     def editSettings(self, coin_name: str, data):
         self.log.info(f"Updating settings {coin_name}.")
         settings_changed = False
@@ -15639,6 +16314,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                             cc["chain_lookups"] = data["lookups"]
                             break
 
+            is_xmr_like = coin_name in ("monero", "wownero")
+            daemon_settings_changed = False
+            # Set when host/port changed, so the live apply points straight at it.
+            rpc_target_changed = False
             for setting in (
                 "manage_daemon",
                 "rpchost",
@@ -15649,20 +16328,47 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     continue
                 if settings_cc.get(setting) != data[setting]:
                     settings_changed = True
-                    suggest_reboot = True
                     settings_cc[setting] = data[setting]
+                    if is_xmr_like and setting in (
+                        "rpchost",
+                        "rpcport",
+                        "automatically_select_daemon",
+                    ):
+                        daemon_settings_changed = True
+                        if setting in ("rpchost", "rpcport"):
+                            rpc_target_changed = True
+                    else:
+                        suggest_reboot = True
 
-            if "remotedaemonurls" in data:
-                remotedaemonurls_in = data["remotedaemonurls"].split("\n")
-                remotedaemonurls = set()
-                for url in remotedaemonurls_in:
-                    if url.count(":") > 0:
-                        remotedaemonurls.add(url.strip())
-
-                if set(settings_cc.get("remote_daemon_urls", [])) != remotedaemonurls:
-                    settings_cc["remote_daemon_urls"] = list(remotedaemonurls)
+            # Node list changes. The settings page posts remote_daemon_nodes (a
+            # list of {"url", "failover"} dicts); the legacy API still accepts
+            # remotedaemonurls (newline-separated "host:port", all failover-on).
+            new_nodes = None
+            if "remote_daemon_nodes" in data:
+                new_nodes = self.normaliseRemoteDaemonUrls(data["remote_daemon_nodes"])
+            elif "remotedaemonurls" in data:
+                new_nodes = self.normaliseRemoteDaemonUrls(
+                    [
+                        line.strip()
+                        for line in data["remotedaemonurls"].split("\n")
+                        if line.count(":") > 0
+                    ]
+                )
+            if new_nodes is not None:
+                existing_nodes = self.normaliseRemoteDaemonUrls(
+                    settings_cc.get("remote_daemon_urls", [])
+                )
+                # Compare url+failover membership only, so a purely cosmetic
+                # reorder of the node list is not treated as a settings change.
+                if {(n["url"], n["failover"]) for n in existing_nodes} != {
+                    (n["url"], n["failover"]) for n in new_nodes
+                }:
+                    settings_cc["remote_daemon_urls"] = new_nodes
                     settings_changed = True
-                    suggest_reboot = True
+                    if is_xmr_like:
+                        daemon_settings_changed = True
+                    else:
+                        suggest_reboot = True
 
             # Ensure remote_daemon_urls appears in settings if automatically_select_daemon is present
             if (
@@ -15777,7 +16483,52 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     json.dump(settings_copy, fp, indent=4)
                 shutil.move(settings_path_new, settings_path)
                 self.settings = settings_copy
+
+        # Apply XMR/WOW daemon changes via set_daemon, outside the mxDB lock.
+        if daemon_settings_changed:
+            coin_id = self.getCoinIdFromName(coin_name)
+            if not self.isCoinActive(coin_id):
+                suggest_reboot = True
+            else:
+                try:
+                    new_cc = self.settings["chainclients"][coin_name]
+                    if rpc_target_changed:
+                        self.ci(coin_id).setDaemonAddress(
+                            new_cc["rpchost"], new_cc["rpcport"]
+                        )
+                    elif new_cc.get("automatically_select_daemon", False):
+                        # Auto-select or list changed: selectXMRRemoteDaemon applies via set_daemon.
+                        self.selectXMRRemoteDaemon(coin_id)
+                except Exception as e:
+                    self.log.error(
+                        f"Applying daemon settings for {coin_name} failed: {e}"
+                    )
+                    suggest_reboot = True
+
         return settings_changed, suggest_reboot, migration_message
+
+    def saveRemoteDaemonNodes(self, coin_name: str, nodes) -> bool:
+        new_nodes = self.normaliseRemoteDaemonUrls(nodes)
+        settings_copy = copy.deepcopy(self.settings)
+        with self.mxDB:
+            settings_cc = settings_copy["chainclients"][coin_name]
+            existing_nodes = self.normaliseRemoteDaemonUrls(
+                settings_cc.get("remote_daemon_urls", [])
+            )
+            if {(n["url"], n["failover"]) for n in existing_nodes} == {
+                (n["url"], n["failover"]) for n in new_nodes
+            }:
+                return False
+            settings_cc["remote_daemon_urls"] = new_nodes
+            self._normalizeSettingsPaths(settings_copy)
+            settings_path = os.path.join(self.data_dir, cfg.CONFIG_FILENAME)
+            settings_path_new = settings_path + ".new"
+            shutil.copyfile(settings_path, settings_path + ".last")
+            with open(settings_path_new, "w") as fp:
+                json.dump(settings_copy, fp, indent=4)
+            shutil.move(settings_path_new, settings_path)
+            self.settings = settings_copy
+        return True
 
     def enableCoin(self, coin_name: str) -> None:
         self.log.info(f"Enabling coin {coin_name}.")
@@ -16437,7 +17188,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             query_str: str = (
                 "SELECT "
                 + "bids.created_at, bids.expire_at, bids.bid_id, bids.offer_id, bids.amount, bids.state, bids.was_received, "
-                + "tx1.state, tx2.state, offers.coin_from, bids.rate, bids.bid_addr, offers.bid_reversed, bids.amount_to, offers.coin_to "
+                + "tx1.state, tx2.state, offers.coin_from, bids.rate, bids.bid_addr, offers.bid_reversed, bids.amount_to, offers.coin_to, "
+                + "bids.plan_id "
                 + "FROM bids "
                 + "LEFT JOIN offers ON offers.offer_id = bids.offer_id "
                 + "LEFT JOIN transactions AS tx1 ON tx1.bid_id = bids.bid_id AND tx1.tx_type = CASE WHEN offers.swap_type = :ads_swap THEN :al_type ELSE :itx_type END "
@@ -16936,6 +17688,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
 
         xmr_swap.a_lock_refund_swipe_tx = ci.setTxSignature(spend_tx, witness_stack)
 
+    def setBidPlan(self, bid_id: bytes, plan_id: bytes) -> None:
+        """Mark a bid as one leg of the multi-offer buy identified by plan_id."""
+        bid = self.getBid(bid_id)
+        ensure(bid, f"Bid not found: {self.log.id(bid_id)}.")
+
+        bid.plan_id = plan_id
+        self.saveBid(bid_id, bid)
+
     def setBidDebugInd(self, bid_id: bytes, debug_ind, add_to_bid: bool = True) -> None:
         self.log.debug(f"Bid {self.log.id(bid_id)} Setting debug flag: {debug_ind}.")
 
@@ -17009,69 +17769,40 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             self.log.warning(f"getLockedState failed: {e}")
             return False, False
 
-    def getExchangeName(self, coin_id: int, exchange_name: str) -> str:
-        if coin_id == Coins.BCH:
-            return "bitcoin-cash"
-        if coin_id == Coins.FIRO:
-            return "zcoin"
-
-        # Handle coin variants that use base coin chainparams
-        use_coinid = coin_id
-        if coin_id == Coins.PART_ANON or coin_id == Coins.PART_BLIND:
-            use_coinid = Coins.PART
-        elif coin_id == Coins.LTC_MWEB:
-            use_coinid = Coins.LTC
-
-        return chainparams[use_coinid]["name"]
-
     def isRateLimitError(self, e) -> bool:
         error_str = str(e)
         return "429" in error_str or "Too Many Requests" in error_str
 
-    def rateSourceBackoffRemaining(self) -> int:
+    def rateSourceBackoffRemaining(self, rate_source: str) -> int:
         with self._price_cache_lock:
-            return max(0, self._rate_limit_backoff_until - int(time.time()))
+            until, _ = self._rate_limit_backoff.get(rate_source, (0, 1))
+            return max(0, until - int(time.time()))
 
-    def noteRateSourceLimited(self) -> int:
+    def noteRateSourceLimited(self, rate_source: str) -> int:
         with self._price_cache_lock:
-            backoff_seconds: int = min(20 * self._rate_limit_backoff_step, 120)
-            self._rate_limit_backoff_until = int(time.time()) + backoff_seconds
-            self._rate_limit_backoff_step = min(self._rate_limit_backoff_step + 1, 6)
+            _, step = self._rate_limit_backoff.get(rate_source, (0, 1))
+            backoff_seconds: int = min(20 * step, 120)
+            self._rate_limit_backoff[rate_source] = (
+                int(time.time()) + backoff_seconds,
+                min(step + 1, 6),
+            )
         return backoff_seconds
 
-    def clearRateSourceBackoff(self) -> None:
+    def clearRateSourceBackoff(self, rate_source: str) -> None:
         with self._price_cache_lock:
-            self._rate_limit_backoff_until = 0
-            self._rate_limit_backoff_step = 1
+            self._rate_limit_backoff.pop(rate_source, None)
 
     def _backgroundPriceFetchLoop(self):
         while self._price_fetch_running:
             try:
                 now = int(time.time())
 
-                backoff_remaining: int = self.rateSourceBackoffRemaining()
-                if backoff_remaining > 0:
-                    for _ in range(backoff_remaining):
-                        if not self._price_fetch_running:
-                            break
-                        time.sleep(1)
-                    continue
-
                 if now - self._last_price_fetch >= self.price_fetch_interval:
                     try:
                         self._fetchPricesAndVolumeBackground()
                         self._last_price_fetch = now
-                        self.clearRateSourceBackoff()
                     except Exception as e:
-                        if self.isRateLimitError(e):
-                            backoff_seconds: int = self.noteRateSourceLimited()
-                            self.log.warning(
-                                f"CoinGecko rate limited, backing off for {backoff_seconds}s"
-                            )
-                        else:
-                            self.log.warning(
-                                f"Background price/volume fetch failed: {e}"
-                            )
+                        self.log.warning(f"Background price/volume fetch failed: {e}")
             except Exception as e:
                 self.log.error(f"Background price/volume fetch error: {e}")
 
@@ -17080,141 +17811,219 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     break
                 time.sleep(1)
 
+    def _coingeckoAuth(self) -> tuple[str, dict]:
+        api_key: str = get_api_key_setting(
+            self.settings,
+            "coingecko_api_key",
+            "",
+        )
+        headers: dict = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
+        plan: str = self.settings.get("coingecko_api_plan", "demo")
+        if api_key == "":
+            root = "https://api.coingecko.com/api/v3"
+        elif plan == "pro":
+            root = "https://pro-api.coingecko.com/api/v3"
+            headers["x-cg-pro-api-key"] = api_key
+        else:
+            root = "https://api.coingecko.com/api/v3"
+            headers["x-cg-demo-api-key"] = api_key
+        return root, headers
+
+    def getChartCoins(self) -> list:
+        enabled_chart_coins = []
+        enabled_chart_coins_setting = self.settings.get("enabled_chart_coins", "")
+        if enabled_chart_coins_setting.lower() == "all":
+            for coin_ticker in ticker_map:
+                enabled_chart_coins.append(coin_ticker.upper())
+        elif enabled_chart_coins_setting.strip() == "":
+            for coin_id in self.coin_clients:
+                if not self.isCoinActive(coin_id):
+                    continue
+                try:
+                    enabled_ticker = self.ci(coin_id).ticker_mainnet()
+                except Exception:
+                    continue
+                if (
+                    enabled_ticker not in enabled_chart_coins
+                    and enabled_ticker.lower() in ticker_map
+                ):
+                    enabled_chart_coins.append(enabled_ticker)
+        else:
+            for ticker in enabled_chart_coins_setting.split(","):
+                upcased_ticker = ticker.strip().upper()
+
+                if (
+                    upcased_ticker not in enabled_chart_coins
+                    and upcased_ticker.lower() in ticker_map
+                ):
+                    enabled_chart_coins.append(upcased_ticker)
+        return enabled_chart_coins
+
+    def isRateSourceEnabled(self, rate_source: str) -> bool:
+        return self.settings.get("rate_sources", {}).get(rate_source, True)
+
+    def getRateSources(self) -> list:
+        return [
+            (s, rate_source_names[s], self.isRateSourceEnabled(s))
+            for s in rate_sources_ordered
+        ]
+
+    def nextRateSource(self, rate_source: str):
+        if rate_source not in rate_sources_ordered:
+            return None
+        i: int = rate_sources_ordered.index(rate_source) + 1
+        for next_source in rate_sources_ordered[i:]:
+            if self.isRateSourceEnabled(next_source):
+                return next_source
+        return None
+
     def _fetchPricesAndVolumeBackground(self):
         all_coins = [c for c in Coins if c in chainparams]
         if not all_coins:
             return
 
-        for rate_source in ["coingecko.com"]:
-            self._fetchPricesAndVolumeForSource(all_coins, rate_source, Fiat.USD)
+        wanted_coins = set(self.activeCoins()) | {
+            ticker_map[t.lower()] for t in self.getChartCoins()
+        }
+        fetched = set()
+        retry_sources = []
+        for rate_source in rate_sources_ordered:
+            if not self.isRateSourceEnabled(rate_source):
+                continue
+            if rate_source == "coingecko.com":
+                coins = all_coins
+            else:
+                coins = [c for c in wanted_coins if c not in fetched]
+            if not coins:
+                break
+            backoff_remaining: int = self.rateSourceBackoffRemaining(rate_source)
+            if backoff_remaining > 0:
+                self.log.debug(
+                    f"Skipping {rate_source}, rate limited for {backoff_remaining}s"
+                )
+                retry_sources.append(rate_source)
+                continue
+            try:
+                fetched |= self._fetchPricesAndVolumeForSource(
+                    coins, rate_source, Fiat.USD
+                )
+                self.clearRateSourceBackoff(rate_source)
+            except Exception as e:
+                if self.isRateLimitError(e):
+                    backoff_seconds: int = self.noteRateSourceLimited(rate_source)
+                    self.log.warning(
+                        f"{rate_source} rate limited, backing off for {backoff_seconds}s"
+                    )
+                    retry_sources.append(rate_source)
+                    continue
+                self.log.warning(f"{rate_source} price fetch failed: {e}")
+                if not isinstance(e, urllib.error.HTTPError):
+                    retry_sources.append(rate_source)
 
-    def _fetchPricesAndVolumeForSource(self, coins_list, rate_source, currency_to):
-        now = int(time.time())
-        headers = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
-
-        exchange_name_map = {}
-        coin_ids = ""
-        for coin_id in coins_list:
-            if len(coin_ids) > 0:
-                coin_ids += ","
-            exchange_name = self.getExchangeName(coin_id, rate_source)
-            coin_ids += exchange_name
-            exchange_name_map[exchange_name] = coin_id
-
-        if rate_source == "coingecko.com":
-            ticker_to = fiatTicker(currency_to).lower()
-            api_key = get_api_key_setting(
-                self.settings,
-                "coingecko_api_key",
-                default_coingecko_api_key,
-                escape=True,
+        missing = [Coins(c).name for c in wanted_coins if c not in fetched]
+        if retry_sources and missing:
+            raise ValueError(
+                f"No rate for {', '.join(missing)}, retrying {', '.join(retry_sources)}"
             )
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_ids}&vs_currencies={ticker_to}&include_24hr_vol=true&include_24hr_change=true"
-            if api_key != "":
-                url += f"&api_key={api_key}"
 
-            js = json.loads(self.readURL(url, timeout=5, headers=headers))
+    def _fetchPricesAndVolumeForSource(
+        self, coins_list, rate_source, currency_to
+    ) -> set:
+        now = int(time.time())
+        oldest_valid_update: int = now - 15 * 60
 
-            with self._price_cache_lock:
-                for k, v in js.items():
-                    coin_id = exchange_name_map[k]
-                    price_cache_key = (coin_id, currency_to, rate_source)
-                    if ticker_to in v:
-                        self._price_cache[price_cache_key] = {
-                            "rate": v[ticker_to],
-                            "timestamp": now,
-                        }
-                    volume_cache_key = (coin_id, rate_source)
-                    volume_24h = v.get(f"{ticker_to}_24h_vol")
-                    price_change_24h = v.get(f"{ticker_to}_24h_change")
-                    self._volume_cache[volume_cache_key] = {
+        fetcher = oracle_fetchers.get(rate_source)
+        if fetcher is None:
+            raise ValueError(f"Unknown rate source {rate_source}")
+        rates = fetcher(self, coins_list, currency_to, oldest_valid_update)
+
+        with self._price_cache_lock:
+            for coin_id, (rate, volume_24h, price_change_24h) in rates.items():
+                self._price_cache[(coin_id, currency_to, rate_source)] = {
+                    "rate": rate,
+                    "timestamp": now,
+                }
+                self._volume_cache[(coin_id, rate_source)] = {
+                    "volume_24h": (
+                        float(volume_24h) if volume_24h is not None else None
+                    ),
+                    "price_change_24h": (
+                        float(price_change_24h) if price_change_24h is not None else 0.0
+                    ),
+                    "timestamp": now,
+                }
+
+        cursor = self.openDB()
+        try:
+            update_query = """
+                UPDATE coinrates SET
+                    rate=:rate,
+                    last_updated=:last_updated
+                WHERE currency_from = :currency_from AND currency_to = :currency_to AND source = :rate_source
+                """
+            insert_query = """INSERT INTO coinrates(currency_from, currency_to, rate, source, last_updated)
+                    VALUES(:currency_from, :currency_to, :rate, :rate_source, :last_updated)"""
+
+            for coin_id, (rate, volume_24h, price_change_24h) in rates.items():
+                rate_params = {
+                    "currency_from": coin_id,
+                    "currency_to": currency_to,
+                    "rate": rate,
+                    "rate_source": rate_source,
+                    "last_updated": now,
+                }
+                cursor.execute(update_query, rate_params)
+                if cursor.rowcount < 1:
+                    cursor.execute(insert_query, rate_params)
+
+                cursor.execute(
+                    "DELETE FROM coinvolume WHERE coin_id = :coin_id AND source = :rate_source",
+                    {
+                        "coin_id": coin_id,
+                        "rate_source": rate_source,
+                    },
+                )
+                cursor.execute(
+                    "INSERT INTO coinvolume (coin_id, volume_24h, price_change_24h, source, last_updated) VALUES (:coin_id, :volume_24h, :price_change_24h, :rate_source, :last_updated)",
+                    {
+                        "coin_id": coin_id,
                         "volume_24h": (
-                            float(volume_24h) if volume_24h is not None else None
+                            str(volume_24h) if volume_24h is not None else "None"
                         ),
                         "price_change_24h": (
-                            float(price_change_24h)
+                            str(price_change_24h)
                             if price_change_24h is not None
-                            else 0.0
+                            else "0.0"
                         ),
-                        "timestamp": now,
-                    }
+                        "rate_source": rate_source,
+                        "last_updated": now,
+                    },
+                )
+            self.commitDB()
+        finally:
+            self.closeDB(cursor, commit=False)
 
-            cursor = self.openDB()
-            try:
-                update_query = """
-                    UPDATE coinrates SET
-                        rate=:rate,
-                        last_updated=:last_updated
-                    WHERE currency_from = :currency_from AND currency_to = :currency_to AND source = :rate_source
-                    """
-                insert_query = """INSERT INTO coinrates(currency_from, currency_to, rate, source, last_updated)
-                        VALUES(:currency_from, :currency_to, :rate, :rate_source, :last_updated)"""
-
-                for k, v in js.items():
-                    coin_id = exchange_name_map[k]
-                    if ticker_to in v:
-                        cursor.execute(
-                            update_query,
-                            {
-                                "currency_from": coin_id,
-                                "currency_to": currency_to,
-                                "rate": v[ticker_to],
-                                "rate_source": rate_source,
-                                "last_updated": now,
-                            },
-                        )
-                        if cursor.rowcount < 1:
-                            cursor.execute(
-                                insert_query,
-                                {
-                                    "currency_from": coin_id,
-                                    "currency_to": currency_to,
-                                    "rate": v[ticker_to],
-                                    "rate_source": rate_source,
-                                    "last_updated": now,
-                                },
-                            )
-
-                for k, v in js.items():
-                    coin_id = exchange_name_map[k]
-                    volume_24h = v.get(f"{ticker_to}_24h_vol")
-                    price_change_24h = v.get(f"{ticker_to}_24h_change")
-                    cursor.execute(
-                        "DELETE FROM coinvolume WHERE coin_id = :coin_id AND source = :rate_source",
-                        {
-                            "coin_id": coin_id,
-                            "rate_source": rate_source,
-                        },
-                    )
-                    cursor.execute(
-                        "INSERT INTO coinvolume (coin_id, volume_24h, price_change_24h, source, last_updated) VALUES (:coin_id, :volume_24h, :price_change_24h, :rate_source, :last_updated)",
-                        {
-                            "coin_id": coin_id,
-                            "volume_24h": (
-                                str(volume_24h) if volume_24h is not None else "None"
-                            ),
-                            "price_change_24h": (
-                                str(price_change_24h)
-                                if price_change_24h is not None
-                                else "0.0"
-                            ),
-                            "rate_source": rate_source,
-                            "last_updated": now,
-                        },
-                    )
-                self.commitDB()
-            finally:
-                self.closeDB(cursor, commit=False)
+        return set(rates)
 
     def lookupFiatRates(
         self,
         coins_list,
         currency_to: int = Fiat.USD,
-        rate_source: str = "coingecko.com",
+        rate_source: str | None = None,
         saved_ttl: int = 300,
     ):
         ensure(len(coins_list) > 0, "Must specify coin/s")
         ensure(saved_ttl >= 0, "Invalid saved time")
+        if rate_source is None:
+            rate_source = rate_sources_ordered[0]
+
+        if not self.isRateSourceEnabled(rate_source):
+            fallback_source = self.nextRateSource(rate_source)
+            if fallback_source is None:
+                return {}
+            return self.lookupFiatRates(
+                coins_list, currency_to, fallback_source, saved_ttl
+            )
 
         now: int = int(time.time())
         oldest_time_valid: int = now - saved_ttl
@@ -17255,19 +18064,33 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 coin_id = int(row[0])
                 if coin_id not in return_rates:
                     return_rates[coin_id] = float(row[1])
-
-            return return_rates
         finally:
             self.closeDB(cursor, commit=False)
+
+        fallback_source = self.nextRateSource(rate_source)
+        missing = [c for c in coins_list if c not in return_rates]
+        if fallback_source and missing:
+            return_rates.update(
+                self.lookupFiatRates(missing, currency_to, fallback_source, saved_ttl)
+            )
+        return return_rates
 
     def lookupVolume(
         self,
         coins_list,
-        rate_source: str = "coingecko.com",
+        rate_source: str | None = None,
         saved_ttl: int = 300,
     ):
         ensure(len(coins_list) > 0, "Must specify coin/s")
         ensure(saved_ttl >= 0, "Invalid saved time")
+        if rate_source is None:
+            rate_source = rate_sources_ordered[0]
+
+        if not self.isRateSourceEnabled(rate_source):
+            fallback_source = self.nextRateSource(rate_source)
+            if fallback_source is None:
+                return {}
+            return self.lookupVolume(coins_list, fallback_source, saved_ttl)
 
         now: int = int(time.time())
         oldest_time_valid: int = now - saved_ttl
@@ -17326,10 +18149,14 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     "volume_24h": volume_24h,
                     "price_change_24h": price_change_24h,
                 }
-
-            return return_data
         finally:
             self.closeDB(cursor, commit=False)
+
+        fallback_source = self.nextRateSource(rate_source)
+        missing = [c for c in coins_list if c not in return_data]
+        if fallback_source and missing:
+            return_data.update(self.lookupVolume(missing, fallback_source, saved_ttl))
+        return return_data
 
     def lookupHistoricalData(
         self,
@@ -17345,8 +18172,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         now: int = int(time.time())
         oldest_time_valid: int = now - saved_ttl
         return_data = {}
-
-        headers = {"User-Agent": "Mozilla/5.0", "Connection": "close"}
 
         cursor = self.openDB()
         try:
@@ -17383,7 +18208,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             if len(need_coins) < 1:
                 return return_data
 
-            backoff_remaining: int = self.rateSourceBackoffRemaining()
+            backoff_remaining: int = self.rateSourceBackoffRemaining(rate_source)
             if backoff_remaining > 0:
                 self.log.debug(
                     f"Skipping historical data fetch, rate limited for {backoff_remaining}s"
@@ -17393,35 +18218,33 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 return return_data
 
             if rate_source == "coingecko.com":
-                api_key: str = get_api_key_setting(
-                    self.settings,
-                    "coingecko_api_key",
-                    default_coingecko_api_key,
-                    escape=True,
-                )
+                root, headers = self._coingeckoAuth()
 
                 for coin_id in need_coins:
+                    exchange_name = getExchangeName(coin_id, rate_source)
+                    if exchange_name is None:
+                        return_data[coin_id] = []
+                        continue
                     try:
-                        exchange_name: str = self.getExchangeName(coin_id, rate_source)
                         url: str = (
-                            f"https://api.coingecko.com/api/v3/coins/{exchange_name}/market_chart?vs_currency=usd&days={days}"
+                            f"{root}/coins/{exchange_name}/market_chart?vs_currency=usd&days={days}"
                         )
-                        if api_key != "":
-                            url += f"&api_key={api_key}"
 
                         js = json.loads(self.readURL(url, timeout=5, headers=headers))
 
                         if "prices" in js:
                             return_data[coin_id] = js["prices"]
                             new_values[coin_id] = js["prices"]
-                        self.clearRateSourceBackoff()
+                        self.clearRateSourceBackoff(rate_source)
                     except Exception as e:
                         self.log.warning(
                             f"Could not fetch historical data for {Coins(coin_id).name}: {e}"
                         )
                         return_data[coin_id] = []
                         if self.isRateLimitError(e):
-                            backoff_seconds: int = self.noteRateSourceLimited()
+                            backoff_seconds: int = self.noteRateSourceLimited(
+                                rate_source
+                            )
                             self.log.warning(
                                 f"CoinGecko rate limited, backing off for {backoff_seconds}s"
                             )
@@ -17467,7 +18290,6 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
             )
         )
 
-        rate_sources = self.settings.get("rate_sources", {})
         ci_from = self.ci(int(coin_from))
         ci_to = self.ci(int(coin_to))
         name_from = ci_from.chainparams()["name"]
@@ -17476,7 +18298,7 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
         ticker_to = ci_to.chainparams()["ticker"]
         rv = {}
 
-        if rate_sources.get("coingecko.com", True):
+        if any(enabled for _, _, enabled in self.getRateSources()):
             try:
                 price_coin_from = int(coin_from)
                 price_coin_to = int(coin_to)
@@ -17508,9 +18330,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                     js[name_to] = {"usd": js[price_coin_to]}
                     js.pop(price_coin_to)
 
-                rv["coingecko"] = js
+                rv["oracle"] = js
             except Exception as e:
-                rv["coingecko_error"] = str(e)
+                rv["oracle_error"] = str(e)
                 if self.debug:
                     self.log.error(traceback.format_exc())
 
@@ -17520,13 +18342,13 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                 return "{:.12f}".format(f).rstrip("0").rstrip(".")
 
             rv_array = []
-            if "coingecko_error" in rv:
-                rv_array.append(("coingecko.com", "error", rv["coingecko_error"]))
-            elif "coingecko" in rv:
-                js = rv["coingecko"]
+            if "oracle_error" in rv:
+                rv_array.append(("oracle", "error", rv["oracle_error"]))
+            elif "oracle" in rv:
+                js = rv["oracle"]
                 rv_array.append(
                     (
-                        "coingecko.com",
+                        "oracle",
                         ticker_from,
                         ticker_to,
                         format_float(float(js[name_from]["usd"])),

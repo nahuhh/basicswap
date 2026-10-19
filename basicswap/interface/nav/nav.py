@@ -141,6 +141,9 @@ class NAVInterface(BTCInterface):
 
         return CScript([OP_HASH160, script_hash, OP_EQUAL])
 
+    def supportsTaproot(self) -> bool:
+        return False
+
     def getInputScriptForPubkeyHash(self, pkh: bytes) -> bytearray:
         script = CScript([OP_0, pkh])
         return bytes((len(script),)) + script
@@ -794,7 +797,11 @@ class NAVInterface(BTCInterface):
         subfee: bool = False,
         bid_id: bytes = None,
         cursor=None,
+        prevouts=None,
     ):
+        if prevouts:
+            raise ValueError("Preselected inputs are not supported for Navcoin")
+
         feerate_str = self.format_amount(feerate)
         # TODO: unlock unspents if bid cancelled
         options = {
@@ -816,9 +823,17 @@ class NAVInterface(BTCInterface):
         return tx_signed.serialize_without_witness()
 
     def fundSCLockTx(
-        self, tx_bytes: bytes, feerate, vkbv=None, bid_id: bytes = None, cursor=None
+        self,
+        tx_bytes: bytes,
+        feerate,
+        vkbv=None,
+        bid_id: bytes = None,
+        cursor=None,
+        prevouts=None,
     ) -> bytes:
-        tx_funded = self.fundTx(tx_bytes.hex(), feerate, bid_id=bid_id, cursor=cursor)
+        tx_funded = self.fundTx(
+            tx_bytes.hex(), feerate, bid_id=bid_id, cursor=cursor, prevouts=prevouts
+        )
         return tx_funded
 
     def createSCLockRefundTx(
@@ -1021,9 +1036,13 @@ class NAVInterface(BTCInterface):
             )
         )
 
-        tx.vout.append(
-            self.txoType()(locked_coin, self.getScriptForPubkeyHash(pkh_dest))
-        )
+        if self.isValidAddressHash(pkh_dest):
+            script_out: bytes = self.getScriptForPubkeyHash(pkh_dest)
+        elif self.isValidTxoDest(pkh_dest):
+            script_out: bytes = pkh_dest
+        else:
+            raise ValueError("Unknown pkh_dest type")
+        tx.vout.append(self.txoType()(locked_coin, script_out))
 
         dummy_witness_stack = self.getScriptLockTxDummyWitness(script_lock)
         witness_bytes = self.getWitnessStackSerialisedLength(dummy_witness_stack)

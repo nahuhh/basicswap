@@ -12,7 +12,7 @@ import time
 from contextlib import contextmanager
 from enum import IntEnum, auto
 
-CURRENT_DB_VERSION = 38
+CURRENT_DB_VERSION = 41
 CURRENT_DB_DATA_VERSION = 10
 
 
@@ -98,6 +98,15 @@ class Table:
         if hasattr(io, "__sqlite3_column__"):
             return False
         return True if io is not None else False
+
+
+COLUMN_TYPES = {
+    "BLOB": "BLOB",
+    "BOOL": "INTEGER",
+    "INTEGER": "INTEGER",
+    "STRING": "TEXT",
+    "TEXT": "TEXT",
+}
 
 
 class Column:
@@ -267,6 +276,9 @@ class Bid(Table, StateRows):
     reject_code = Column("integer")
 
     index = Index("bid_offer_id_index", "offer_id")
+
+    # Shared by the bids placed together by one multi-offer buy, else null.
+    plan_id = Column("blob")
 
     initiate_tx = None
     participate_tx = None
@@ -446,6 +458,12 @@ class XmrSwap(Table):
 
     kbsl_dleag = Column("blob")
     kbsf_dleag = Column("blob")
+    # The received message whose proof the split messages complete
+    split_parent_msg_id = Column("blob")
+    # Set once the accept is built and saved: a retry re-sends it, never rebuilds
+    accept_prepared_at = Column("integer")
+    # The same for a reverse bid's intent accept, a self-bid runs both on one row
+    intent_accept_prepared_at = Column("integer")
 
     vkbv = Column("blob")  # chain b view private key
     pkbv = Column("blob")  # chain b view public key
@@ -499,6 +517,7 @@ class XmrSplitData(Table):
     msg_sequence = Column("integer")
     dleag = Column("blob")
     created_at = Column("integer")
+    parent_msg_id = Column("blob")
 
 
 class RevokedMessage(Table):
@@ -700,7 +719,7 @@ class MessageNetworkLink(Table):
     linked_type = Column("integer")
     linked_id = Column("blob")
 
-    network_id = Column("string")
+    network_id = Column("integer")
     link_type = Column("integer")  # MessageNetworkLinkTypes
     created_at = Column("integer")
 
@@ -827,9 +846,11 @@ def extract_schema(input_globals: dict = None) -> dict:
                 indices.append(m_obj)
                 continue
             if hasattr(m_obj, "__sqlite3_column__"):
-                col_type: str = m_obj.column_type.upper()
-                if col_type == "BOOL":
-                    col_type = "INTEGER"
+                col_type = COLUMN_TYPES.get(m_obj.column_type.upper())
+                if col_type is None:
+                    raise ValueError(
+                        f"Unknown column type {m_obj.column_type} for {table_name}.{m_name}"
+                    )
                 columns[m_name] = {
                     "type": col_type,
                     "primary_key": m_obj.primary_key,
@@ -1223,13 +1244,16 @@ class DBMethods:
                     query += f" AND {ck} = :{ck} "
                     query_data[ck] = constraint_value
 
+        order_terms = []
         for order_col, order_dir in order_by.items():
             if validColumnName(order_col) is False:
                 raise ValueError(f"Invalid sort by: {order_col}")
             order_dir = order_dir.upper()
             if order_dir not in ("ASC", "DESC"):
                 raise ValueError(f"Invalid sort dir: {order_dir}")
-            query += f" ORDER BY {order_col} {order_dir}"
+            order_terms.append(f"{order_col} {order_dir}")
+        if len(order_terms) > 0:
+            query += " ORDER BY " + ", ".join(order_terms)
 
         if query_suffix:
             query += query_suffix

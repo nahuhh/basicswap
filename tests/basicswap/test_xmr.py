@@ -34,7 +34,10 @@ from basicswap.basicswap import (
 from basicswap.basicswap_util import (
     TxLockTypes,
     EventLogTypes,
+    MessageTypes,
+    XmrSplitMsgTypes,
 )
+from basicswap.messages_npb import XmrSplitMessage
 from basicswap.util import COIN, format_amount, make_int, TemporaryError
 from basicswap.util.address import toWIF
 from basicswap.rpc import (
@@ -443,6 +446,7 @@ class BaseTest(unittest.TestCase):
                     # Load mnemonics after all nodes have started to avoid staking getting stuck in TryToSync
                     rpc = make_rpc_func(i)
                     waitForRPC(rpc, test_delay_event)
+                    rpc("reservebalance", [True, 1000000])
                     if i == 0:
                         rpc(
                             "extkeyimportmaster",
@@ -471,7 +475,10 @@ class BaseTest(unittest.TestCase):
                             {"stakecombinethreshold": 100, "stakesplitthreshold": 200},
                         ],
                     )
-                    rpc("reservebalance", [False])
+                # Only node 0 stakes. Competing regtest stakes can spend outputs that
+                # exist on one branch only, the other nodes then mark that branch
+                # invalid and never reorg onto it.
+                callnoderpc(0, "reservebalance", [False])
 
             btc_wallet_bin = "bitcoin-wallet" + (".exe" if os.name == "nt" else "")
             for i in range(NUM_BTC_NODES):
@@ -676,11 +683,11 @@ class BaseTest(unittest.TestCase):
                     log_name=f"BasicSwap{i}",
                 )
                 cls.swap_clients.append(sc)
-                sc.setDaemonPID(Coins.BTC, cls.btc_daemons[i].handle.pid)
-                sc.setDaemonPID(Coins.PART, cls.part_daemons[i].handle.pid)
+                sc.setDaemon(Coins.BTC, cls.btc_daemons[i])
+                sc.setDaemon(Coins.PART, cls.part_daemons[i])
 
                 if cls.start_ltc_nodes:
-                    sc.setDaemonPID(Coins.LTC, cls.ltc_daemons[i].handle.pid)
+                    sc.setDaemon(Coins.LTC, cls.ltc_daemons[i])
                 cls.addPIDInfo(sc, i)
 
                 sc.start()
@@ -1453,6 +1460,168 @@ class Test(BaseTest):
         offers = swap_clients[0].listOffers(filters={"offer_id": offer_id})
         assert len(offers) == 0
 
+    def postPartXmrBid(self):
+        swap_clients = self.swap_clients
+        offer_id = swap_clients[0].postOffer(
+            Coins.PART,
+            Coins.XMR,
+            10 * COIN,
+            0.11 * XMR_COIN,
+            10 * COIN,
+            SwapTypes.XMR_SWAP,
+        )
+        wait_for_offer(test_delay_event, swap_clients[1], offer_id)
+        offer = swap_clients[1].getOffer(offer_id)
+        bid_id = swap_clients[1].postXmrBid(offer_id, offer.amount_from)
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[0],
+            bid_id,
+            BidStates.BID_RECEIVED,
+            wait_for=(self.extra_wait_time + 40),
+        )
+        return offer, bid_id
+
+    def waitForBothCompleted(self, bid_id, id_offerer: int = 0, id_bidder: int = 1):
+        wait_for_bid(
+            test_delay_event,
+            self.swap_clients[id_offerer],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            wait_for=180,
+        )
+        wait_for_bid(
+            test_delay_event,
+            self.swap_clients[id_bidder],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            sent=True,
+            wait_for=180,
+        )
+
+    def test_01b_part_xmr_competing_accept_chunks(self):
+        logging.info(
+            "---------- Test PART to XMR, another accept's chunks arrive first"
+        )
+        swap_clients = self.swap_clients
+        offer, bid_id = self.postPartXmrBid()
+
+        bid, xmr_swap = swap_clients[1].getXmrBid(bid_id)
+        split_size_init, split_size = xmr_swap.getMsgSplitInfo()
+        other_parent = os.urandom(28)
+        remaining: int = 48893 - split_size_init
+        sequence: int = 1
+        while remaining > 0:
+            chunk_size: int = min(split_size, remaining)
+            msg_data = XmrSplitMessage(
+                msg_id=bid_id,
+                msg_type=XmrSplitMsgTypes.BID_ACCEPT,
+                sequence=sequence,
+                dleag=os.urandom(chunk_size),
+                parent_msg_id=other_parent,
+            )
+            swap_clients[1].processXmrSplitMessage(
+                {
+                    "msgid": os.urandom(28).hex(),
+                    "from": offer.addr_from,
+                    "to": bid.bid_addr,
+                    "sent": int(time.time()),
+                    "payloadversion": 2,
+                    "hex": f"{MessageTypes.XMR_BID_SPLIT:02x}"
+                    + msg_data.to_bytes().hex(),
+                }
+            )
+            remaining -= chunk_size
+            sequence += 1
+
+        swap_clients[0].acceptXmrBid(bid_id)
+        self.waitForBothCompleted(bid_id)
+
+        cursor = swap_clients[1].openDB()
+        try:
+            parents = cursor.execute(
+                "SELECT DISTINCT parent_msg_id FROM xmr_split_data WHERE bid_id = :bid_id",
+                {"bid_id": bid_id},
+            ).fetchall()
+        finally:
+            swap_clients[1].closeDB(cursor, commit=False)
+        assert len(parents) == 2
+
+    def test_01c_part_xmr_double_accept(self):
+        logging.info("---------- Test PART to XMR, the offerer accepts twice")
+        swap_clients = self.swap_clients
+        offer, bid_id = self.postPartXmrBid()
+
+        swap_clients[0].acceptXmrBid(bid_id)
+        # As a failed save before a retry leaves it: the accept is out, the bid still acceptable
+        bid, xmr_swap = swap_clients[0].getXmrBid(bid_id)
+        bid.setState(BidStates.BID_RECEIVED)
+        swap_clients[0].saveBid(bid_id, bid, xmr_swap=xmr_swap)
+        swap_clients[0].acceptXmrBid(bid_id)
+
+        self.waitForBothCompleted(bid_id)
+
+    def test_01d_part_xmr_double_accept_first_kept(self):
+        logging.info(
+            "---------- Test PART to XMR, the offerer accepts twice, the bidder keeps the first"
+        )
+        swap_clients = self.swap_clients
+        offer, bid_id = self.postPartXmrBid()
+
+        swap_clients[0].acceptXmrBid(bid_id)
+        for _ in range(60):
+            bidder_bid, _ = swap_clients[1].getXmrBid(bid_id)
+            if bidder_bid.state != BidStates.BID_SENT:
+                break
+            if test_delay_event.wait(1):
+                raise ValueError("Test stopped.")
+        assert bidder_bid.state != BidStates.BID_SENT
+        bid, xmr_swap = swap_clients[0].getXmrBid(bid_id)
+        bid.setState(BidStates.BID_RECEIVED)
+        swap_clients[0].saveBid(bid_id, bid, xmr_swap=xmr_swap)
+        swap_clients[0].acceptXmrBid(bid_id)
+
+        self.waitForBothCompleted(bid_id)
+
+    def test_01e_xmr_part_reverse_double_accept_first_kept(self):
+        logging.info(
+            "---------- Test XMR to PART, the offerer accepts a reverse bid twice, the bidder keeps the first"
+        )
+        swap_clients = self.swap_clients
+        offer_id = swap_clients[1].postOffer(
+            Coins.XMR,
+            Coins.PART,
+            1 * XMR_COIN,
+            10 * COIN,
+            1 * XMR_COIN,
+            SwapTypes.XMR_SWAP,
+        )
+        wait_for_offer(test_delay_event, swap_clients[0], offer_id)
+        offer = swap_clients[0].getOffer(offer_id)
+        bid_id = swap_clients[0].postXmrBid(offer_id, offer.amount_from)
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[1],
+            bid_id,
+            BidStates.BID_RECEIVED,
+            wait_for=(self.extra_wait_time + 40),
+        )
+
+        swap_clients[1].acceptADSReverseBid(bid_id)
+        for _ in range(60):
+            bidder_bid, _ = swap_clients[0].getXmrBid(bid_id)
+            if bidder_bid.state != BidStates.BID_REQUEST_SENT:
+                break
+            if test_delay_event.wait(1):
+                raise ValueError("Test stopped.")
+        assert bidder_bid.state != BidStates.BID_REQUEST_SENT
+        bid, xmr_swap = swap_clients[1].getXmrBid(bid_id)
+        bid.setState(BidStates.BID_RECEIVED)
+        swap_clients[1].saveBid(bid_id, bid, xmr_swap=xmr_swap)
+        swap_clients[1].acceptADSReverseBid(bid_id)
+
+        self.waitForBothCompleted(bid_id, id_offerer=1, id_bidder=0)
+
     def test_02_leader_recover_a_lock_tx(self):
         logging.info("---------- Test PART to XMR leader recovers coin a lock tx")
         swap_clients = self.swap_clients
@@ -2208,9 +2377,6 @@ class Test(BaseTest):
         assert float(js_1["balance"]) > 200.0
         node1_anon_before = js_1["anon_balance"] + js_1["anon_pending"]
 
-        callnoderpc(
-            1, "reservebalance", [True, 1000000]
-        )  # Stop staking to avoid conflicts (input used by tx->anon staked before tx gets in the chain)
         post_json = {
             "value": 100,
             "address": js_1["stealth_address"],
@@ -2232,7 +2398,6 @@ class Test(BaseTest):
         js_1 = read_json_api(1801, "wallets/part")
         node1_anon_before = js_1["anon_balance"] + js_1["anon_pending"]
 
-        callnoderpc(1, "reservebalance", [False])
         post_json = {
             "value": 10,
             "address": js_0["stealth_address"],

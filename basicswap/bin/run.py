@@ -20,7 +20,7 @@ import basicswap.config as cfg
 from basicswap import __version__
 from basicswap.basicswap import BasicSwap
 from basicswap.chainparams import chainparams, Coins, isKnownCoinName
-from basicswap.network.simplex_chat import startSimplexClient
+from basicswap.network.simplex.client import startSimplexNetworkClient
 from basicswap.ui.util import getCoinName
 from basicswap.util.daemon import Daemon
 
@@ -408,26 +408,9 @@ def runClient(
                     continue
                 network_type: str = network.get("type", "unknown")
                 if network_type == "simplex":
-                    simplex_dir = os.path.join(data_dir, "simplex")
-                    log_level = "debug" if swap_client.debug else "info"
-                    socks_proxy = None
-                    if "socks_proxy_override" in network:
-                        socks_proxy = network["socks_proxy_override"]
-                    elif swap_client.use_tor_proxy:
-                        socks_proxy = (
-                            f"{swap_client.tor_proxy_host}:{swap_client.tor_proxy_port}"
-                        )
-
                     daemons.append(
-                        startSimplexClient(
-                            network["client_path"],
-                            simplex_dir,
-                            network["server_address"],
-                            network["ws_port"],
-                            logger,
-                            swap_client.delay_event,
-                            socks_proxy=socks_proxy,
-                            log_level=log_level,
+                        startSimplexNetworkClient(
+                            swap_client, network, data_dir, logger
                         )
                     )
                     pid = daemons[-1].handle.pid
@@ -464,48 +447,9 @@ def runClient(
 
                 if v["manage_wallet_daemon"] is True:
                     swap_client.log.info(f"Starting {display_name} wallet daemon")
-                    daemon_addr = "{}:{}".format(v["rpchost"], v["rpcport"])
-                    trusted_daemon: bool = swap_client.getXMRTrustedDaemon(
-                        coin_id, v["rpchost"]
-                    )
-                    wallet_opts = [
-                        "--trusted-daemon" if trusted_daemon else "--untrusted-daemon",
-                        "--daemon-address",
-                        daemon_addr,
-                    ]
-                    daemon_rpcuser = v.get("rpcuser", "")
-                    daemon_rpcpass = v.get("rpcpassword", "")
-                    if daemon_rpcuser != "":
-                        wallet_opts += [
-                            "--daemon-login",
-                            daemon_rpcuser + ":" + daemon_rpcpass,
-                        ]
-
-                    proxy_log_str = ""
-                    proxy_host, proxy_port = swap_client.getXMRWalletProxy(
-                        coin_id, v["rpchost"]
-                    )
-                    if proxy_host:
-                        proxy_log_str = " through proxy"
-                        wallet_opts += [
-                            "--proxy",
-                            f"{proxy_host}:{proxy_port}",
-                            "--daemon-ssl-allow-any-cert",
-                        ]
-
-                    swap_client.log.info(
-                        "daemon-address: {} ({}){}".format(
-                            daemon_addr,
-                            "trusted" if trusted_daemon else "untrusted",
-                            proxy_log_str,
-                        )
-                    )
-
                     filename: str = getWalletBinName(coin_id, v, c + "-wallet-rpc")
                     daemons.append(
-                        startXmrWalletDaemon(
-                            v["datadir"], v["bindir"], filename, wallet_opts
-                        )
+                        startXmrWalletDaemon(v["datadir"], v["bindir"], filename)
                     )
                     pid = daemons[-1].handle.pid
                     swap_client.log.info(f"Started {filename} {pid}")
@@ -593,7 +537,7 @@ def runClient(
                 )
                 pid = daemons[-1].handle.pid
                 pids.append((c, pid))
-                swap_client.setDaemonPID(c, pid)
+                swap_client.setDaemon(c, daemons[-1])
                 swap_client.log.info(f"Started {filename} {pid}")
         if len(pids) > 0:
             with open(pids_path, "w") as fd:

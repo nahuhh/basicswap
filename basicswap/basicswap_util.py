@@ -45,6 +45,7 @@ class KeyTypes(IntEnum):
 class MessageNetworks(IntEnum):
     SMSG = auto()
     SIMPLEX = auto()
+    NOSTR = auto()
 
 
 class MessageNetworkLinkTypes(IntEnum):
@@ -190,6 +191,7 @@ class ActionTypes(IntEnum):
     REDEEM_ITX = auto()
     ACCEPT_AS_REV_BID = auto()
     SEND_MERCY_TX = auto()
+    SEND_PARTICIPATE_TX = auto()
 
 
 class EventLogTypes(IntEnum):
@@ -285,6 +287,7 @@ class NotificationTypes(IntEnum):
 
 class ConnectionRequestTypes(IntEnum):
     BID = 1
+    ACK = 2
 
 
 class AutomationOverrideOptions(IntEnum):

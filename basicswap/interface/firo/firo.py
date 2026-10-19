@@ -339,9 +339,17 @@ class FIROInterface(BTCInterface):
         return tx.serialize()
 
     def fundSCLockTx(
-        self, tx_bytes, feerate, vkbv=None, bid_id: bytes = None, cursor=None
+        self,
+        tx_bytes,
+        feerate,
+        vkbv=None,
+        bid_id: bytes = None,
+        cursor=None,
+        prevouts=None,
     ):
-        return self.fundTx(tx_bytes, feerate, bid_id=bid_id, cursor=cursor)
+        return self.fundTx(
+            tx_bytes, feerate, bid_id=bid_id, cursor=cursor, prevouts=prevouts
+        )
 
     def signTxWithWallet(self, tx):
         rv = self.rpc("signrawtransaction", [tx.hex()])
@@ -383,6 +391,16 @@ class FIROInterface(BTCInterface):
     def getScriptForPubkeyHash(self, pkh: bytes) -> bytearray:
         # Return P2PKH
         return CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
+
+    def supportsTaproot(self) -> bool:
+        return False
+
+    def isValidTxoDest(self, script: bytes) -> bool:
+        if self.isScriptP2PKH(script):
+            return True
+        if self.isScriptP2SH(script):
+            return True
+        return False
 
     def getScriptDest(self, script: bytearray) -> bytearray:
         # P2SH
@@ -550,8 +568,7 @@ class FIROInterface(BTCInterface):
 
         sum_value: int = 0
         for outpoint in utxos:
-            txout = self.rpc("gettxout", [outpoint[0].hex(), outpoint[1]])
-            sum_value += self.make_int(txout["value"])
+            sum_value += self.getTxOut(outpoint[0], outpoint[1]).nValue
 
         return sum_value
 
