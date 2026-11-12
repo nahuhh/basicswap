@@ -20,7 +20,7 @@ Copy and edit .env config:
     cp example.env .env
 
 
-Optionally set random RPC passwords:
+Set random RPC passwords, example.env leaves them empty and basicswap-prepare refuses an empty one:
 
     for KEY in $(grep -o '^.*_RPC_PWD' .env)
     do
@@ -121,6 +121,9 @@ Start BasicSwap:
 
 ## Update code
 
+Rebuilding the bitcoin container installs the latest Bitcoin Core.  Migrate a
+legacy Bitcoin wallet first, see "Migrate a legacy Bitcoin wallet".
+
     docker-compose stop
 
     pushd .
@@ -134,6 +137,38 @@ Start BasicSwap:
 
     docker-compose build --no-cache swapclient
     docker-compose up
+
+
+## Migrate a legacy Bitcoin wallet
+
+Bitcoin Core 30 and later can't load the legacy wallet of a Bitcoin install
+prepared before Bitcoin Core 30.
+Migrate the wallet while the old core still runs, before rebuilding the coin
+containers:
+
+    docker-compose stop
+
+    pushd .
+    cd ../../
+    git pull
+    popd
+
+    docker-compose build --no-cache swapclient
+
+    docker-compose -f docker-compose-prepare.yml up -d --scale swapprepare=0
+
+    docker-compose -f docker-compose-prepare.yml run -e WALLET_ENCRYPTION_PWD=walletpass \
+        --rm swapprepare \
+        basicswap-prepare --migratewallets
+
+    docker-compose -f docker-compose-prepare.yml stop
+
+Then build the remaining containers and start BasicSwap as in "Update code".
+Bitcoin Core first writes a backup of the legacy wallet,
+`<wallet name>_<time>.legacy.bak`, in the bitcoin data directory.
+If the bitcoin container was rebuilt first, BasicSwap stops at startup with a
+message to run `basicswap-prepare --migratewallets`: run the steps above from
+starting the cores.
 
 
 ## Add a coin
@@ -175,7 +210,8 @@ Prepare wallet:
 
     docker-compose -f docker-compose-prepare.yml up -d --scale swapprepare=0
 
-    docker-compose -f docker-compose-prepare.yml run -e WALLET_ENCRYPTION_PWD=walletpass \
+    read -rs WALLET_ENCRYPTION_PWD && export WALLET_ENCRYPTION_PWD
+    docker-compose -f docker-compose-prepare.yml run -e WALLET_ENCRYPTION_PWD \
         --rm swapprepare \
         basicswap-prepare --initwalletsonly --withoutcoin=particl --withcoin=${ADD_COIN}
 
@@ -186,5 +222,6 @@ Prepare wallet:
 
 # Notes
 
-Switch Basicswap repo:
-    docker-compose build swapclient --build-arg BASICSWAP_URL=https://github.com/basicswap/basicswap/archive/refs/heads/dev.zip --build-arg BASICSWAP_DIR=basicswap-dev
+Switch Basicswap repo or commit, the full commit id is required:
+    docker-compose build swapclient --build-arg BASICSWAP_COMMIT=$(git ls-remote https://github.com/basicswap/basicswap refs/heads/dev | cut -f1)
+    docker-compose build swapclient --build-arg BASICSWAP_REPO=https://github.com/<user>/basicswap.git --build-arg BASICSWAP_COMMIT=<commit>

@@ -12,11 +12,12 @@ from basicswap.interface.prepare_util import (
     CoinPrepareModule,
     PrepareContext,
     ensurePubkey,
+    readClearsigned,
     exitWithError,
     generate_salt,
 )
 
-FIRO_VERSION = os.getenv("FIRO_VERSION", "0.14.18.0")
+FIRO_VERSION = os.getenv("FIRO_VERSION", "0.14.18.2")
 FIRO_VERSION_TAG = os.getenv("FIRO_VERSION_TAG", "")
 firo_signers = {"reuben": ("0186454D63E83D85EF91DE4E1290A1D0FA7EE109",)}
 
@@ -105,8 +106,7 @@ class FIROPrepare(CoinPrepareModule):
             gpg, ctx, signing_key_name, self.signers, pubkey_filename, pubkeyurls
         )
 
-        with open(assert_path, "rb") as fp:
-            verified = gpg.verify_file(fp)
+        verified = gpg.verify(readClearsigned(assert_path)[0])
 
         self.ensureValidSignatureBy(
             ctx, verified, signing_key_name, filepath=assert_path

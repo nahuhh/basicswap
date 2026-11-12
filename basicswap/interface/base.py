@@ -9,6 +9,7 @@ import socks
 import threading
 
 from enum import IntEnum
+from math import ceil
 
 from basicswap.basicswap_util import (
     TxLockTypes,
@@ -88,6 +89,44 @@ class CoinInterface:
     def interface_type(self) -> int:
         # coin_type() returns the base coin type, interface_type() returns the coin+balance type.
         return self.coin_type()
+
+    def max_batched_lock_outputs(self):
+        # Max swap lock outputs payable in one publishBLockTxs tx; None means unbounded.
+        return None
+
+    def fundBLockTx(
+        self,
+        Kbs: bytes,
+        output_amount: int,
+        feerate: int,
+        bid_id: bytes = None,
+        cursor=None,
+    ) -> tuple[bytes, int] | None:
+        """The signed, unpublished lock tx and its lock output, None when the
+        wallet builds and sends it in one call (publishBLockTx)."""
+        return None
+
+    def fundBLockTxs(
+        self, locks, feerate: int, bid_id: bytes = None, cursor=None
+    ) -> bytes | None:
+        """The signed, unpublished tx paying every lock, None when the wallet
+        builds and sends it in one call (publishBLockTxs)."""
+        return None
+
+    def getSpendableOutputs(self):
+        # Trusted, unlocked outputs, or None when the coin cannot preselect inputs.
+        return None
+
+    @staticmethod
+    def est_tx_input_vsize() -> int:
+        return 0
+
+    @staticmethod
+    def feeForVSize(fee_rate: int, vsize: int) -> int:
+        return ceil(fee_rate * vsize / 1000)
+
+    def getSplitTxFees(self) -> tuple[int, int, int]:
+        return 0, 0, 0
 
     def setDefaults(self):
         self._unknown_wallet_seed = True
@@ -224,12 +263,9 @@ class CoinInterface:
         # swipe, that publishes it while the swipe can still be replaced.
         return False
 
-    def swipePaysKey(
-        self, swipe_tx_bytes: bytes, swipe_txid_hex: str, key: bytes
-    ) -> bool:
-        # TODO: Remove.  Bids whose swipe was built before the payout moved to a
-        # swap derived key pay a pooled address, and their mercy tx has to be
-        # signed by the wallet as it was then.
+    def swipePaysKey(self) -> bool:
+        # Whether the swipe pays the swap's KA_SWIPE key.  Where it pays a wallet
+        # address instead, the wallet signs the mercy tx.
         return True
 
     def mercySpendImportsKey(self) -> bool:
@@ -261,6 +297,11 @@ class CoinInterface:
 
     def unlockOutput(self, txid_hex: str, vout: int, cursor=None) -> None:
         pass
+
+    def getRedeemFeeRate(self):
+        """Rate per kB a redeem will pay, when the offer's committed rate does
+        not size it. None leaves the caller on the committed rate."""
+        return None
 
 
 class AdaptorSigInterface:
@@ -330,6 +371,9 @@ class Secp256k1Interface(CoinInterface, AdaptorSigInterface):
     def isValidAddressHash(self, address_hash: bytes) -> bool:
         if len(address_hash) == 20:
             return True
+
+    def decodeSwapDest(self, address: str) -> bytes:
+        return self.decodeAddress(address)
 
     def getMedianTimePastAtHeight(self, height: int) -> int | None:
         # BIP68 measures time based relative locks from the median time past of the

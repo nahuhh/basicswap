@@ -59,7 +59,15 @@ Or, on the BSX host machine create a tunnel to the node:
 
 ## SSH Tunnel to Remote BasicSwap Node
 
-While basicswap can be configured to host on an external interface:
+BasicSwap is not designed to run on the open web.  Anyone who can reach its UI or API
+controls the wallets, including withdrawals.  Keep the UI and websocket ports on loopback,
+as the defaults do ('htmlhost' and 'wshost' 127.0.0.1; the Docker setups publish them to
+the host's 127.0.0.1 only), never expose them to the internet or any network you don't
+fully trust, and use an ssh tunnel (below) to reach a node on another machine.
+
+If you host it on another interface anyway, on a network you trust, set a UI password
+first with `basicswap-prepare --client-auth-password`.  It can be configured to
+host on an external interface:
 
 If not using docker by changing 'htmlhost' and 'wshost' in basicswap.json
 For docker change 'HTML_PORT' and 'WS_PORT' in the .env file in the same dir as docker-compose.yml
@@ -165,6 +173,21 @@ Alternatively --extracoinopts can be used with --startonlycoin
 
     docker compose run --rm --service-ports swapclient basicswap-run -datadir=/coindata -withcoins=monero
 
+
+
+## CoinGecko Steps for user
+
+Price and chart data need your own CoinGecko API key. BasicSwap does not include one. A request with no key is rejected, so prices stay empty until a key is set.
+
+1. Create a key at [CoinGecko API pricing](https://www.coingecko.com/en/api/pricing).
+   - Demo: choose Create Free Account, then open the Developer Dashboard, API Keys, and add a key.
+   - Pro: use the key from a paid CoinGecko API plan.
+2. In BasicSwap open Settings, then Charts Configuration.
+3. Set CoinGecko Plan to Demo or Pro so it matches that key.
+4. Paste the key into CoinGecko API Key.
+5. Click Apply Changes.
+
+The next price fetch uses the new key. One free Demo key is enough for a single node. Do not share it. A shared key runs out of its monthly allowance.
 
 
 ## FAQ

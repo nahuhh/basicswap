@@ -31,6 +31,11 @@ class DOGEInterface(BTCInterface):
         return 192
 
     @staticmethod
+    def est_tx_input_vsize() -> int:
+        # P2PKH
+        return 148
+
+    @staticmethod
     def xmr_swap_b_lock_spend_tx_vsize() -> int:
         return 192
 
@@ -54,6 +59,16 @@ class DOGEInterface(BTCInterface):
         # Return P2PKH
         return CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
 
+    def supportsTaproot(self) -> bool:
+        return False
+
+    def isValidTxoDest(self, script: bytes) -> bool:
+        if self.isScriptP2PKH(script):
+            return True
+        if self.isScriptP2SH(script):
+            return True
+        return False
+
     def encodeScriptDest(self, script_dest: bytes) -> str:
         # Extract hash from script
         script_hash = script_dest[2:-1]
@@ -62,7 +77,7 @@ class DOGEInterface(BTCInterface):
     def getBLockSpendTxFee(self, tx, fee_rate: int) -> int:
         add_bytes = 107
         size = len(tx.serialize_with_witness()) + add_bytes
-        pay_fee = round(fee_rate * size / 1000)
+        pay_fee = self.feeForVSize(fee_rate, size)
         self._log.info(
             f"BLockSpendTx fee_rate, size, fee: {fee_rate}, {size}, {pay_fee}."
         )

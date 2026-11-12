@@ -8,7 +8,11 @@
 import hashlib
 import random
 
-from basicswap.interface.btc.btc import BTCInterface, find_vout_for_address_from_txobj
+from basicswap.interface.btc.btc import (
+    BTCInterface,
+    find_vout_for_address_from_txobj,
+    MAX_PROOF_UTXOS,
+)
 from basicswap.util import (
     i2b,
     ensure,
@@ -320,7 +324,11 @@ class FIROInterface(BTCInterface):
             if isinstance(vout, int) and vout >= 0:
                 rv["index"] = vout
             else:
-                rv["index"] = find_vout_for_address_from_txobj(tx_obj, dest_address)
+                rv["index"] = find_vout_for_address_from_txobj(
+                    tx_obj,
+                    dest_address,
+                    lambda txo: self.make_int(txo["value"]) == bid_amount,
+                )
             if rv["index"] is not None and rv["index"] >= 0:
                 rv["value"] = self.make_int(tx_obj["vout"][rv["index"]]["value"])
 
@@ -339,9 +347,17 @@ class FIROInterface(BTCInterface):
         return tx.serialize()
 
     def fundSCLockTx(
-        self, tx_bytes, feerate, vkbv=None, bid_id: bytes = None, cursor=None
+        self,
+        tx_bytes,
+        feerate,
+        vkbv=None,
+        bid_id: bytes = None,
+        cursor=None,
+        prevouts=None,
     ):
-        return self.fundTx(tx_bytes, feerate, bid_id=bid_id, cursor=cursor)
+        return self.fundTx(
+            tx_bytes, feerate, bid_id=bid_id, cursor=cursor, prevouts=prevouts
+        )
 
     def signTxWithWallet(self, tx):
         rv = self.rpc("signrawtransaction", [tx.hex()])
@@ -354,6 +370,7 @@ class FIROInterface(BTCInterface):
         sub_fee: bool = False,
         lock_unspents: bool = True,
         feerate: int = None,
+        change_addr: str = None,
     ) -> str:
         txn = self.rpc(
             "createrawtransaction", [[], {addr_to: self.format_amount(amount)}]
@@ -370,6 +387,8 @@ class FIROInterface(BTCInterface):
             "lockUnspents": lock_unspents,
             "feeRate": fee_rate,
         }
+        if change_addr:
+            options["changeAddress"] = change_addr
         if sub_fee:
             options["subtractFeeFromOutputs"] = [
                 0,
@@ -383,6 +402,16 @@ class FIROInterface(BTCInterface):
     def getScriptForPubkeyHash(self, pkh: bytes) -> bytearray:
         # Return P2PKH
         return CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
+
+    def supportsTaproot(self) -> bool:
+        return False
+
+    def isValidTxoDest(self, script: bytes) -> bool:
+        if self.isScriptP2PKH(script):
+            return True
+        if self.isScriptP2SH(script):
+            return True
+        return False
 
     def getScriptDest(self, script: bytearray) -> bytearray:
         # P2SH
@@ -410,10 +439,15 @@ class FIROInterface(BTCInterface):
     def getSpendableBalance(self) -> int:
         return self.make_int(self.rpc("getwalletinfo")["balance"])
 
+    def getBalances(self) -> tuple[int, int]:
+        wi = self.rpc("getwalletinfo")
+        balance = self.make_int(wi["balance"])
+        return balance, balance + self.make_int(wi["unconfirmed_balance"])
+
     def getBLockSpendTxFee(self, tx, fee_rate: int) -> int:
         add_bytes = 107
         size = len(tx.serialize_with_witness()) + add_bytes
-        pay_fee = round(fee_rate * size / 1000)
+        pay_fee = self.feeForVSize(fee_rate, size)
         self._log.info(
             f"BLockSpendTx fee_rate, size, fee: {fee_rate}, {size}, {pay_fee}."
         )
@@ -463,7 +497,7 @@ class FIROInterface(BTCInterface):
                 (utxo_amount, u["txid"], u["vout"])
             )
 
-        max_utxos: int = 4
+        max_utxos: int = MAX_PROOF_UTXOS
 
         viable_addrs = []
         for addr, data in unspents_by_addr.items():
@@ -544,14 +578,21 @@ class FIROInterface(BTCInterface):
             signature,
         )
         ensure(passed is True, "Proof of funds signature invalid")
+        ensure(len(set(utxos)) == len(utxos), "Duplicate proof of funds outpoint")
 
         if self.using_segwit():
             address = self.encodeSegwitAddress(decodeAddress(address)[1:])
 
+        signer_dest = bytes(self.getScriptForPubkeyHash(self.decodeAddress(address)))
         sum_value: int = 0
         for outpoint in utxos:
-            txout = self.rpc("gettxout", [outpoint[0].hex(), outpoint[1]])
-            sum_value += self.make_int(txout["value"])
+            txout = self.getTxOut(outpoint[0], outpoint[1])
+            ensure(txout is not None, "Proof of funds outpoint is spent or unknown")
+            ensure(
+                bytes(txout.scriptPubKey) == signer_dest,
+                "Proof of funds output does not pay the signing address",
+            )
+            sum_value += txout.nValue
 
         return sum_value
 
@@ -563,8 +604,11 @@ class FIROInterface(BTCInterface):
         current_height: int = chain_blocks
         block_hash = self.rpc("getblockhash", [current_height])
 
-        script_hash: bytes = self.decodeAddress(addr_find)
-        find_scriptPubKey = self.getDestForScriptHash(script_hash)
+        addr_data: bytes = decodeAddress(addr_find)
+        if addr_data[0] == self.chainparams_network()["pubkey_address"]:
+            find_scriptPubKey = self.getScriptForPubkeyHash(addr_data[1:])
+        else:
+            find_scriptPubKey = self.getDestForScriptHash(addr_data[1:])
 
         while current_height > height_start:
             block_hash = self.rpc("getblockhash", [current_height])

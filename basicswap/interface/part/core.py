@@ -6,6 +6,7 @@
 
 import base64
 import os
+import platform
 
 from basicswap.interface.part.chainparams import params
 from basicswap.interface.prepare_util import (
@@ -15,7 +16,7 @@ from basicswap.interface.prepare_util import (
 )
 
 PARTICL_REPO = os.getenv("PARTICL_REPO", "particl")
-PARTICL_VERSION = os.getenv("PARTICL_VERSION", "27.2.5.0")
+PARTICL_VERSION = os.getenv("PARTICL_VERSION", "27.2.6.0")
 PARTICL_VERSION_TAG = os.getenv("PARTICL_VERSION_TAG", "")
 PARTICL_LINUX_EXTRA = os.getenv("PARTICL_LINUX_EXTRA", "nousb")
 particl_signers = {"tecnovert": ("8E517DC12EC1CC37F6423A8A13F13651C9CF0D6B",)}
@@ -56,12 +57,19 @@ class PARTPrepare(CoinPrepareModule):
 
     def getArchName(self, ctx: PrepareContext, os_name: str, use_guix: bool) -> str:
         if os_name == "osx" and use_guix:
+            if platform.machine() == "arm64":
+                return "arm64-apple-darwin"
             return "x86_64-apple-darwin18"
         return ctx.bin_arch
 
     def getReleaseFilename(self, ctx: PrepareContext, arch_name: str) -> str:
         os_name, _ = getOSDirNames(ctx.bin_arch)
-        filename_extra = PARTICL_LINUX_EXTRA if os_name == "linux" else ""
+        if os_name == "linux":
+            filename_extra = PARTICL_LINUX_EXTRA
+        elif arch_name == "arm64-apple-darwin":
+            filename_extra = "nousb"
+        else:
+            filename_extra = ""
         if filename_extra == "":
             return super().getReleaseFilename(ctx, arch_name)
         if self.useGuix():

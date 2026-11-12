@@ -6,11 +6,17 @@
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
+from io import BytesIO
+import base64
+import collections
 import hashlib
+import itertools
 import logging
 import os
 import random
 import secrets
+import tarfile
+import tempfile
 import threading
 import unittest
 
@@ -29,11 +35,12 @@ from basicswap.basicswap import (
     SwapTypes,
 )
 from basicswap.base import BaseApp
+from basicswap.chainparams import coins_without_segwit, scriptless_coins
 from basicswap.contrib.mnemonic import Mnemonic
-from basicswap.db import create_db_, DBMethods, KnownIdentity
+from basicswap.db import Bid, create_db_, DBMethods, KnownIdentity, Offer, SwapTx
 from basicswap.util import h2b
 from basicswap.util.address import decodeAddress, toWIF
-from basicswap.util.crypto import ripemd160, hash160, blake256
+from basicswap.util.crypto import ripemd160, hash160, blake256, sha256
 from basicswap.util.extkey import ExtKeyPair
 from basicswap.util.integer import encode_varint, decode_varint
 from basicswap.util.network import (
@@ -49,6 +56,21 @@ from basicswap.util_xmr import (
     encode_address as xmr_encode_address,
 )
 from basicswap.interface.btc.btc import BTCInterface
+from basicswap.interface.btc.core import checkTarMembers
+from basicswap.interface.nmc.nmc import NMCInterface
+from basicswap.interface.bch.bch import BCHInterface
+from basicswap.interface.bch.contrib.cashaddress import Address
+from basicswap.interface.bch.contrib.script import OP_HASH256
+from basicswap.interface.dash.dash import DASHInterface
+from basicswap.interface.doge.doge import DOGEInterface
+from basicswap.interface.firo.firo import FIROInterface
+from basicswap.interface.ltc.ltc import LTCInterface
+from basicswap.interface.part.part import PARTInterface
+from basicswap.interface.pivx.pivx import PIVXInterface
+from basicswap.protocols.atomic_swap_1 import buildContractScript
+from basicswap.protocols.xmr_swap_1 import XmrSwapInterface
+from basicswap.script import OpCodes
+from basicswap.interface.electrumx import scripthash_from_address
 from basicswap.util.logging import BSXLogger
 from basicswap.interface.xmr.xmr import XMRInterface
 from tests.basicswap.util.mnemonics import mnemonics
@@ -60,7 +82,10 @@ from tests.basicswap.util.common import (
 from basicswap.config import DEFAULT_ALTRUISTIC
 from basicswap.basicswap_util import (
     ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER,
+    AddressTypes,
+    MessageNetworks,
     TxLockTypes,
+    XmrSplitMsgTypes,
 )
 from basicswap.util import (
     make_int,
@@ -72,11 +97,22 @@ from basicswap.util import (
 from basicswap.rpc import Jsonrpc, escape_rpcauth
 from basicswap.messages_npb import (
     BidMessage,
+    MessagePortalOffer,
+    OfferRevokeMessage,
+    XmrSplitMessage,
 )
+from basicswap.network.bsx_network import BSXNetwork
+from basicswap.contrib.test_framework import segwit_addr
 from basicswap.contrib.test_framework.script import (
     CScript,
+    CScriptOp,
     hash160 as hash160_btc,
     OP_CHECKMULTISIG,
+    OP_CHECKSIG,
+    OP_DUP,
+    OP_EQUAL,
+    OP_EQUALVERIFY,
+    OP_HASH160,
     SegwitV0SignatureHash,
     SIGHASH_ALL,
 )
@@ -178,6 +214,107 @@ class Test(unittest.TestCase):
         assert "altruistic" not in sc.coin_clients[Coins.LTC]
 
         del sc
+
+    def test_btc_wallet_info_balance_compatibility(self):
+        ci = self.ci_btc()
+
+        # Bitcoin Core < 30: getwalletinfo still returns balance fields.
+        calls = []
+
+        def legacy_rpc(method, params=None):
+            calls.append(method)
+            if method == "getwalletinfo":
+                return {
+                    "balance": 1.25,
+                    "unconfirmed_balance": 0.5,
+                    "immature_balance": 0.25,
+                }
+            if method == "listlockunspent":
+                return []
+            raise ValueError(f"Unexpected RPC call: {method}")
+
+        ci.rpc_wallet = legacy_rpc
+        wallet_info = ci.getWalletInfo()
+
+        assert wallet_info["balance"] == 1.25
+        assert wallet_info["unconfirmed_balance"] == 0.5
+        assert wallet_info["immature_balance"] == 0.25
+        assert "getbalances" not in calls
+
+        # Bitcoin Core >= 30: balance fields moved to getbalances.
+        calls.clear()
+
+        def core30_rpc(method, params=None):
+            calls.append(method)
+            if method == "getwalletinfo":
+                return {"walletname": "bsx_wallet"}
+            if method == "getbalances":
+                return {
+                    "mine": {
+                        "trusted": 1.25,
+                        "untrusted_pending": 0.5,
+                        "immature": 0.25,
+                    }
+                }
+            if method == "listlockunspent":
+                return []
+            raise ValueError(f"Unexpected RPC call: {method}")
+
+        ci.rpc_wallet = core30_rpc
+        wallet_info = ci.getWalletInfo()
+
+        assert wallet_info["balance"] == 1.25
+        assert wallet_info["unconfirmed_balance"] == 0.5
+        assert wallet_info["immature_balance"] == 0.25
+        assert calls.count("getbalances") == 1
+
+    def test_ltc_hogex(self):
+        from basicswap.interface.ltc.ltc import LTCInterface
+
+        ci = LTCInterface(
+            {"rpcport": 0, "rpcauth": "none", **REQUIRED_SETTINGS}, "regtest"
+        )
+        # Mainnet integrating txs: one pays a peg-out, one also spends two peg-ins
+        peg_out = bytes.fromhex(
+            "0200000000080195aac628271f342507c9d371a0ecca59ccc139cf803709057f4067d985991b650000000000ffffffff"
+            "02c8ec9d7b952400002258208ea56d108427a9ff7ebaa88dbe6b9433f9c8d8d9649d99e0611f02f904ccda15484d991a"
+            "02000000160014b566d28576e5e7bd6aa33d4e2f802cf5ea8657e20000000000"
+        )
+        peg_ins = bytes.fromhex(
+            "02000000000803dd3ce9eff8a90bb12f81ffba8725b5b817d7aaaefed4c051d43d682977ff028b0000000000ffffffff"
+            "fc55e2fca68168a2a09de875bb6cb248c2aaf2e9b9a83e0e47bb08b5d133837b0000000000fffffffffe0bddd19cfb97"
+            "94780f5ff2f53d3be4ab143b5e7d164be5c0bdabaf91d16ae70000000000ffffffff02de433796972400002258200a2c"
+            "71e5a942007a5407b628ddc6dad8210500d5faab2f981cdfda274dc9e5774e41000000000000160014846da40316c201"
+            "669d680959313128246563df730000000000"
+        )
+        for tx_bytes, txid, num_vin in (
+            (
+                peg_out,
+                "cc53a5f1ce55d19b698fc119dbc7acd5fb94825eda152a3b755bba4f4f0e87a7",
+                1,
+            ),
+            (
+                peg_ins,
+                "651b9985d967407f05093780cf39c1cc59caeca071d3c90725341f2728c6aa95",
+                3,
+            ),
+        ):
+            tx = ci.loadTx(tx_bytes)
+            tx.rehash()
+            assert tx.hash == txid
+            assert len(tx.vin) == num_vin
+            assert len(tx.vout) == 2
+
+        with_body = bytearray(peg_out)
+        with_body[-5] = 0x01
+        unknown_flag = bytearray(peg_out)
+        unknown_flag[5] = 0x0A
+        with_locktime = bytearray(peg_out)
+        with_locktime[-4] = 0x01
+        for refused in (with_body, unknown_flag, peg_out[:-2]):
+            with self.assertRaises(ValueError):
+                ci.loadTx(bytes(refused))
+        assert ci.loadTx(bytes(with_locktime)).nLockTime == 1
 
     def test_serialise_num(self):
         def test_case(v, nb=None):
@@ -412,6 +549,288 @@ class Test(unittest.TestCase):
             except Exception as e:
                 assert "Bad fee" in str(e)
 
+    def test_lock_refund_script_must_be_canonical(self):
+        ci = self.ci_btc()
+
+        Kal = ci.getPubkey(ci.getNewRandomKey())
+        Kaf = ci.getPubkey(ci.getNewRandomKey())
+        script_lock = CScript([2, Kal, Kaf, 2, OP_CHECKMULTISIG])
+
+        locked_coin: int = ci.make_int(0.1)
+        lock_tx = CTransaction()
+        lock_tx.nVersion = ci.txVersion()
+        lock_tx.vin.append(
+            CTxIn(COutPoint(uint256_from_str(secrets.token_bytes(32)), 0))
+        )
+        lock_tx.vout.append(CTxOut(locked_coin, ci.getScriptDest(script_lock)))
+        lock_tx.rehash()
+        lock_tx_bytes = lock_tx.serialize()
+
+        lock1_value = ci.getExpectedSequence(
+            TxLockTypes.SEQUENCE_LOCK_TIME, 2 * 60 * 60
+        )
+        csv_val = ci.getExpectedSequence(TxLockTypes.SEQUENCE_LOCK_TIME, 4 * 60 * 60)
+        fee_rate: int = 1000
+        refund_tx, refund_script, _ = ci.createSCLockRefundTx(
+            lock_tx_bytes, script_lock, Kal, Kaf, lock1_value, csv_val, fee_rate
+        )
+
+        def verify(tx_bytes, script):
+            ci.verifySCLockRefundTx(
+                tx_bytes,
+                lock_tx_bytes,
+                script,
+                ci.getTxid(lock_tx),
+                0,
+                lock1_value,
+                script_lock,
+                Kal,
+                Kaf,
+                csv_val,
+                locked_coin,
+                fee_rate,
+            )
+
+        verify(refund_tx, refund_script)
+
+        # The same lock 2 value, pushed with a padding byte
+        csv_push = bytes(CScript([csv_val]))
+        csv_at: int = 76
+        self.assertEqual(refund_script[csv_at : csv_at + len(csv_push)], csv_push)
+        padded_push = bytes([csv_push[0] + 1]) + csv_push[1:] + b"\x00"
+        padded_script = (
+            refund_script[:csv_at]
+            + padded_push
+            + refund_script[csv_at + len(csv_push) :]
+        )
+        tx = ci.loadTx(refund_tx)
+        tx.vout[0].scriptPubKey = ci.getScriptDest(padded_script)
+        self.assertRaisesRegex(
+            ValueError, "Bad lock refund script", verify, tx.serialize(), padded_script
+        )
+
+    def test_coin_b_key_proof_binds_the_key(self):
+        from coincurve.keys import PublicKey
+
+        ci = self.ci_btc()
+        n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        message = "proof kbsl owned for swap"
+        bid_id = secrets.token_bytes(28)
+        pkbsf = ci.getPubkey(ci.getNewRandomKey())
+
+        def scalar() -> int:
+            return int.from_bytes(secrets.token_bytes(32), "big") % (n - 1) + 1
+
+        def b32(v: int) -> bytes:
+            return v.to_bytes(32, "big")
+
+        # The old proof: a signature built from pkbsf alone recovers to a share that cancels it
+        z = int.from_bytes(sha256(message.encode("utf-8")), "big")
+        a, b = scalar(), scalar()
+        R = PublicKey.combine_keys(
+            [PrivateKey(b32(a)).public_key, PublicKey(pkbsf).multiply(b32(b))]
+        )
+        r = int.from_bytes(R.format(compressed=False)[1:33], "big") % n
+        s = (-r * pow(b, -1, n)) % n
+        X = (-a * pow(b, -1, n) - z * pow(r, -1, n)) % n
+        rogue = ci.sumPubkeys(
+            ci.getPubkey(b32(X)), PublicKey(pkbsf).multiply(b32(n - 1)).format()
+        )
+        s = min(s, n - s)
+        sig = None
+        for recid in range(4):
+            candidate = b32(r) + b32(s) + bytes([recid])
+            try:
+                if ci.verifySigAndRecover(candidate, message) == rogue:
+                    sig = candidate
+                    break
+            except Exception:
+                continue
+        self.assertIsNotNone(sig)
+        self.assertEqual(ci.sumPubkeys(rogue, pkbsf), ci.getPubkey(b32(X)))
+
+        # Once the signed hash includes the key, the same pair fails
+        self.assertRaises(
+            ValueError, ci.verifyKeyProof, rogue + sig[:64], message, bid_id
+        )
+
+        kbsl = ci.getNewRandomKey()
+        proof = ci.signKeyProof(kbsl, message, bid_id)
+        self.assertEqual(ci.verifyKeyProof(proof, message, bid_id), ci.getPubkey(kbsl))
+        self.assertRaises(
+            ValueError, ci.verifyKeyProof, proof, message, secrets.token_bytes(28)
+        )
+
+    def test_route_established_refuses_an_old_protocol_bid(self):
+        from basicswap.basicswap import MINPROTO_VERSION_ADAPTOR_SIG
+        from basicswap.basicswap_util import BidStates
+        from basicswap.db import XmrSwap
+
+        sc = BasicSwap.__new__(BasicSwap)
+        sc.fp = None
+        sc.log = BSXLogger("test")
+        sc.mock_time_offset = 0
+        offer = Offer(
+            offer_id=bytes(28),
+            coin_from=int(Coins.BTC),
+            coin_to=int(Coins.XMR),
+            swap_type=int(SwapTypes.XMR_SWAP),
+            protocol_version=MINPROTO_VERSION_ADAPTOR_SIG,
+        )
+        sent = []
+        sc.is_reverse_ads_bid = lambda coin_from, coin_to: False
+        sc.queryOne = lambda cls, cursor, filters: XmrSwap(bid_id=filters["bid_id"])
+        sc.logEvent = lambda *args, **kwargs: None
+        sc.saveBid = lambda *args, **kwargs: None
+        sc.saveBidInSession = lambda *args, **kwargs: None
+        sc.sendXmrBidMessage = lambda bid, xmr_swap, offer, cursor: sent.append(
+            bid.bid_id
+        )
+
+        for protocol_version in (
+            MINPROTO_VERSION_ADAPTOR_SIG - 1,
+            MINPROTO_VERSION_ADAPTOR_SIG,
+        ):
+            bid = Bid(
+                bid_id=bytes([protocol_version]) * 28,
+                offer_id=bytes(28),
+                state=int(BidStates.CONNECT_REQ_SENT),
+                expire_at=sc.getTime() + 3600,
+                protocol_version=protocol_version,
+            )
+            sc.getBidAndOffer = lambda bid_id, cursor: (bid, offer)
+            sc.routeEstablishedForBid(bid.bid_id, None)
+            if protocol_version < MINPROTO_VERSION_ADAPTOR_SIG:
+                self.assertEqual(bid.state, int(BidStates.BID_ERROR))
+                self.assertEqual(sent, [])
+            else:
+                self.assertEqual(bid.state, int(BidStates.BID_SENT))
+                self.assertEqual(sent, [bid.bid_id])
+
+    def test_lock_b_height_is_cleared_when_the_tx_leaves_the_chain(self):
+        from basicswap.db import XmrSwap
+
+        sc = BasicSwap.__new__(BasicSwap)
+        sc.fp = None
+        sc.log = BSXLogger("test")
+        sc.logBidEvent = lambda *args, **kwargs: None
+        sc.countBidEvents = lambda *args, **kwargs: 0
+        ci = self.ci_btc()
+        amount_to: int = 5000000
+        bid = Bid(
+            bid_id=secrets.token_bytes(28), amount_to=amount_to, chain_b_height_start=90
+        )
+        xmr_swap = XmrSwap(
+            bid_id=bid.bid_id,
+            vkbv=ci.getNewRandomKey(),
+            pkbs=ci.getPubkey(ci.getNewRandomKey()),
+        )
+        found = {
+            "txid": secrets.token_bytes(32).hex(),
+            "height": 100,
+            "index": 1,
+            "value": amount_to,
+        }
+        lookups = []
+        ci.findTxB = lambda *args, **kwargs: lookups.pop(0)
+
+        lookups.append(found)
+        self.assertTrue(sc.findTxB(ci, xmr_swap, bid, None, False))
+        self.assertEqual(bid.xmr_b_lock_tx.chain_height, 100)
+
+        lookups.append(None)
+        self.assertTrue(sc.findTxB(ci, xmr_swap, bid, None, False))
+        self.assertEqual(bid.xmr_b_lock_tx.chain_height, 0)
+        lookups.append(None)
+        self.assertFalse(sc.findTxB(ci, xmr_swap, bid, None, False))
+
+        lookups.append(dict(found, height=103))
+        self.assertTrue(sc.findTxB(ci, xmr_swap, bid, None, False))
+        self.assertEqual(bid.xmr_b_lock_tx.chain_height, 103)
+
+        # Replaced by an output of another amount
+        lookups.append(dict(found, value=amount_to - 1))
+        self.assertTrue(sc.findTxB(ci, xmr_swap, bid, None, False))
+        self.assertEqual(bid.xmr_b_lock_tx.chain_height, 0)
+
+    def test_lock_release_waits_for_a_lock_tx_b_that_left_the_chain(self):
+        from basicswap.basicswap_util import BidStates, TxTypes
+        from basicswap.db import XmrOffer, XmrSwap
+        from basicswap.util import TemporaryError
+
+        sc = BasicSwap.__new__(BasicSwap)
+        sc.fp = None
+        sc.log = BSXLogger("test")
+        sc.logBidEvent = lambda *args, **kwargs: None
+        sc.countBidEvents = lambda *args, **kwargs: 0
+        ci = self.ci_btc()
+        ci.blocks_confirmed = 2
+        chain = {"height": 110, "found": None}
+        ci.getChainHeight = lambda: chain["height"]
+        ci.findTxB = lambda *args, **kwargs: chain["found"]
+        sc.ci = lambda coin: ci
+        sc.is_reverse_ads_bid = lambda coin_from, coin_to: False
+        sc.SMSG_SECONDS_IN_HOUR = 60 * 60
+
+        amount_to: int = 5000000
+        lock_txid: bytes = secrets.token_bytes(32)
+        offer = Offer(
+            offer_id=secrets.token_bytes(28),
+            coin_from=int(Coins.PART),
+            coin_to=int(Coins.BTC),
+            lock_type=int(TxLockTypes.SEQUENCE_LOCK_BLOCKS),
+            addr_from="offer_addr",
+        )
+        bid = Bid(
+            bid_id=secrets.token_bytes(28),
+            offer_id=offer.offer_id,
+            amount_to=amount_to,
+            chain_b_height_start=90,
+            was_received=True,
+            bid_addr="bid_addr",
+            state=int(BidStates.XMR_SWAP_NOSCRIPT_COIN_LOCKED),
+        )
+        # Ten blocks deep by the stored height
+        bid.xmr_b_lock_tx = SwapTx(
+            bid_id=bid.bid_id,
+            tx_type=TxTypes.XMR_SWAP_B_LOCK,
+            txid=lock_txid,
+            vout=1,
+            chain_height=100,
+        )
+        xmr_swap = XmrSwap(
+            bid_id=bid.bid_id,
+            vkbv=ci.getNewRandomKey(),
+            pkbs=ci.getPubkey(ci.getNewRandomKey()),
+            b_lock_tx_id=lock_txid,
+            al_lock_spend_tx_esig=secrets.token_bytes(64),
+        )
+        sent = []
+        sc.getXmrBidFromSession = lambda cursor, bid_id: (bid, xmr_swap)
+        sc.getXmrOfferFromSession = lambda cursor, offer_id: (offer, XmrOffer())
+        sc.sendMessage = lambda *args, **kwargs: sent.append(args[1]) or b"msg_id"
+        sc.addMessageLink = lambda *args, **kwargs: None
+        sc.saveBidInSession = lambda *args, **kwargs: None
+
+        self.assertRaises(TemporaryError, sc.sendXmrBidLockRelease, bid.bid_id, None)
+        self.assertEqual(bid.xmr_b_lock_tx.chain_height, 0)
+
+        # Mined again, one confirmation short
+        chain["found"] = {
+            "txid": lock_txid.hex(),
+            "height": 109,
+            "index": 1,
+            "value": amount_to,
+        }
+        self.assertRaises(TemporaryError, sc.sendXmrBidLockRelease, bid.bid_id, None)
+        self.assertEqual(sent, [])
+        self.assertEqual(bid.state, int(BidStates.XMR_SWAP_NOSCRIPT_COIN_LOCKED))
+
+        chain["height"] = 111
+        sc.sendXmrBidLockRelease(bid.bid_id, None)
+        self.assertEqual(sent, ["bid_addr"])
+        self.assertEqual(bid.state, int(BidStates.XMR_SWAP_LOCK_RELEASED))
+
     def test_compare_fee_rates(self):
         # compareFeeRates must accept every fee feeForVSize can produce
         ci = self.ci_btc()
@@ -640,12 +1059,330 @@ class Test(unittest.TestCase):
         addr = ci.pubkey_to_address(pk)
         assert addr == "mj6SdSxmWRmdDqR5R3FfZmRiLmQfQAsLE8"
 
+    def test_dest_for_address_keeps_the_witness_version(self):
+        ci = self.ci_btc()
+        hrp = ci.chainparams_network()["hrp"]
+        program = bytes(range(32))
+        for version in (0, 1):
+            address = segwit_addr.encode_segwit_address(hrp, version, program)
+            script = ci.getDestForAddress(address)
+            assert script == CScript([CScriptOp.encode_op_n(version), program])
+
+    def test_dest_for_address_accepts_uppercase(self):
+        ci = self.ci_btc()
+        hrp = ci.chainparams_network()["hrp"]
+        address = segwit_addr.encode_segwit_address(hrp, 1, bytes(range(32)))
+        assert ci.getDestForAddress(address.upper()) == ci.getDestForAddress(address)
+
+    def test_base58_address_starting_like_bech32(self):
+        settings = {"rpcport": 0, "rpcauth": "none"}
+        settings.update(REQUIRED_SETTINGS)
+        ci = PARTInterface(settings, "mainnet", swap_client=_FakeSwapClient())
+        pkh = bytes.fromhex("fd18") + bytes(18)
+        address = ci.pkh_to_address(pkh)
+        assert address.startswith("Pw1")
+        assert ci.decodeAddress(address) == pkh
+
+    def test_scripthash_from_address_keeps_the_witness_version(self):
+        ci = self.ci_btc()
+        network_params = ci.chainparams_network()
+        program = bytes(range(32))
+        for version in (0, 1):
+            address = segwit_addr.encode_segwit_address(
+                network_params["hrp"], version, program
+            )
+            script = CScript([CScriptOp.encode_op_n(version), program])
+            expected = sha256(bytes(script))[::-1].hex()
+            assert scripthash_from_address(address, network_params) == expected
+
+    def test_decode_address_refuses_non_v0(self):
+        ci = self.ci_btc()
+        hrp = ci.chainparams_network()["hrp"]
+        program = bytes(range(20))
+        v0_address = segwit_addr.encode_segwit_address(hrp, 0, program)
+        assert ci.decodeAddress(v0_address) == program
+        v1_address = segwit_addr.encode_segwit_address(hrp, 1, bytes(range(32)))
+        with self.assertRaises(ValueError):
+            ci.decodeAddress(v1_address)
+
+    def test_dest_for_address_refuses_unpayable_versions(self):
+        ci = self.ci_btc()
+        hrp = ci.chainparams_network()["hrp"]
+        for version, program in ((1, bytes(range(20))), (2, bytes(range(32)))):
+            address = segwit_addr.encode_segwit_address(hrp, version, program)
+            with self.assertRaises(ValueError):
+                ci.getDestForAddress(address)
+
+        nmc_coin_settings = {"rpcport": 0, "rpcauth": "none"}
+        nmc_coin_settings.update(REQUIRED_SETTINGS)
+        ci_nmc = NMCInterface(nmc_coin_settings, "regtest")
+        nmc_hrp = ci_nmc.chainparams_network()["hrp"]
+        taproot = segwit_addr.encode_segwit_address(nmc_hrp, 1, bytes(range(32)))
+        with self.assertRaises(ValueError):
+            ci_nmc.getDestForAddress(taproot)
+
+    def test_is_valid_address_checks_the_witness_version(self):
+        ci = self.ci_btc()
+        hrp = ci.chainparams_network()["hrp"]
+        taproot = segwit_addr.encode_segwit_address(hrp, 1, bytes(range(32)))
+        future = segwit_addr.encode_segwit_address(hrp, 2, bytes(range(32)))
+
+        ci.rpc_wallet = lambda method, params=None: {"isvalid": True}
+        assert ci.isValidAddress(taproot) is True
+        assert ci.isValidAddress(future) is False
+
+        ci._connection_type = "electrum"
+        assert ci.isValidAddress(taproot) is True
+        assert ci.isValidAddress(future) is False
+
+        nmc_coin_settings = {"rpcport": 0, "rpcauth": "none"}
+        nmc_coin_settings.update(REQUIRED_SETTINGS)
+        ci_nmc = NMCInterface(nmc_coin_settings, "regtest")
+        ci_nmc.rpc_wallet = lambda method, params=None: {"isvalid": True}
+        nmc_hrp = ci_nmc.chainparams_network()["hrp"]
+        nmc_taproot = segwit_addr.encode_segwit_address(nmc_hrp, 1, bytes(range(32)))
+        assert ci_nmc.isValidAddress(nmc_taproot) is False
+
+    def test_describe_tx_names_taproot_outputs(self):
+        ci = self.ci_btc()
+        hrp = ci.chainparams_network()["hrp"]
+        program = bytes(range(32))
+        tx = CTransaction()
+        tx.vin.append(CTxIn(COutPoint(1, 0)))
+        tx.vout.append(CTxOut(1000, CScript([CScriptOp.encode_op_n(1), program])))
+        rv = ci._describeTxLocal(tx.serialize().hex())
+        expected = segwit_addr.encode_segwit_address(hrp, 1, program)
+        assert rv["vout"][0]["scriptPubKey"]["address"] == expected
+
+    def test_spend_b_lock_pays_what_the_address_means(self):
+        ci = self.ci_btc()
+        hrp = ci.chainparams_network()["hrp"]
+        pk = ci.getPubkey(ci.getNewRandomKey())
+        redeem_script = CScript([pk, OP_CHECKSIG])
+        program = bytes(range(32))
+        cases = (
+            (
+                ci.encode_p2sh(redeem_script),
+                CScript([OP_HASH160, hash160(redeem_script), OP_EQUAL]),
+            ),
+            (
+                ci.pubkey_to_address(pk),
+                CScript([OP_DUP, OP_HASH160, hash160(pk), OP_EQUALVERIFY, OP_CHECKSIG]),
+            ),
+            (
+                segwit_addr.encode_segwit_address(hrp, 0, hash160(pk)),
+                CScript([CScriptOp.encode_op_n(0), hash160(pk)]),
+            ),
+            (
+                segwit_addr.encode_segwit_address(hrp, 1, program),
+                CScript([CScriptOp.encode_op_n(1), program]),
+            ),
+        )
+        published = []
+        ci.getBLockTxo = lambda txid, vout, script_pk: (0, 100000)
+        ci.getBLockSpendTxFee = lambda tx, fee: 1000
+        ci.signTxWithKey = lambda tx, key, prev_amount=None: tx
+        ci.publishTx = lambda tx: published.append(tx) or "00" * 32
+        for address, expected in cases:
+            ci.spendBLockTx(
+                bytes(32), address, None, ci.getNewRandomKey(), 100000, 1000, 0
+            )
+            tx = ci.loadTx(published[-1])
+            assert bytes(tx.vout[0].scriptPubKey) == bytes(expected)
+
+    def test_swap_dest_is_a_key_hash_or_a_script_peers_accept(self):
+        settings = {"rpcport": 0, "rpcauth": "none"}
+        settings.update(REQUIRED_SETTINGS)
+        ci = self.ci_btc()
+        ci_part = PARTInterface(settings, "regtest")
+        ci_doge = DOGEInterface(settings, "regtest")
+        ci_nmc = NMCInterface(settings, "regtest")
+
+        pk = ci.getPubkey(ci.getNewRandomKey())
+        pkh = hash160(pk)
+        redeem_script = CScript([pk, OP_CHECKSIG])
+        program = bytes(range(32))
+        p2pkh = CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
+        p2sh = CScript([OP_HASH160, hash160(redeem_script), OP_EQUAL])
+        p2wpkh = CScript([CScriptOp.encode_op_n(0), pkh])
+        p2wsh = CScript([CScriptOp.encode_op_n(0), program])
+        p2tr = CScript([CScriptOp.encode_op_n(1), program])
+
+        def segwit(ci, version, data):
+            hrp = ci.chainparams_network()["hrp"]
+            return segwit_addr.encode_segwit_address(hrp, version, data)
+
+        accepted = (
+            (ci, ci.pubkey_to_address(pk), p2pkh),
+            (ci, ci.encode_p2sh(redeem_script), p2sh),
+            (ci, segwit(ci, 0, pkh), pkh),
+            (ci, segwit(ci, 0, program), p2wsh),
+            (ci, segwit(ci, 1, program), p2tr),
+            (ci_part, ci_part.pubkey_to_address(pk), pkh),
+            (ci_part, ci_part.encode_p2sh(redeem_script), p2sh),
+            (ci_part, segwit(ci_part, 0, pkh), p2wpkh),
+            (ci_part, segwit(ci_part, 0, program), p2wsh),
+            (ci_doge, ci_doge.pubkey_to_address(pk), pkh),
+            (ci_doge, ci_doge.encode_p2sh(redeem_script), p2sh),
+        )
+        for coin_ci, address, expected in accepted:
+            assert coin_ci.decodeSwapDest(address) == bytes(expected), address
+
+        refused = (
+            (ci, segwit(ci, 2, program)),
+            (ci_part, segwit(ci_part, 1, program)),
+            (ci_doge, segwit(ci_doge, 0, pkh)),
+            (ci_nmc, segwit(ci_nmc, 1, program)),
+        )
+        for coin_ci, address in refused:
+            with self.assertRaises(ValueError):
+                coin_ci.decodeSwapDest(address)
+        for coin_ci in (ci_part, ci_nmc):
+            with self.assertRaises(ValueError):
+                coin_ci.getDestForAddress(segwit(coin_ci, 1, program))
+
+    def test_lock_spend_pays_every_swap_dest_a_coin_accepts(self):
+        def ci_for(cls):
+            settings = {"rpcport": 0, "rpcauth": "none"}
+            settings.update(REQUIRED_SETTINGS)
+            ci = cls(settings, "regtest")
+            ci._log = BSXLogger("test")
+            return ci
+
+        hash20 = bytes(range(20))
+        hash32 = bytes(range(32))
+        dests = [hash20] + [
+            bytes(script)
+            for script in (
+                CScript([OP_DUP, OP_HASH160, hash20, OP_EQUALVERIFY, OP_CHECKSIG]),
+                CScript([OP_HASH160, hash20, OP_EQUAL]),
+                CScript([CScriptOp.encode_op_n(0), hash20]),
+                CScript([CScriptOp.encode_op_n(0), hash32]),
+                CScript([CScriptOp.encode_op_n(1), hash32]),
+                CScript([CScriptOp.encode_op_n(2), hash32]),
+            )
+        ]
+        fee = 1000
+        for cls in (
+            BTCInterface,
+            LTCInterface,
+            NMCInterface,
+            PARTInterface,
+            DOGEInterface,
+            DASHInterface,
+            FIROInterface,
+            PIVXInterface,
+            BCHInterface,
+        ):
+            ci = ci_for(cls)
+            if ci.coin_type() in coins_without_segwit + scriptless_coins:
+                continue
+            for dest in dests:
+                if not BasicSwap.isValidSwapDest(None, ci, dest):
+                    continue
+                Kal = ci.getPubkey(ci.getNewRandomKey())
+                Kaf = ci.getPubkey(ci.getNewRandomKey())
+                lock_args = {}
+                if cls is BCHInterface:
+                    refund_script = ci.genScriptLockTxScript(
+                        ci,
+                        Kal,
+                        Kaf,
+                        mining_fee=fee,
+                        out_1=ci.getScriptForPubkeyHash(bytes(range(20, 40))),
+                        out_2=ci.getScriptForPubkeyHash(dest),
+                        public_key=Kaf,
+                        timelock=24,
+                    )
+                    lock_args = {
+                        "mining_fee": fee,
+                        "out_1": ci.getScriptForPubkeyHash(dest),
+                        "out_2": ci.scriptToP2SH32LockingBytecode(refund_script),
+                        "public_key": Kal,
+                        "timelock": 48,
+                    }
+                script_lock = XmrSwapInterface().genScriptLockTxScript(
+                    ci, Kal, Kaf, **lock_args
+                )
+                lock_bytes = ci.createSCLockTx(200000, script_lock)
+                tx_lock = ci.loadTx(lock_bytes, allow_witness=False)
+                tx_lock.vin.append(CTxIn(COutPoint(1, 0)))
+                tx_lock_bytes = tx_lock.serialize()
+                spend_tx = ci.createSCLockSpendTx(tx_lock_bytes, script_lock, dest, fee)
+                pays = dest
+                if ci.isValidAddressHash(dest):
+                    pays = bytes(ci.getScriptForPubkeyHash(dest))
+                assert bytes(ci.loadTx(spend_tx).vout[0].scriptPubKey) == pays, (
+                    ci.coin_name(),
+                    dest.hex(),
+                )
+                assert ci.verifySCLockSpendTx(
+                    spend_tx, tx_lock_bytes, script_lock, dest, fee
+                ), (ci.coin_name(), dest.hex())
+
+    def test_bch_dest_for_address_follows_the_address_type(self):
+        bch_coin_settings = {"rpcport": 0, "rpcauth": "none"}
+        bch_coin_settings.update(REQUIRED_SETTINGS)
+        ci = BCHInterface(bch_coin_settings, "regtest")
+        hash20 = bytes(range(20))
+        hash32 = bytes(range(32))
+        p2pkh = Address("P2PKH-REGTEST", list(hash20)).cash_address()
+        p2sh20 = Address("P2SH20-REGTEST", list(hash20)).cash_address()
+        p2sh32 = Address("P2SH32-REGTEST", list(hash32)).cash_address()
+        assert ci.getDestForAddress(p2pkh) == ci.getScriptForPubkeyHash(hash20)
+        assert ci.getDestForAddress(p2sh20) == CScript([OP_HASH160, hash20, OP_EQUAL])
+        assert ci.getDestForAddress(p2sh32) == CScript([OP_HASH256, hash32, OP_EQUAL])
+        assert ci.decodeSwapDest(p2pkh) == hash20
+        with self.assertRaises(ValueError):
+            ci.decodeSwapDest(p2sh20)
+
     def test_dleag(self):
         ci = self.ci_xmr()
 
         key = ci.getNewRandomKey()
         proof = ci.proveDLEAG(key)
         assert ci.verifyDLEAG(proof)
+
+    def test_xmr_lock_fee_covers_any_inputs_the_wallet_picks(self):
+        ci = self.ci_xmr()
+
+        def fee_for(n_inputs: int) -> int:
+            return 1000 + 700 * n_inputs
+
+        def wallet_funds(values, amount: int) -> bool:
+            # transfer takes one output that covers it, else outputs in any order
+            if any(v >= amount + fee_for(2) for v in values):
+                return True
+            for order in itertools.permutations(values):
+                covered = 0
+                for n_inputs, value in enumerate(order, start=1):
+                    covered += value
+                    if covered >= amount + fee_for(max(n_inputs, 2)):
+                        break
+                else:
+                    return False
+            return True
+
+        for values in ([5, 300, 2000, 9000, 9000], [5, 5, 20000]):
+            ci._lockTxFeeModel = lambda values=values: (sorted(values), fee_for)
+
+            amount = ci.estMaxLockAmount(1)
+            assert amount > 0
+            assert wallet_funds(values, amount)
+            assert amount + ci.estLockTxsFee(amount, 1) <= sum(values)
+
+            amount = ci.estMaxLockAmount(2)
+            assert amount + ci.estLockTxsFee(amount, 2) <= sum(values)
+
+    def test_xmr_lock_fee_refuses_more_inputs_than_a_tx_takes(self):
+        ci = self.ci_xmr()
+        ci._lockTxFeeModel = lambda: ([800] * 150, lambda n: 1000 + 700 * n)
+
+        amount = ci.estMaxLockAmount(1)
+        ci.estLockTxsFee(amount, 1)
+        with self.assertRaises(ValueError) as e:
+            ci.estLockTxsFee(amount + 100, 1)
+        assert "Consolidate" in str(e.exception)
 
     def test_rate(self):
         scale_from = 8
@@ -956,6 +1693,106 @@ class Test(unittest.TestCase):
         for url, allowed in test_urls:
             assert is_url_scheme_allowed(url) is allowed
 
+    def test_redact_secrets_for_logs(self):
+        from basicswap.bin.run import redactArgs
+        from basicswap.rpc import redact_url
+
+        args = [
+            "/bin/firod",
+            "-datadir=/data/firo",
+            "-hdseed=00ff",
+            '--pass="pwd"',
+            "--daemon-login",
+            "user:pwd",
+            "--trusted-daemon",
+        ]
+        assert redactArgs(args) == (
+            "/bin/firod -datadir=/data/firo -hdseed=*** --pass=*** "
+            "--daemon-login *** --trusted-daemon"
+        )
+        assert (
+            redact_url("http://user:pwd@127.0.0.1:19792/wallet/w")
+            == "http://127.0.0.1:19792/wallet/w"
+        )
+        assert redact_url("http://127.0.0.1:19792/") == "http://127.0.0.1:19792/"
+        assert (
+            redact_url("http://user:p/w?x#y@z@127.0.0.1:19792/")
+            == "http://127.0.0.1:19792/"
+        )
+
+    def test_prepare_stop_timeout_hides_args(self):
+        import subprocess
+        from types import SimpleNamespace
+        from basicswap.bin.prepare import finalise_daemon
+
+        def wait(timeout):
+            raise subprocess.TimeoutExpired(["firod", "-hdseed=00ff"], timeout)
+
+        handle = SimpleNamespace(pid=1, send_signal=lambda sig: None, wait=wait)
+        with self.assertLogs(level="INFO") as logs:
+            finalise_daemon(SimpleNamespace(name="firod", handle=handle, files=[]))
+        assert "timed out after 120 seconds" in logs.output[-1]
+        assert not any("00ff" in line for line in logs.output)
+
+    def test_prepare_read_secret(self):
+        import io
+        from unittest import mock
+        from basicswap.bin.prepare import readSecret
+
+        with mock.patch("sys.stdin", io.StringIO("word1 word2\n")):
+            assert readSecret("Particl mnemonic: ") == "word1 word2"
+        tty = mock.Mock(isatty=lambda: True)
+        with (
+            mock.patch("sys.stdin", tty),
+            mock.patch("getpass.getpass", side_effect=["pwd", "pwd"]),
+        ):
+            assert readSecret("Password: ", confirm=True) == "pwd"
+        with (
+            mock.patch("sys.stdin", tty),
+            mock.patch("getpass.getpass", side_effect=["pwd", "other"]),
+        ):
+            with self.assertRaises(SystemExit):
+                readSecret("Password: ", confirm=True)
+
+    def test_release_hash_in_signed_text(self):
+        from types import SimpleNamespace
+        from basicswap.interface.prepare_util import getFileHash
+        from basicswap.interface.wow.core import prepare_module as wow_prepare
+        from basicswap.interface.xmr.core import prepare_module as xmr_prepare
+
+        ctx = SimpleNamespace(logger=logging.getLogger())
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release_path = os.path.join(tmp_dir, "release.tar.bz2")
+            with open(release_path, "wb") as fp:
+                fp.write(b"release")
+            release_hash = getFileHash(release_path)
+            other_hash = sha256(b"other").hex()
+
+            def signed(text: str) -> str:
+                return (
+                    "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"
+                    f"{text}\n-----BEGIN PGP SIGNATURE-----\n\n"
+                    "iQ==\n-----END PGP SIGNATURE-----\n"
+                )
+
+            assert_path = os.path.join(tmp_dir, "hashes.txt")
+
+            def verify(contents: str) -> None:
+                with open(assert_path, "w") as fp:
+                    fp.write(contents)
+                for prepare_module in (xmr_prepare, wow_prepare):
+                    prepare_module.verifyCoreHash(ctx, release_path, assert_path)
+
+            verify(signed(f"release.tar.bz2, {release_hash}"))
+            # The signature covers only the text between the markers
+            for unsigned in (
+                signed(f"release.tar.bz2, {other_hash}") + f"{release_hash}\n",
+                f"{release_hash}\n" + signed(f"release.tar.bz2, {other_hash}"),
+                signed(f"release.tar.bz2, {other_hash}")
+                + signed(f"release.tar.bz2, {release_hash}"),
+            ):
+                self.assertRaises(ValueError, verify, unsigned)
+
     def test_is_public_url(self):
         # Non-http(s) schemes and internal hosts must be rejected; a public IP
         # literal (resolves to itself, no DNS needed) must be accepted.
@@ -968,10 +1805,119 @@ class Test(unittest.TestCase):
             ("http://10.0.0.5", False),
             ("http://192.168.1.1/", False),
             ("https://[::1]/", False),
+            ("http://100.64.0.1", False),
+            ("http://224.0.0.1", False),
+            ("http://[ff02::1]/", False),
+            ("http://[::ffff:10.0.0.5]/", False),
+            ("http://[64:ff9b::a00:5]/", False),
             ("https://8.8.8.8", True),
+            ("http://[64:ff9b::808:808]/", True),
         ]
         for url, is_public in test_urls:
             assert is_public_url(url) is is_public
+
+    def test_read_url_limits(self):
+        import http.server
+        import time
+        from types import SimpleNamespace
+        from unittest import mock
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                try:
+                    if self.path == "/slowheaders":
+                        self.flush_headers()
+                        for _ in range(20):
+                            self.wfile.write(b"X-Slow: x\r\n")
+                            self.wfile.flush()
+                            time.sleep(0.1)
+                    self.end_headers()
+                    if self.path == "/big":
+                        self.wfile.write(b"x" * 2048)
+                        return
+                    for _ in range(20):
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        app = SimpleNamespace(use_tor_proxy=False)
+        try:
+            with mock.patch("basicswap.base.READ_URL_MAX_BYTES", 2048):
+                assert BaseApp.readURL(app, url + "/big") == b"x" * 2048
+            with mock.patch("basicswap.base.READ_URL_MAX_BYTES", 1024):
+                with self.assertRaises(ValueError):
+                    BaseApp.readURL(app, url + "/big")
+            for path in ("/slow", "/slowheaders"):
+                with self.assertRaises(TimeoutError):
+                    BaseApp.readURL(app, url + path, timeout=0.5)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_read_url_pinned(self):
+        import http.server
+        import socket
+        from types import SimpleNamespace
+        from unittest import mock
+
+        hosts = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hosts.append(self.headers["Host"])
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        real_getaddrinfo = socket.getaddrinfo
+
+        def getaddrinfo(host, *args, **kwargs):
+            if host == "rebind.example":
+                host = "127.0.0.1"
+            return real_getaddrinfo(host, *args, **kwargs)
+
+        url = f"http://rebind.example:{port}/"
+        app = SimpleNamespace(use_tor_proxy=False)
+        try:
+            with (
+                mock.patch("socket.getaddrinfo", getaddrinfo),
+                mock.patch("urllib.request.getproxies", return_value={}),
+            ):
+                with self.assertRaises(ValueError):
+                    BaseApp.readURL(app, url, check_public=True)
+                assert hosts == []
+                with mock.patch(
+                    "basicswap.base.is_public_ip_address", return_value=True
+                ):
+                    assert BaseApp.readURL(app, url, check_public=True) == b"ok"
+                assert hosts == [f"rebind.example:{port}"]
+            with mock.patch(
+                "urllib.request.getproxies",
+                return_value={"http": f"http://127.0.0.1:{port}"},
+            ):
+                assert (
+                    BaseApp.readURL(app, "http://rebind.example/", check_public=True)
+                    == b"ok"
+                )
+            assert hosts[-1] == "rebind.example"
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_normalize_allowed_hosts(self):
         from basicswap.util.network import normalize_allowed_hosts
@@ -1214,6 +2160,79 @@ class Test(unittest.TestCase):
         for headers, settings, expected in cases:
             assert check(Stub(settings), headers) is expected, (headers, settings)
 
+    def queuedWsHandler(self, queue_bytes: int, small_buffer: bool = False):
+        import socket
+        import threading
+        from types import SimpleNamespace
+        from basicswap.contrib.websocket_server.websocket_server import (
+            WebSocketHandler,
+        )
+
+        ours, peer = socket.socketpair()
+        if small_buffer:
+            ours.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        handler = WebSocketHandler.__new__(WebSocketHandler)
+        handler.server = SimpleNamespace(
+            send_queue_bytes=queue_bytes, _client_left_=lambda h: None
+        )
+        handler.request = ours
+        handler.client_address = ("127.0.0.1", 1)
+        handler.timeout = 2
+        handler._send_lock = threading.Lock()
+        handler.setup()
+        self.addCleanup(peer.close)
+        self.addCleanup(ours.close)
+        return handler, peer
+
+    def readWs(self, peer, size: int) -> bytes:
+        data = b""
+        peer.settimeout(5)
+        while len(data) < size:
+            chunk = peer.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    def test_ws_send_queue_does_not_block_and_drops_a_stalled_reader(self):
+        handler, peer = self.queuedWsHandler(1024 * 1024, small_buffer=True)
+        frame = bytes(range(256)) * 256
+        for _ in range(12):
+            handler.send_bytes(frame)
+        with self.assertRaises(ConnectionError):
+            for _ in range(8):
+                handler.send_bytes(frame)
+        self.assertFalse(handler.keep_alive)
+        with self.assertRaises(ConnectionError):
+            handler.send_bytes(b"late")
+
+    def test_ws_send_queue_keeps_order_and_flushes_on_finish(self):
+        import socket
+        import threading
+        import time
+
+        handler, peer = self.queuedWsHandler(1024 * 1024, small_buffer=True)
+        received = []
+
+        def read():
+            time.sleep(0.1)
+            received.append(self.readWs(peer, 50 * 8 + 8))
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        for n in range(50):
+            handler.send_bytes(b"msg %02d" % n)
+        handler.send_close(reason=b"prov")
+        handler.finish()
+        handler.request.shutdown(socket.SHUT_WR)
+        reader.join(10)
+        data = received[0]
+        self.assertEqual(
+            [data[i + 2 : i + 8] for i in range(0, 50 * 8, 8)],
+            [b"msg %02d" % n for n in range(50)],
+        )
+        self.assertEqual(data[50 * 8 + 4 :], b"prov")
+
     def test_ws_handshake_bad_request(self):
         # Anything that is not a websocket handshake (port scans, a client that
         # closes before sending, a TLS hello) must close the connection instead
@@ -1223,9 +2242,21 @@ class Test(unittest.TestCase):
             WebSocketHandler,
         )
 
+        class Connection:
+            def settimeout(self, timeout):
+                pass
+
+        class Server:
+            _handshake_lock = threading.Lock()
+            _pending_handshakes = 0
+            max_pending_handshakes = None
+
         def make_handler(data: bytes):
             handler = WebSocketHandler.__new__(WebSocketHandler)
+            handler._handshake_timer = threading.Timer(1000, lambda: None)
             handler.rfile = io.BytesIO(data)
+            handler.connection = Connection()
+            handler.server = Server()
             handler.keep_alive = True
             handler.handshake_done = False
             handler.valid_client = False
@@ -1248,6 +2279,298 @@ class Test(unittest.TestCase):
         handler = make_handler(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         handler.handshake()
         assert handler.keep_alive is False
+
+    def test_ws_handshake_limits(self):
+        import socket
+        import time
+        from unittest import mock
+        from basicswap.contrib.websocket_server import websocket_server as ws
+
+        def handler_for(data):
+            sock, peer = socket.socketpair()
+            sock.settimeout(3)
+            handler = ws.WebSocketHandler.__new__(ws.WebSocketHandler)
+            handler.request = handler.connection = sock
+            handler.rfile = sock.makefile("rb")
+            handler.timeout = 1000
+            handler._start_handshake_timer(sock)
+            peer.sendall(data)
+            return handler, peer
+
+        request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\r\n"
+        handler, peer = handler_for(request)
+        assert handler.read_http_headers() == {
+            "host": "localhost",
+            "upgrade": "websocket",
+        }
+        peer.close()
+
+        for data in (
+            b"GET / HTTP/1.1\r\n" + b"X-Repeat: y\r\n" * 200 + b"\r\n",
+            b"GET / HTTP/1.1\r\n" + b"no colon\r\n" * 200 + b"\r\n",
+            b"GET / HTTP/1.1\r\n" + (b"X: " + b"y" * 4000 + b"\r\n") * 20 + b"\r\n",
+        ):
+            handler, peer = handler_for(data)
+            assert handler.read_http_headers() is None
+            peer.close()
+
+        with mock.patch.object(ws, "HANDSHAKE_TIMEOUT", 0.2):
+            handler, peer = handler_for(b"GET / HTTP/1.1\r\nHost: localhost\r\nX: ")
+            stop = threading.Event()
+
+            def trickle():
+                while not stop.is_set():
+                    try:
+                        peer.sendall(b"y")
+                    except OSError:
+                        return
+                    time.sleep(0.05)
+
+            threading.Thread(target=trickle, daemon=True).start()
+            start = time.monotonic()
+            assert handler.read_http_headers() is None
+            assert time.monotonic() - start < 2
+            stop.set()
+            peer.close()
+
+        class Srv:
+            _handshake_lock = threading.Lock()
+            _pending_handshakes = ws.MAX_PENDING_HANDSHAKES
+            max_pending_handshakes = ws.MAX_PENDING_HANDSHAKES
+
+        handler, peer = handler_for(request)
+        handler.server = Srv()
+        handler.keep_alive = True
+        handler.handshake()
+        assert handler.keep_alive is False
+        assert Srv._pending_handshakes == ws.MAX_PENDING_HANDSHAKES
+        assert handler.rfile.readline() == b"GET / HTTP/1.1\r\n"
+        peer.close()
+
+        checked = []
+
+        class Uncapped(Srv):
+            max_pending_handshakes = None
+
+            def origin_check(self, headers):
+                checked.append(headers)
+                return True
+
+        handler, peer = handler_for(request)
+        handler.server = Uncapped()
+        handler.keep_alive = True
+        handler.handshake()
+        assert checked == [{"host": "localhost", "upgrade": "websocket"}]
+        assert Uncapped._pending_handshakes == ws.MAX_PENDING_HANDSHAKES
+        peer.close()
+
+    def test_ws_tls_handshake_timeout(self):
+        import socket
+        import ssl
+        from unittest import mock
+        from basicswap.contrib.websocket_server import websocket_server as ws
+
+        timeouts = []
+
+        class Context:
+            def __init__(self, protocol):
+                pass
+
+            def load_cert_chain(self, cert, key):
+                pass
+
+            def wrap_socket(self, sock, server_side):
+                timeouts.append(sock.gettimeout())
+                raise ssl.SSLError("handshake timed out")
+
+        class Srv:
+            key = "key.pem"
+            cert = "cert.pem"
+
+        sock, peer = socket.socketpair()
+        try:
+            with mock.patch.object(ws.ssl, "SSLContext", Context):
+                ws.WebSocketHandler(sock, ("127.0.0.1", 1), Srv())
+            assert timeouts == [ws.HANDSHAKE_TIMEOUT]
+        finally:
+            sock.close()
+            peer.close()
+
+    def test_http_post_limits(self):
+        import base64
+        from unittest import mock
+        from basicswap import http_server
+        from basicswap.http_server import HttpHandler
+
+        class SwapClient:
+            log = logging
+
+            def __init__(self, settings):
+                self.settings = settings
+
+        class Srv:
+            host_name = "127.0.0.1"
+            port_no = 12700
+
+            def __init__(self, settings):
+                self.swap_client = SwapClient(settings)
+                self.session_lock = threading.Lock()
+                self.active_sessions = {}
+
+        class Connection:
+            def settimeout(self, timeout):
+                pass
+
+        class Stub(HttpHandler):
+            def __init__(self, headers, body, settings):
+                self.headers = {"Host": "127.0.0.1:12700", **headers}
+                self.connection = Connection()
+                self.rfile = BytesIO(body)
+                self.wfile = BytesIO()
+                self.path = "/json/coins"
+                self.server = Srv(settings)
+                self.errors = []
+                self.handled = None
+
+            def send_error(self, code, message=None, explain=None):
+                self.errors.append(code)
+
+            def handle_http(self, status_code, path, post_string="", is_json=False):
+                self.handled = post_string
+                return b""
+
+        def post(headers, body=b"", settings=None):
+            handler = Stub(headers, body, settings or {})
+            handler.do_POST()
+            return handler
+
+        password = {"client_auth_hash": rfc2440_hash_password("password")}
+        handler = post({"Content-Length": "5"}, b"hello")
+        assert handler.handled == b"hello" and handler.errors == []
+        handler = post({"Content-Length": "10"}, b"hello")
+        assert handler.errors == [400] and handler.handled is None
+        assert post({}).handled == b""
+        for value in ("-1", "abc"):
+            handler = post({"Content-Length": value}, b"hello")
+            assert handler.errors == [400] and handler.handled is None, value
+        with mock.patch.object(http_server, "MAX_POST_BYTES", 10):
+            handler = post({"Content-Length": "11"}, b"x" * 11)
+            assert handler.errors == [413] and handler.handled is None
+
+        size = http_server.MAX_REFUSED_POST_BYTES + 1
+        body = b"x" * size
+        handler = post({"Content-Length": str(size)}, body, password)
+        assert handler.errors == [413] and handler.handled is None
+        for creds in ("x", base64.b64encode(b"user:wrong").decode()):
+            handler = post(
+                {"Content-Length": str(size), "Authorization": f"Basic {creds}"},
+                body,
+                password,
+            )
+            assert handler.errors == [413] and handler.handled is None, creds
+        creds = base64.b64encode(b"user:password").decode()
+        handler = post(
+            {"Content-Length": str(size), "Authorization": f"Basic {creds}"},
+            body,
+            password,
+        )
+        assert handler.handled == body
+        assert post({"Content-Length": "5"}, b"hello", password).handled == b"hello"
+        handler = post({"Content-Length": str(size), "Host": "evil.example"}, body)
+        assert handler.errors == [413] and handler.handled is None
+
+    def test_http_post_body_deadline(self):
+        import socket
+        import time
+        from unittest import mock
+        from basicswap import http_server
+        from basicswap.http_server import HttpHandler
+
+        sock, peer = socket.socketpair()
+        sock.settimeout(3)
+
+        class SwapClient:
+            settings = {}
+
+        class Srv:
+            host_name = "127.0.0.1"
+            port_no = 12700
+            swap_client = SwapClient()
+
+        class Stub(HttpHandler):
+            def __init__(self):
+                self.headers = {"Host": "127.0.0.1:12700", "Content-Length": "100"}
+                self.connection = sock
+                self.rfile = sock.makefile("rb")
+                self.server = Srv()
+                self.errors = []
+                self.handled = None
+
+            def send_error(self, code, message=None, explain=None):
+                self.errors.append(code)
+
+            def handle_http(self, status_code, path, post_string="", is_json=False):
+                self.handled = post_string
+                return b""
+
+        stop = threading.Event()
+
+        def trickle():
+            while not stop.is_set():
+                try:
+                    peer.sendall(b"x")
+                except OSError:
+                    return
+                time.sleep(0.05)
+
+        threading.Thread(target=trickle, daemon=True).start()
+        try:
+            with mock.patch.object(http_server, "POST_BODY_TIMEOUT", 0.3):
+                handler = Stub()
+                start = time.monotonic()
+                handler.do_POST()
+            assert handler.errors == [408] and handler.handled is None
+            assert time.monotonic() - start < 2
+        finally:
+            stop.set()
+            peer.close()
+            sock.close()
+
+    def test_http_handler_cap(self):
+        import time
+        from unittest import mock
+        from basicswap.http_server import HttpThread
+
+        class SwapClient:
+            debug = False
+            debug_logs = False
+
+        server = HttpThread("127.0.0.1", 0, False, SwapClient())
+        try:
+            server._handler_slots = threading.BoundedSemaphore(1)
+            finished = threading.Event()
+            with (
+                mock.patch.object(
+                    server, "finish_request", side_effect=lambda *a: finished.set()
+                ),
+                mock.patch.object(server, "shutdown_request") as shutdown,
+            ):
+                assert server._handler_slots.acquire(blocking=False)
+                server.process_request("request", ("127.0.0.1", 1))
+                assert not finished.wait(1)
+                shutdown.assert_called_once_with("request")
+
+                server._handler_slots.release()
+                server.process_request("request", ("127.0.0.1", 1))
+                assert finished.wait(5)
+                for _ in range(50):
+                    if server._handler_slots.acquire(blocking=False):
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError("handler slot not released")
+        finally:
+            server.server_close()
 
     def test_is_allowed_host(self):
         from basicswap.http_server import HttpHandler
@@ -1348,11 +2671,106 @@ class Test(unittest.TestCase):
                 settings,
             )
 
+    def test_amm_token_scope(self):
+        import ast
+        import base64
+        from unittest import mock
+        from basicswap.http_server import HttpHandler, amm_request_allowed
+
+        script = os.path.join(
+            os.path.dirname(__file__), "..", "..", "scripts", "createoffers.py"
+        )
+        with open(script) as fp:
+            tree = ast.parse(fp.read())
+        requests = set()
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("read_json_api", "read_json_api_wallet")
+            ):
+                continue
+            arg = node.args[0]
+            if isinstance(arg, ast.Constant):
+                path = arg.value
+            elif isinstance(arg, ast.JoinedStr):
+                path = "".join(
+                    v.value if isinstance(v, ast.Constant) else "x" for v in arg.values
+                )
+            else:
+                path = arg.func.value.value.replace("{}", "x")
+            requests.add(("POST" if len(node.args) > 1 else "GET", path))
+        assert len(requests) > 10
+        for method, path in requests:
+            assert amm_request_allowed(method, ["", "json"] + path.split("/")), (
+                method,
+                path,
+            )
+
+        class SwapClient:
+            def __init__(self):
+                self.settings = {"client_auth_hash": rfc2440_hash_password("password")}
+                self._amm_api_token = "amm-token"
+                self.log = logging
+
+        class Srv:
+            host_name = "127.0.0.1"
+            port_no = 12700
+
+            def __init__(self):
+                self.swap_client = SwapClient()
+
+        class Stub(HttpHandler):
+            def __init__(self, command, path, password):
+                creds = base64.b64encode(f"amm:{password}".encode()).decode()
+                self.command = command
+                self.path = path
+                self.headers = {
+                    "Host": "127.0.0.1:12700",
+                    "Authorization": "Basic " + creds,
+                }
+                self.server = Srv()
+                self.status = None
+
+            def putHeaders(self, status_code, content_type, extra_headers=None):
+                self.status = status_code
+
+        def request(command, path, password="amm-token"):
+            handler = Stub(command, path, password)
+            post_string = b"{}" if command == "POST" else ""
+            response = handler.handle_http(200, path, post_string, True)
+            return handler.status, response
+
+        with mock.patch(
+            "basicswap.http_server.js_url_to_function",
+            return_value=lambda *args: b"dispatched",
+        ):
+            assert request("GET", "/json/coins") == (200, b"dispatched")
+            assert request("POST", "/json/offers/new") == (200, b"dispatched")
+            for command, path in (
+                ("POST", "/json/wallets/btc/withdraw"),
+                ("POST", "/json/getcoinseed"),
+                ("POST", "/json/identities/x"),
+                ("POST", "/json/bids/x"),
+                ("GET", "/json/wallettransactions/btc"),
+                ("POST", "/rpc"),
+                ("GET", "/settings"),
+            ):
+                status, response = request(command, path)
+                assert status == 403, (command, path)
+                assert b"AMM token" in response
+            assert request("POST", "/json/wallets/btc/withdraw", "password") == (
+                200,
+                b"dispatched",
+            )
+
     def test_checkform_csrf_token(self):
         from basicswap.http_server import HttpHandler
 
         class Srv:
             session_tokens = {"csrf": "the-server-token"}
+            used_form_ids = {}
+            form_id_lock = threading.Lock()
 
         class Stub:
             server = Srv()
@@ -1360,12 +2778,133 @@ class Test(unittest.TestCase):
         check = HttpHandler.checkForm
         msgs = []
         # Correct token -> returns parsed form data.
-        fd = check(Stub(), b"formid=the-server-token&x=1", "rpc", msgs)
+        fd = check(Stub(), b"formid=the-server-token.n1&x=1", "rpc", msgs)
         assert fd is not None and b"x" in fd
+        assert check(Stub(), b"formid=the-server-token.n1&x=1", "rpc", msgs) is None
+        assert "Prevented double submit for form rpc." in msgs
+        assert check(Stub(), b"formid=the-server-token.n2&x=1", "rpc", msgs)
         # Wrong / missing / empty -> rejected (None).
         assert check(Stub(), b"formid=wrong&x=1", "rpc", msgs) is None
+        assert check(Stub(), b"formid=the-server-token&x=1", "rpc", msgs) is None
         assert check(Stub(), b"x=1", "rpc", msgs) is None
         assert check(Stub(), "", "rpc", msgs) is None
+
+    def test_json_smsgaddresses_requires_post(self):
+        from basicswap.http_server import json_requires_post
+
+        assert not json_requires_post(["", "json", "smsgaddresses"])
+        assert not json_requires_post(["", "json", "smsgaddresses", ""])
+        for mode in ("new", "add", "edit", "disableall"):
+            assert json_requires_post(["", "json", "smsgaddresses", mode]), mode
+
+    def test_tokens_not_rendered_before_login(self):
+        from unittest import mock
+        from basicswap.http_server import HttpHandler
+
+        class SwapClient:
+            ws_server = None
+            debug = False
+            debug_ui = False
+            use_tor_proxy = False
+            _show_notifications = False
+
+            def __init__(self, settings):
+                self.settings = settings
+
+            def getSummary(self):
+                from collections import defaultdict
+
+                return defaultdict(int)
+
+            def getLockedState(self):
+                return True, False
+
+        class Srv:
+            title = "BasicSwap"
+
+            def __init__(self, settings):
+                self.swap_client = SwapClient(settings)
+                self.session_lock = threading.Lock()
+                self.msg_id_lock = threading.Lock()
+                self.msg_id_counter = 0
+                self.session_tokens = {"csrf": "csrf-token", "shutdown": "old-token"}
+
+        class Stub(HttpHandler):
+            def __init__(self, settings, basic_auth_ok=False):
+                self.headers = {}
+                self.path = "/static/missing"
+                self.server = Srv(settings)
+                self._basic_auth_ok = basic_auth_ok
+
+            def putHeaders(self, status_code, content_type, extra_headers=None):
+                pass
+
+        def render_404(handler):
+            rendered = {}
+            get_template = env.get_template
+
+            class Capture:
+                def __init__(self, template):
+                    self.template = template
+
+                def render(self, **kwargs):
+                    rendered.update(kwargs)
+                    return self.template.render(**kwargs)
+
+            def capture_404(name, *args, **kwargs):
+                template = get_template(name, *args, **kwargs)
+                return Capture(template) if name == "404.html" else template
+
+            with mock.patch.object(env, "get_template", side_effect=capture_404):
+                page = handler.page_404(["", "static", "missing"]).decode()
+            return page, rendered
+
+        from basicswap.http_server import env
+
+        password = {"client_auth_hash": rfc2440_hash_password("password")}
+        handler = Stub(password)
+        page, rendered = render_404(handler)
+        assert rendered["form_id"] == ""
+        assert "old-token" not in page
+        assert handler.server.session_tokens["shutdown"] == "old-token"
+
+        authenticated = Stub(password)
+        for handler in (Stub(password, basic_auth_ok=True), Stub({}), authenticated):
+            with mock.patch.object(
+                HttpHandler,
+                "is_authenticated",
+                return_value=handler is authenticated,
+            ):
+                page, rendered = render_404(handler)
+            shutdown_token = handler.server.session_tokens["shutdown"]
+            assert rendered["form_id"].startswith("csrf-token.")
+            assert shutdown_token != "old-token"
+            assert f"/shutdown/{shutdown_token}" in page
+
+    def test_html_responses_deny_framing(self):
+        from basicswap.http_server import HttpHandler
+
+        class Srv:
+            allow_cors = False
+
+        class Stub(HttpHandler):
+            def __init__(self):
+                self.server = Srv()
+                self.sent = []
+
+            def send_response(self, code, message=None):
+                pass
+
+            def send_header(self, keyword, value):
+                self.sent.append((keyword, value))
+
+            def end_headers(self):
+                pass
+
+        handler = Stub()
+        handler.putHeaders(200, "text/html")
+        assert ("X-Frame-Options", "DENY") in handler.sent
+        assert ("Content-Security-Policy", "frame-ancestors 'none'") in handler.sent
 
     def test_varint(self):
         test_vectors = [
@@ -1384,6 +2923,122 @@ class Test(unittest.TestCase):
             b = encode_varint(i)
             assert len(b) == expect_length
             assert decode_varint(b) == (i, expect_length)
+
+    def test_electrum_discover_drops_invalid_peer_hosts(self):
+        import json
+        from basicswap.interface.electrumx import is_valid_peer_host
+        from basicswap.js_server import js_electrum_discover
+
+        onion = "x" * 56 + ".onion"
+        for host, valid in (
+            ("electrum.example.com", True),
+            ("1.2.3.4", True),
+            ("2001:db8::1", True),
+            (onion, True),
+            ("", False),
+            (None, False),
+            ("a b", False),
+            ('"><img src=x onerror=alert(1)>', False),
+            ("a" * 254, False),
+        ):
+            assert is_valid_peer_host(host) is valid, host
+
+        peers = [
+            {"host": "electrum.example.com", "port": 50002, "is_onion": False},
+            {"host": "<img src=x onerror=alert(1)>", "port": 50002, "is_onion": False},
+            {"host": onion, "port": 50002, "is_onion": True},
+        ]
+
+        class Server:
+            def get_current_server_info(self):
+                return {"host": "electrum.example.org", "port": 50002}
+
+            def discover_peers(self):
+                return [dict(peer) for peer in peers]
+
+        class Backend:
+            _server = Server()
+
+        class CI:
+            _connection_type = "electrum"
+
+            def getBackend(self):
+                return Backend()
+
+        class SwapClient:
+            def ci(self, coin_type):
+                return CI()
+
+        class Srv:
+            swap_client = SwapClient()
+
+        class Handler:
+            server = Srv()
+
+        rv = json.loads(
+            js_electrum_discover(Handler(), None, b'{"coin": "bitcoin"}', True)
+        )
+        assert [s["host"] for s in rv["clearnet_servers"]] == ["electrum.example.com"]
+        assert [s["host"] for s in rv["onion_servers"]] == [onion]
+
+    def test_oracle_rates_validated(self):
+        from unittest import mock
+        from basicswap.basicswap import BasicSwap
+        from basicswap.oracles import filterValidRates, oracle_fetchers
+
+        rates = {
+            1: (100.5, 1000, -2.5),
+            2: (float("nan"), 1, 1),
+            3: ("inf", 1, 1),
+            4: ("abc", 1, 1),
+            5: (0, 1, 1),
+            6: (-1, 1, 1),
+            7: (True, 1, 1),
+            8: ("12.5", "nan", "x"),
+            9: (None, 1, 1),
+        }
+        assert filterValidRates(rates) == {
+            1: (100.5, 1000.0, -2.5),
+            8: (12.5, None, None),
+        }
+
+        class Cursor:
+            rowcount = 1
+
+            def __init__(self):
+                self.rates = []
+
+            def execute(self, query, params=None):
+                if params and "rate" in params:
+                    self.rates.append(params["currency_from"])
+
+        class Stub:
+            _price_cache_lock = threading.Lock()
+
+            def __init__(self):
+                self._price_cache = {}
+                self._volume_cache = {}
+                self.cursor = Cursor()
+
+            def openDB(self):
+                return self.cursor
+
+            def commitDB(self):
+                pass
+
+            def closeDB(self, cursor, commit=True):
+                pass
+
+        stub = Stub()
+        with mock.patch.dict(
+            oracle_fetchers, {"test_oracle": lambda *args: dict(rates)}
+        ):
+            fetched = BasicSwap._fetchPricesAndVolumeForSource(
+                stub, list(rates), "test_oracle", 1
+            )
+        assert fetched == {1, 8}
+        assert sorted(key[0] for key in stub._price_cache) == [1, 8]
+        assert stub.cursor.rates == [1, 8]
 
     def test_base58(self):
         k = bytes.fromhex(
@@ -1568,6 +3223,149 @@ class Test(unittest.TestCase):
         finally:
             db_test.closeDB(cursor)
 
+    def test_connect_request_limits(self):
+        from types import SimpleNamespace
+        from basicswap.network.bsx_network import BSXNetwork
+
+        now: int = 1800000000
+        sc = SimpleNamespace(
+            getTime=lambda: now,
+            _connect_request_times={},
+            _sender_connect_request_times={},
+            _max_connect_requests_per_hour=3,
+            _max_connect_requests_per_sender_per_hour=2,
+        )
+
+        def check(addr_from: str, new_route: bool = True) -> None:
+            BSXNetwork.checkConnectRequestRateLimit(sc, 1, addr_from, new_route)
+
+        check("addr_a")
+        check("addr_a")
+        with self.assertRaisesRegex(ValueError, "exceeded for sender"):
+            check("addr_a")
+        check("addr_b")
+        with self.assertRaisesRegex(ValueError, "rate limit exceeded$"):
+            check("addr_c")
+        check("addr_c", new_route=False)
+
+        now += 3600
+        check("addr_a")
+        assert list(sc._sender_connect_request_times) == [(1, "addr_a")]
+
+    def test_simplex_connect_request_finds_existing_route(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from basicswap.db import DirectMessageRoute
+        from basicswap.network.bsx_network import BSXNetwork
+        from basicswap.network.simplex.routes import processSimplexConnectRequest
+
+        sc = DBMethods()
+        sc.sqlite_file = ":memory:"
+        sc.mxDB = threading.RLock()
+        sc.log = BSXLogger("test")
+        sc.getMessageRoute = lambda *args, **kwargs: BSXNetwork.getMessageRoute(
+            sc, *args, **kwargs
+        )
+        net_i = mock.MagicMock()
+        offer = SimpleNamespace(
+            offer_id=secrets.token_bytes(28), addr_from="offer_addr"
+        )
+        cursor = sc.openDB()
+        try:
+            create_db_(sc._db_con, logger)
+            sc.add(
+                DirectMessageRoute(
+                    active_ind=1,
+                    network_id=2,
+                    smsg_addr_local="offer_addr",
+                    smsg_addr_remote="bid_addr",
+                    created_at=0,
+                ),
+                cursor,
+            )
+            req_data = {"bsx_address": "bid_addr", "connection_req": "simplex:/x"}
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                processSimplexConnectRequest(sc, net_i, req_data, offer, cursor)
+            net_i.send_command.assert_not_called()
+        finally:
+            sc.closeDB(cursor)
+
+    def test_simplex_receive_queue_bounded(self):
+        from unittest import mock
+        from basicswap.network.simplex import simplex
+
+        with mock.patch.object(simplex, "MAX_RECV_QUEUE_SIZE", 2):
+            ws_thread = simplex.WebSocketThread("ws://127.0.0.1:1", logger=logger)
+        for i in range(3):
+            ws_thread.on_message(None, '{"resp": {}}')
+        ws_thread.on_message(None, '{"corrId": "1"}')
+        assert ws_thread.recv_queue.qsize() == 2
+        assert ws_thread.cmd_recv_queue.qsize() == 1
+        assert ws_thread.num_messages_dropped == 1
+
+    def test_simplex_frame_limits_installed(self):
+        from types import SimpleNamespace
+        import websocket
+        from basicswap.network.nostr.client import BoundedFrameBuffer
+        from basicswap.network.simplex import simplex
+
+        ws_thread = simplex.WebSocketThread("ws://127.0.0.1:1", logger=logger)
+        ws_sock = websocket.WebSocket()
+        ws_thread.on_open(SimpleNamespace(sock=ws_sock))
+        assert isinstance(ws_sock.frame_buffer, BoundedFrameBuffer)
+        assert ws_sock.frame_buffer.max_frame_len == simplex.MAX_EVENT_LEN
+
+    def test_portal_smsg_difficulty_bound(self):
+        from basicswap.basicswap_util import MessageNetworks
+        from basicswap.messages_npb import MessagePortalOffer
+        from basicswap.network.bsx_network import BSXNetwork
+
+        sc = DBMethods()
+        sc.sqlite_file = ":memory:"
+        sc.mxDB = threading.RLock()
+        sc.log = BSXLogger("test")
+        now: int = 1800000000
+        sc.getTime = lambda: now
+        sc.getSmsgMsgBytes = lambda msg: msg["payload"]
+        sc.getActiveNetwork = lambda network_id: {"bridged": [{"type": "simplex"}]}
+        sc.own_portals = {}
+        sc.known_portals = {}
+        sc._portal_time_valid = 30 * 60
+        sc._max_known_portals = 20
+        sc._have_smsg_rpc = False
+
+        cursor = sc.openDB()
+        try:
+            create_db_(sc._db_con, logger)
+
+            def offer_portal(addr_portal: str, smsg_difficulty: int) -> int:
+                msg_data = MessagePortalOffer(
+                    network_type_from=MessageNetworks.SMSG,
+                    network_type_to=MessageNetworks.SIMPLEX,
+                    portal_address_to=b"network_addr",
+                    time_valid=30 * 60,
+                    smsg_difficulty=smsg_difficulty,
+                )
+                msg = {
+                    "msgid": secrets.token_bytes(28).hex(),
+                    "msg_net": "smsg",
+                    "sent": now,
+                    "from": addr_portal,
+                    "pubkey_from": "02" + "11" * 32,
+                    "payload": msg_data.to_bytes(),
+                }
+                BSXNetwork.processPortalOffer(sc, msg)
+                return cursor.execute(
+                    "SELECT COUNT(*) FROM network_portals"
+                ).fetchone()[0]
+
+            assert offer_portal("portal_1", 0x1EFFFFFF) == 1
+            assert offer_portal("portal_2", 0x1E0FFFFF) == 1
+            assert offer_portal("portal_3", 0x1E3FFFFF) == 2
+            assert offer_portal("portal_4", 0) == 2
+        finally:
+            sc.closeDB(cursor)
+
     def test_db_savepoint(self):
         db_test = DBMethods()
         db_test.sqlite_file = ":memory:"
@@ -1627,6 +3425,347 @@ class Test(unittest.TestCase):
             sighash.hex()
             == "252cd6e85b99e0fd554c44d5fe638923f7ef563048362406a665cf3400feb1bd"
         )
+
+    def test_tx_parser_rejects_short_data(self):
+        from basicswap.contrib.test_framework.messages import ser_compact_size
+
+        ci = self.ci_btc()
+        many_inputs = (2).to_bytes(4, "little") + ser_compact_size(200000)
+        with self.assertRaises(ValueError):
+            ci.loadTx(many_inputs)
+        with self.assertRaises(ValueError):
+            ci.getTxid(many_inputs)
+
+        tx = CTransaction()
+        tx.nVersion = 2
+        tx.vin.append(CTxIn(COutPoint(1, 0), b"\x51"))
+        tx.vout.append(CTxOut(1000, b"\x51"))
+        tx_bytes = tx.serialize()
+        assert ci.loadTx(tx_bytes).serialize() == tx_bytes
+        for cut in (1, 4, 20):
+            with self.assertRaises(ValueError):
+                ci.loadTx(tx_bytes[:-cut])
+
+    def test_pivx_tx_parser_rejects_short_data(self):
+        from basicswap.interface.pivx.contrib.messages import (
+            COutPoint as PIVXOutPoint,
+            CTransaction as PIVXTransaction,
+            CTxIn as PIVXTxIn,
+            CTxOut as PIVXTxOut,
+            SaplingTxData,
+        )
+
+        sap_data = SaplingTxData()
+        sap_data.pre = b"\x01"
+        sap_data.valueBalance = 0
+        sap_data.vShieldedSpend = []
+        sap_data.vShieldedOutput = []
+        sap_data.bindingSig = b"\x00" * 64
+        pivx_tx = PIVXTransaction()
+        pivx_tx.nVersion = 3
+        pivx_tx.nType = 1
+        pivx_tx.vin.append(PIVXTxIn(PIVXOutPoint(1, 0), b"\x51"))
+        pivx_tx.vout.append(PIVXTxOut(1000, b"\x51"))
+        pivx_tx.sapData = sap_data
+        pivx_tx.extraData = b"hello"
+
+        settings = {"rpcport": 0, "rpcauth": "none"}
+        settings.update(REQUIRED_SETTINGS)
+        ci = PIVXInterface(settings, "regtest")
+        tx_bytes = pivx_tx.serialize()
+        assert ci.loadTx(tx_bytes).serialize() == tx_bytes
+        for cut in (1, 3):
+            with self.assertRaises(ValueError):
+                ci.loadTx(tx_bytes[:-cut])
+
+    def test_part_tx_parser_witness_optional(self):
+        from basicswap.contrib.test_framework.messages import (
+            CTxInWitness,
+            CTxOutPart,
+            PARTICL_TX_VERSION,
+        )
+
+        ci = self.ci_btc()
+        tx = CTransaction()
+        tx.nVersion = PARTICL_TX_VERSION
+        tx.vin.append(CTxIn(COutPoint(1, 0)))
+        tx.vout.append(CTxOutPart(1000, b"\x51"))
+        witness = CTxInWitness()
+        witness.scriptWitness.stack = [b"\x01" * 72]
+        tx.wit.vtxinwit = [witness]
+
+        no_witness = ci.loadTx(tx.serialize_without_witness())
+        assert no_witness.serialize_without_witness() == tx.serialize_without_witness()
+        assert no_witness.wit.vtxinwit[0].scriptWitness.stack == []
+        with_witness = ci.loadTx(tx.serialize())
+        assert with_witness.serialize() == tx.serialize()
+        with self.assertRaises(ValueError):
+            ci.loadTx(tx.serialize()[:-1])
+
+    def test_dcr_tx_parser_bounds_witness(self):
+        from basicswap.interface.dcr.messages import (
+            COutPoint as DCRCOutPoint,
+            CTransaction as DCRTransaction,
+            CTxIn as DCRTxIn,
+            CTxOut as DCRTxOut,
+            TxSerializeType,
+        )
+        from basicswap.util.integer import encode_compactsize
+
+        version = 1 | (TxSerializeType.OnlyWitness << 16)
+        many_witnesses = version.to_bytes(4, "little") + encode_compactsize(200000)
+        with self.assertRaisesRegex(ValueError, "Witness count"):
+            DCRTransaction().deserialize(many_witnesses)
+
+        tx = DCRTransaction()
+        txi = DCRTxIn(DCRCOutPoint(1, 0, 0))
+        txi.signature_script = b"\x01" * 72
+        tx.vin.append(txi)
+        tx.vout.append(DCRTxOut(1000, b"\x51"))
+        for ser_type in (
+            TxSerializeType.Full,
+            TxSerializeType.NoWitness,
+            TxSerializeType.OnlyWitness,
+        ):
+            tx_bytes = tx.serialize(ser_type)
+            loaded = DCRTransaction()
+            loaded.deserialize(tx_bytes)
+            assert loaded.serialize(ser_type) == tx_bytes
+            with self.assertRaisesRegex(ValueError, "Truncated"):
+                DCRTransaction().deserialize(tx_bytes[:-1])
+
+    def test_electrum_response_len_capped(self):
+        import socket
+        from unittest import mock
+        from basicswap.interface import electrumx
+        from basicswap.interface.electrumx import ElectrumConnection, ElectrumServer
+
+        def stub_connection():
+            conn = ElectrumConnection("127.0.0.1", 0, use_ssl=False)
+            conn._socket, peer = socket.socketpair()
+            conn._connected = True
+            oversized = []
+            conn.register_misbehaving_callback(lambda reason: oversized.append(True))
+
+            def send():
+                try:
+                    peer.sendall(b"x" * 70000)
+                except OSError:
+                    pass
+
+            threading.Thread(target=send, daemon=True).start()
+            return conn, peer, oversized
+
+        with mock.patch.object(electrumx, "MAX_RESPONSE_LEN", 65536):
+            for receive in (
+                lambda c: c._receive_response_sync(1, timeout=2),
+                lambda c: c._receive_batch_responses_sync([1, 2], timeout=2),
+            ):
+                conn, peer, oversized = stub_connection()
+                try:
+                    with self.assertRaises(ConnectionError):
+                        receive(conn)
+                finally:
+                    peer.close()
+                assert not conn.is_connected()
+                assert oversized == [True]
+
+            conn, peer, oversized = stub_connection()
+            conn._start_listener()
+            listener = conn._listener_thread
+            listener.join(timeout=5)
+            conn._listener_running = False
+            peer.close()
+            assert not listener.is_alive()
+            assert not conn.is_connected()
+            assert oversized == [True]
+
+        server = ElectrumServer(
+            "bitcoin",
+            clearnet_servers=[
+                "electrum1.example.com:50002",
+                "electrum2.example.com:50002",
+            ],
+        )
+        with (
+            mock.patch.object(ElectrumConnection, "connect"),
+            mock.patch.object(
+                ElectrumConnection, "get_server_version", return_value=["test"]
+            ),
+            mock.patch.object(ElectrumServer, "_start_keepalive"),
+            mock.patch.object(ElectrumServer, "_subscribe_headers"),
+        ):
+            assert server._try_connect_server(server._servers[0])
+        server._connection._misbehaving_callback("test")
+        assert [s["host"] for s in server.get_sorted_servers()] == [
+            "electrum2.example.com"
+        ]
+
+    def test_electrum_sync_receive_deadline(self):
+        import socket
+        import time
+        from basicswap.interface.electrumx import ElectrumConnection
+        from basicswap.util import TemporaryError
+
+        for receive in (
+            lambda c: c._receive_response_sync(1, timeout=1),
+            lambda c: c._receive_batch_responses_sync([1, 2], timeout=1),
+        ):
+            conn = ElectrumConnection("127.0.0.1", 0, use_ssl=False)
+            conn._socket, peer = socket.socketpair()
+            conn._connected = True
+            stop = threading.Event()
+
+            def drip():
+                for _ in range(30):
+                    if stop.wait(0.1):
+                        return
+                    try:
+                        peer.sendall(b"x")
+                    except OSError:
+                        return
+
+            threading.Thread(target=drip, daemon=True).start()
+            start = time.time()
+            try:
+                with self.assertRaisesRegex(TemporaryError, "timed out"):
+                    receive(conn)
+                assert time.time() - start < 2
+            finally:
+                stop.set()
+                peer.close()
+                conn._socket.close()
+
+    def test_electrum_discovery_skips_non_public_peers(self):
+        from unittest import mock
+        from basicswap.interface.electrumx import ElectrumServer
+
+        server = ElectrumServer(
+            "bitcoin", clearnet_servers=["electrum.example.com:50002"]
+        )
+        peers = [
+            ["127.0.0.1", "", ["s50002"]],
+            ["10.0.0.2", "", ["s50002"]],
+            ["100.64.0.3", "", ["t50001"]],
+            ["169.254.0.4", "", ["s50002"]],
+            ["::1", "", ["s50002"]],
+            ["fd00::5", "", ["s50002"]],
+            ["::ffff:192.168.1.6", "", ["s50002"]],
+            ["8.8.8.8", "localhost", ["s50002"]],
+            ["8.8.8.8", "printer.local", ["s50002"]],
+            ["8.8.8.8", "electrum.example.org", ["s50002"]],
+            ["2606:4700::1111", "", ["s50002"]],
+            ["", "abcdefghijklmnop.onion", ["t50001"]],
+        ]
+        with mock.patch.object(server, "call", return_value=peers):
+            hosts = [p["host"] for p in server.discover_peers()]
+        assert hosts == [
+            "electrum.example.org",
+            "2606:4700::1111",
+            "abcdefghijklmnop.onion",
+        ]
+
+    def test_electrum_ping_refuses_non_public_destinations(self):
+        import socket
+        from unittest import mock
+        from basicswap.interface.electrumx import ElectrumServer
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        listener.settimeout(0.5)
+        port = listener.getsockname()[1]
+        server = ElectrumServer(
+            "bitcoin", clearnet_servers=["electrum.example.com:50002"]
+        )
+        real_getaddrinfo = socket.getaddrinfo
+
+        def rebind(host, *args, **kwargs):
+            if host == "rebind.example.com":
+                host = "127.0.0.1"
+            return real_getaddrinfo(host, *args, **kwargs)
+
+        try:
+            assert server.ping_server("127.0.0.1", port, ssl=False) is None
+            with self.assertRaises(socket.timeout):
+                listener.accept()
+
+            with mock.patch("socket.getaddrinfo", side_effect=rebind):
+                assert server.ping_server("rebind.example.com", port, ssl=False) is None
+            with self.assertRaises(socket.timeout):
+                listener.accept()
+        finally:
+            listener.close()
+
+    def test_electrum_ping_writes_no_pins(self):
+        from unittest import mock
+        from basicswap.interface.electrumx import (
+            CertPinStore,
+            ElectrumConnection,
+            ElectrumServer,
+        )
+
+        pins = CertPinStore()
+        server = ElectrumServer(
+            "bitcoin", clearnet_servers=["electrum.example.com:50002"], cert_pins=pins
+        )
+
+        def first_use_pin(conn):
+            conn._cert_pins.set(conn._coin_name, conn.server_key(), "00" * 32)
+
+        with (
+            mock.patch.object(ElectrumConnection, "connect", first_use_pin),
+            mock.patch.object(ElectrumConnection, "ping", return_value=1.0),
+        ):
+            assert server.ping_server("electrum.example.org", 50002) == 1.0
+        assert pins.get("bitcoin", "electrum.example.org:50002") is None
+
+    def test_electrum_txids_checked(self):
+        import json
+        import socket
+        from basicswap.interface.electrumx import ElectrumConnection
+        from basicswap.util import TemporaryError
+
+        valid = [{"tx_hash": "ab" * 32, "height": 1}]
+        invalid = (
+            [{"tx_hash": "<img src=x onerror=alert(1)>", "height": 1}],
+            [{"tx_hash": "ab" * 31, "height": 1}],
+            [{"height": 1}],
+        )
+
+        dropped = []
+
+        def stub_connection(results):
+            conn = ElectrumConnection("127.0.0.1", 0, use_ssl=False)
+            conn._socket, peer = socket.socketpair()
+            conn._connected = True
+            conn.register_misbehaving_callback(dropped.append)
+            for request_id, result in enumerate(results, 1):
+                response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+                peer.sendall((json.dumps(response) + "\n").encode())
+            return conn, peer
+
+        for method in (
+            "blockchain.scripthash.get_history",
+            "blockchain.scripthash.listunspent",
+        ):
+            conn, peer = stub_connection([valid])
+            assert conn.call(method, ["00" * 32]) == valid
+            peer.close()
+            for result in invalid:
+                conn, peer = stub_connection([result])
+                with self.assertRaisesRegex(TemporaryError, "invalid txid"):
+                    conn.call(method, ["00" * 32])
+                assert not conn.is_connected()
+                peer.close()
+
+                conn, peer = stub_connection([valid, result])
+                requests = [(method, ["00" * 32]), (method, ["11" * 32])]
+                with self.assertRaisesRegex(TemporaryError, "invalid txid"):
+                    conn.call_batch(requests)
+                assert not conn.is_connected()
+                peer.close()
+        assert len(dropped) == 2 * 2 * len(invalid)
 
     def test_validateSwapType(self):
         logging.info("---------- Test validateSwapType")
@@ -1789,6 +3928,230 @@ class Test(unittest.TestCase):
 
         del sc
 
+    def test_ptx_lock_margin(self):
+        basicswap_dir = "/tmp/bsx_test_other"
+        if not os.path.exists(basicswap_dir):
+            os.makedirs(basicswap_dir)
+
+        k = PrivateKey()
+        settings = {
+            "network_key": toWIF(PREFIX_SECRET_KEY_REGTEST, k.secret),
+            "network_pubkey": k.public_key.format().hex(),
+        }
+        sc = BasicSwap(
+            basicswap_dir,
+            settings,
+            "regtest",
+            log_name="bsx_test_other",
+        )
+        ci = self.ci_btc()
+        ltc_coin_settings = {"rpcport": 0, "rpcauth": "none"}
+        ltc_coin_settings.update(REQUIRED_SETTINGS)
+        sc.coin_clients[Coins.BTC] = {"interface": ci}
+        sc.coin_clients[Coins.LTC] = {
+            "interface": LTCInterface(ltc_coin_settings, "regtest")
+        }
+
+        secret_hash = sha256(secrets.token_bytes(32))
+        pkh_buyer = secrets.token_bytes(20)
+        pkh_seller = secrets.token_bytes(20)
+        lock_value: int = 4 * 60 * 60
+
+        offer = Offer(
+            coin_from=Coins.BTC,
+            coin_to=Coins.LTC,
+            lock_type=TxLockTypes.ABS_LOCK_TIME,
+            lock_value=lock_value,
+        )
+        accepted_at: int = sc.getTime()
+        bid = Bid()
+        bid.initiate_tx = SwapTx(
+            script=buildContractScript(
+                accepted_at + lock_value,
+                secret_hash,
+                pkh_buyer,
+                pkh_seller,
+                OpCodes.OP_CHECKLOCKTIMEVERIFY,
+            )
+        )
+
+        def abs_participate_script(itx_block_time: int) -> bytearray:
+            return buildContractScript(
+                itx_block_time + lock_value // 2,
+                secret_hash,
+                pkh_seller,
+                pkh_buyer,
+                OpCodes.OP_CHECKLOCKTIMEVERIFY,
+            )
+
+        sc.ensurePTxLockMargin(
+            bid, offer, abs_participate_script(accepted_at + sc._sc_lock_tx_timeout)
+        )
+        # The seller held the initiate txn back for half the lock
+        self.assertRaisesRegex(
+            ValueError,
+            "too close",
+            sc.ensurePTxLockMargin,
+            bid,
+            offer,
+            abs_participate_script(accepted_at + lock_value // 2),
+        )
+        sc.setMockTimeOffset(lock_value - 10 * 60)
+        self.assertRaisesRegex(
+            ValueError,
+            "too close",
+            sc.ensurePTxLockMargin,
+            bid,
+            offer,
+            abs_participate_script(accepted_at + 60),
+        )
+        sc.setMockTimeOffset(0)
+
+        offer = Offer(
+            coin_from=Coins.BTC,
+            coin_to=Coins.LTC,
+            lock_type=TxLockTypes.SEQUENCE_LOCK_TIME,
+            lock_value=lock_value,
+        )
+        itx_mtp: int = 1700000000
+        bid = Bid()
+        bid.initiate_tx = SwapTx(
+            script=buildContractScript(
+                ci.getExpectedSequence(offer.lock_type, lock_value),
+                secret_hash,
+                pkh_buyer,
+                pkh_seller,
+            ),
+            block_height=100,
+            block_time=itx_mtp,
+        )
+        participate_script = buildContractScript(
+            ci.getExpectedSequence(offer.lock_type, lock_value // 2),
+            secret_hash,
+            pkh_seller,
+            pkh_buyer,
+        )
+        ci.getMedianTimePastAtHeight = lambda height: itx_mtp
+
+        ci.getChainMedianTime = lambda: itx_mtp + 10 * 60
+        sc.ensurePTxLockMargin(bid, offer, participate_script)
+        # The buyer was offline for half the lock
+        ci.getChainMedianTime = lambda: itx_mtp + lock_value // 2
+        self.assertRaisesRegex(
+            ValueError,
+            "too close",
+            sc.ensurePTxLockMargin,
+            bid,
+            offer,
+            participate_script,
+        )
+
+        del sc
+
+    def test_extract_secret_by_hash(self):
+        sc = BasicSwap.__new__(BasicSwap)
+        sc.fp = None
+        sc.coin_clients = {
+            Coins.PIVX: {"use_segwit": False},
+            Coins.LTC: {"use_segwit": True},
+        }
+        secret = secrets.token_bytes(32)
+        script = buildContractScript(
+            100, sha256(secret), secrets.token_bytes(20), secrets.token_bytes(20)
+        )
+        bid = Bid()
+        bid.initiate_tx = SwapTx(script=script)
+        sig = "30" + "44" * 70
+        pubkey = "02" + "11" * 32
+
+        def script_sig(*items) -> dict:
+            return {"scriptSig": {"asm": " ".join(items)}}
+
+        redeem = script_sig(sig + "[ALL]", pubkey, secret.hex(), "1", script.hex())
+        self.assertEqual(sc.extractSecret(Coins.PIVX, bid, redeem), secret)
+        # Valid in a block on chains where CLEANSTACK is only relay policy
+        extra_push = script_sig(
+            "deadbeef", sig + "[ALL]", pubkey, secret.hex(), "1", script.hex()
+        )
+        self.assertEqual(sc.extractSecret(Coins.PIVX, bid, extra_push), secret)
+        refund = script_sig(sig + "[ALL]", pubkey, "0", script.hex())
+        self.assertIsNone(sc.extractSecret(Coins.PIVX, bid, refund))
+        witness = {
+            "txinwitness": [sig + "01", pubkey, secret.hex(), "01", script.hex()]
+        }
+        self.assertEqual(sc.extractSecret(Coins.LTC, bid, witness), secret)
+
+    def test_lock_tx_lookup_picks_the_output_with_the_amount(self):
+        ci = self.ci_btc()
+        script = buildContractScript(
+            100,
+            secrets.token_bytes(32),
+            secrets.token_bytes(20),
+            secrets.token_bytes(20),
+        )
+        dest = ci.getScriptDest(script)
+        addr = ci.encodeScriptDest(dest)
+        amount: int = 5000000
+        tx = CTransaction()
+        tx.vin.append(CTxIn(COutPoint(1, 0)))
+        tx.vout.append(CTxOut(1000, dest))
+        tx.vout.append(CTxOut(amount, dest))
+        tx_hex: str = tx.serialize().hex()
+        txid_hex: str = ci.getTxid(tx).hex()
+        wallet_rpc = {
+            "listunspent": [
+                {"address": addr, "amount": 0.00001, "txid": txid_hex},
+                {"address": addr, "amount": 0.05, "txid": txid_hex},
+            ],
+            "gettransaction": {
+                "hex": tx_hex,
+                "confirmations": 1,
+                "blockhash": "00" * 32,
+            },
+        }
+        node_rpc = {
+            "decoderawtransaction": ci._describeTxLocal(tx_hex),
+            "getblockheader": {"height": 100},
+        }
+        ci.isAddressMine = lambda address, or_watch_only=False: True
+        ci.rpc_wallet_watch = lambda method, params=None: wallet_rpc[method]
+        ci.rpc = lambda method, params=None: node_rpc[method]
+
+        found = ci.getLockTxHeight(None, addr, amount, 0, find_index=True)
+        self.assertEqual(found["txid"], txid_hex)
+        self.assertEqual(found["index"], 1)
+        self.assertEqual(found["value"], amount)
+
+    def test_found_script_needs_the_agreed_amount(self):
+        from basicswap.basicswap_util import TxTypes
+
+        sc = BasicSwap.__new__(BasicSwap)
+        sc.fp = None
+        sc.log = BSXLogger("test")
+        sc.coin_clients = {Coins.BCH: {"watched_scripts": []}}
+        amount: int = 5000000
+        bid = Bid(bid_id=secrets.token_bytes(28), amount=amount)
+        bid.xmr_a_lock_tx = SwapTx(bid_id=bid.bid_id, tx_type=TxTypes.XMR_SWAP_A_LOCK)
+        sc.swaps_in_progress = {bid.bid_id: (bid, Offer())}
+        sc.saveBid = lambda bid_id, bid: None
+        sc.logBidEvent = lambda *args, **kwargs: None
+        sc.addWatchedScript(
+            Coins.BCH, bid.bid_id, secrets.token_bytes(23), TxTypes.XMR_SWAP_A_LOCK
+        )
+        watched_scripts = sc.coin_clients[Coins.BCH]["watched_scripts"]
+        watched = watched_scripts[0]
+        lock_txid = secrets.token_bytes(32)
+
+        self.assertFalse(
+            sc.processFoundScript(Coins.BCH, watched, secrets.token_bytes(32), 0, 546)
+        )
+        self.assertIsNone(bid.xmr_a_lock_tx.txid)
+        self.assertEqual(watched_scripts, [watched])
+        self.assertTrue(sc.processFoundScript(Coins.BCH, watched, lock_txid, 1, amount))
+        self.assertEqual(bid.xmr_a_lock_tx.txid, lock_txid)
+        self.assertEqual(bid.xmr_a_lock_tx.vout, 1)
+        self.assertEqual(watched_scripts, [])
+
     def test_jsonrpc(self):
         logging.info("---------- Test Jsonrpc")
         host = "127.0.0.1"
@@ -1800,6 +4163,397 @@ class Test(unittest.TestCase):
         host = "https://127.0.0.1"
         url = Jsonrpc.constructUrl(auth, host, port, "new_wallet")
         assert url == "https://user:p%40ss@127.0.0.1:1234/wallet/new_wallet"
+
+    def test_prepare_refuses_empty_rpc_password(self):
+        from unittest import mock
+        import basicswap.bin.prepare as prepare
+
+        prepare_module = prepare.coin_prepare_modules["bitcoin"]
+        for core_settings, refused in (
+            ({"rpcuser": "user", "rpcpassword": ""}, True),
+            ({"walletrpcuser": "user", "walletrpcpassword": ""}, True),
+            ({"rpcuser": "", "rpcpassword": ""}, False),
+            ({"rpcuser": "user", "rpcpassword": "pwd"}, False),
+        ):
+            settings = {"chainclients": {"bitcoin": core_settings}}
+            with mock.patch.object(prepare_module, "prepareDataDir") as prepare_dir:
+                if refused:
+                    with self.assertRaises(SystemExit):
+                        prepare.prepareDataDir(
+                            "bitcoin", settings, "regtest", None, {"prepare_ctx": None}
+                        )
+                    prepare_dir.assert_not_called()
+                else:
+                    prepare.prepareDataDir(
+                        "bitcoin", settings, "regtest", None, {"prepare_ctx": None}
+                    )
+                    prepare_dir.assert_called_once()
+
+    def test_prepare_fails_when_wallet_not_encrypted(self):
+        from unittest import mock
+        import basicswap.bin.prepare as prepare
+
+        seed_module = mock.Mock(provides_master_key=True, creates_wallet=False)
+        seed_module.startsInitDaemon.return_value = False
+        coin_module = mock.Mock(provides_master_key=False, creates_wallet=False)
+        coin_module.startsInitDaemon.return_value = False
+        coin_module.needsPostInitPasswordChange.return_value = True
+        coin_module.getPostInitWarning.return_value = None
+        modules = {"particl": seed_module, "monero": coin_module}
+        coin_ids = {"particl": Coins.PART, "monero": Coins.XMR}
+        settings = {"chainclients": {"particl": {}, "monero": {}}}
+
+        for is_encrypted, refused in (
+            (mock.Mock(return_value=True), False),
+            (mock.Mock(return_value=False), True),
+            (mock.Mock(side_effect=ValueError("rpc error")), True),
+            (None, True),
+        ):
+            ci = mock.Mock()
+            ci.changeWalletPassword.side_effect = ValueError("rpc error")
+            if is_encrypted is None:
+                del ci.isWalletEncrypted
+            else:
+                ci.isWalletEncrypted = is_encrypted
+            swap_client = mock.Mock(xmr_based_coins=(Coins.XMR,))
+            swap_client.getCoinIdFromName.side_effect = coin_ids.get
+            swap_client.ci.return_value = ci
+            with (
+                mock.patch.object(prepare, "BasicSwap", return_value=swap_client),
+                mock.patch.object(prepare, "WALLET_ENCRYPTION_PWD", "test.123"),
+                mock.patch.dict(prepare.coin_prepare_modules, modules, clear=True),
+            ):
+                args = (None, ["monero"], "", settings, "regtest", False)
+                extra_opts = {"prepare_ctx": mock.Mock()}
+                if refused:
+                    with self.assertRaisesRegex(
+                        ValueError, "Failed to encrypt wallet for Monero"
+                    ):
+                        prepare.initialise_wallets(*args, extra_opts=extra_opts)
+                else:
+                    prepare.initialise_wallets(*args, extra_opts=extra_opts)
+            ci.changeWalletPassword.assert_called_once_with(
+                "", "test.123", check_seed_if_encrypt=False
+            )
+
+    def test_entry_points_set_private_umask(self):
+        import importlib.util
+        from unittest import mock
+        import basicswap.bin.prepare as prepare
+        import basicswap.bin.run as run
+
+        script_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "scripts", "createoffers.py"
+        )
+        spec = importlib.util.spec_from_file_location("createoffers", script_path)
+        createoffers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(createoffers)
+
+        orig_umask = os.umask(0o022)
+        try:
+            for main in (prepare.main, run.main, createoffers.main):
+                os.umask(0o022)
+                with (
+                    mock.patch("sys.argv", ["prog", "--version"]),
+                    mock.patch("sys.stdout"),
+                ):
+                    try:
+                        main()
+                    except SystemExit:
+                        pass
+                assert os.umask(0o022) == 0o077, main.__module__
+        finally:
+            os.umask(orig_umask)
+
+    def test_early_offer_revokes_keep_every_sender(self):
+        settings = {"rpcport": 0, "rpcauth": "none"}
+        settings.update(REQUIRED_SETTINGS)
+        ci_part = PARTInterface(settings, "regtest")
+        sc = _FakeSwapClient()
+        sc._possibly_revoked_offers = collections.deque([], maxlen=1000)
+        sc._expired_offer_revokes = set()
+        sc.network_addr = "network_addr"
+        sc.mock_time_offset = 0
+        sc.ci = lambda coin: ci_part
+        sc.getTime = lambda: BaseApp.getTime(sc)
+        sc.openDB = lambda: None
+        sc.closeDB = lambda cursor: None
+        sc.getOffer = lambda offer_id, cursor: None
+        sc.getSmsgMsgBytes = lambda msg: msg["payload"]
+        sc.storeOfferRevoke = lambda *args: BasicSwap.storeOfferRevoke(sc, *args)
+
+        offer_id = sc.getTime().to_bytes(8, "big") + secrets.token_bytes(20)
+        maker, other = PrivateKey(), PrivateKey()
+        maker_addr = ci_part.pubkey_to_address(maker.public_key.format())
+        other_addr = ci_part.pubkey_to_address(other.public_key.format())
+
+        def revoke(key: PrivateKey, addr_from: str) -> None:
+            sig = ci_part._signMessageWithKeyLocal(
+                ci_part.encodeKey(key.secret), offer_id.hex() + "_revoke"
+            )
+            msg_data = OfferRevokeMessage(
+                offer_msg_id=offer_id, signature=base64.b64decode(sig)
+            )
+            msg = {
+                "to": sc.network_addr,
+                "from": addr_from,
+                "payload": msg_data.to_bytes(),
+            }
+            BasicSwap.processOfferRevoke(sc, msg)
+
+        revoke(other, maker_addr)
+        assert len(sc._possibly_revoked_offers) == 0
+        revoke(other, other_addr)
+        assert BasicSwap.isOfferRevoked(sc, offer_id, maker_addr) is False
+        revoke(maker, maker_addr)
+        revoke(maker, maker_addr)
+        assert len(sc._possibly_revoked_offers) == 2
+        assert BasicSwap.isOfferRevoked(sc, offer_id, maker_addr) is True
+
+    def test_split_chunks_need_their_bid_or_offer(self):
+        sc = DBMethods()
+        sc.sqlite_file = ":memory:"
+        sc.mxDB = threading.RLock()
+        sc.log = BSXLogger("test")
+        sc._max_early_split_chunks = 1000
+        sc._max_early_split_chunks_per_sender = 2
+        sc._max_split_chunks_per_bid = 60
+        now: int = 1800000000
+        sc.getTime = lambda: now
+        sc.getSmsgMsgBytes = lambda msg: msg["payload"]
+        sc.getSplitChunkRefusal = lambda *args: BasicSwap.getSplitChunkRefusal(
+            sc, *args
+        )
+
+        offer_id = secrets.token_bytes(28)
+        bid_id = secrets.token_bytes(28)
+        cursor = sc.openDB()
+        try:
+            create_db_(sc._db_con, logger)
+            offer = Offer(
+                offer_id=offer_id,
+                addr_from="offer_addr",
+                was_sent=True,
+                active_ind=1,
+                expire_at=now + 600,
+            )
+            sc.add(offer, cursor)
+            sc.add(Bid(bid_id=bid_id, offer_id=offer_id, bid_addr="bid_addr"), cursor)
+
+            def send_chunk(
+                chunk_bid_id, msg_type, addr_from, addr_to, parent_msg_id=None
+            ) -> int:
+                msg_data = XmrSplitMessage(
+                    msg_id=chunk_bid_id,
+                    msg_type=msg_type,
+                    sequence=1,
+                    dleag=bytes(100),
+                    parent_msg_id=parent_msg_id or chunk_bid_id,
+                )
+                msg = {
+                    "msgid": secrets.token_bytes(28).hex(),
+                    "from": addr_from,
+                    "to": addr_to,
+                    "sent": now,
+                    "payload": msg_data.to_bytes(),
+                }
+                BasicSwap.processXmrSplitMessage(sc, msg)
+                return cursor.execute("SELECT COUNT(*) FROM xmr_split_data").fetchone()[
+                    0
+                ]
+
+            BID, ACCEPT = XmrSplitMsgTypes.BID, XmrSplitMsgTypes.BID_ACCEPT
+            assert send_chunk(bid_id, ACCEPT, "other_addr", "bid_addr") == 0
+            assert send_chunk(bid_id, ACCEPT, "offer_addr", "bid_addr") == 1
+            assert send_chunk(bid_id, BID, "bid_addr", "offer_addr") == 2
+            unknown_bid_id = secrets.token_bytes(28)
+            assert send_chunk(unknown_bid_id, ACCEPT, "offer_addr", "bid_addr") == 2
+            assert send_chunk(unknown_bid_id, BID, "early_addr", "other_addr") == 2
+            assert send_chunk(unknown_bid_id, BID, "early_addr", "offer_addr") == 3
+            assert (
+                send_chunk(secrets.token_bytes(28), BID, "early_addr", "offer_addr")
+                == 4
+            )
+            assert (
+                send_chunk(secrets.token_bytes(28), BID, "early_addr", "offer_addr")
+                == 4
+            )
+            assert (
+                send_chunk(secrets.token_bytes(28), BID, "early_addr_2", "offer_addr")
+                == 5
+            )
+            sc._max_early_split_chunks = 3
+            assert (
+                send_chunk(secrets.token_bytes(28), BID, "early_addr_3", "offer_addr")
+                == 5
+            )
+
+            sc._max_split_chunks_per_bid = 3
+            for expect_rows in (6, 6):
+                assert (
+                    send_chunk(
+                        bid_id,
+                        ACCEPT,
+                        "offer_addr",
+                        "bid_addr",
+                        secrets.token_bytes(28),
+                    )
+                    == expect_rows
+                )
+        finally:
+            sc.closeDB(cursor)
+
+    def test_portals_capped_and_forgotten(self):
+        sc = DBMethods()
+        sc.sqlite_file = ":memory:"
+        sc.mxDB = threading.RLock()
+        sc.log = BSXLogger("test")
+        now: int = 1800000000
+        sc.getTime = lambda: now
+        sc.getSmsgMsgBytes = lambda msg: msg["payload"]
+        sc.getActiveNetwork = lambda network_id: {"bridged": [{"type": "simplex"}]}
+        sc.own_portals = {}
+        sc.known_portals = {}
+        sc.active_networks = []
+        sc._is_locked = False
+        sc._have_smsg_rpc = False
+        sc._portal_time_valid = 30 * 60
+        sc._max_known_portals = 2
+        sc._forget_portals_after = 86400 * 7
+
+        cursor = sc.openDB()
+        try:
+            create_db_(sc._db_con, logger)
+
+            def offer_portal(addr_portal: str, time_valid: int = 30 * 60) -> int:
+                msg_data = MessagePortalOffer(
+                    network_type_from=MessageNetworks.SMSG,
+                    network_type_to=MessageNetworks.SIMPLEX,
+                    portal_address_to=b"network_addr",
+                    time_valid=time_valid,
+                    smsg_difficulty=0x1EFFFFFF,
+                )
+                msg = {
+                    "msgid": secrets.token_bytes(28).hex(),
+                    "msg_net": "smsg",
+                    "sent": now,
+                    "from": addr_portal,
+                    "pubkey_from": "02" + "11" * 32,
+                    "payload": msg_data.to_bytes(),
+                }
+                BSXNetwork.processPortalOffer(sc, msg)
+                return cursor.execute(
+                    "SELECT COUNT(*) FROM network_portals"
+                ).fetchone()[0]
+
+            def portal_addrs() -> list:
+                return [
+                    r[0]
+                    for r in cursor.execute(
+                        "SELECT addr FROM smsgaddresses ORDER BY addr"
+                    ).fetchall()
+                ]
+
+            def pick() -> str | None:
+                portal = BSXNetwork.pickPortal(
+                    sc, sc.known_portals[MessageNetworks.SMSG][MessageNetworks.SIMPLEX]
+                )
+                return None if portal is None else portal.address_from
+
+            cursor.execute(
+                "INSERT INTO smsgaddresses (addr, use_type) VALUES ('bid_addr', :use_type)",
+                {"use_type": int(AddressTypes.BID)},
+            )
+            assert offer_portal("portal_1", time_valid=86400) == 1
+            assert (
+                cursor.execute("SELECT time_valid FROM network_portals").fetchone()[0]
+                == 30 * 60
+            )
+            assert offer_portal("portal_2") == 2
+            assert offer_portal("portal_3") == 2
+            assert offer_portal("portal_1") == 2
+
+            now += 3600
+            assert offer_portal("portal_3") == 3
+            assert pick() == "portal_3"
+            now += 3600
+            assert pick() == "portal_3"
+
+            now += 86400 * 7
+            assert offer_portal("portal_2") == 3
+            BSXNetwork.updateNetworkBridges(sc, now)
+            assert cursor.execute(
+                "SELECT address_from FROM network_portals"
+            ).fetchall() == [("portal_2",)]
+            assert portal_addrs() == ["bid_addr", "portal_2"]
+            assert pick() == "portal_2"
+            assert (
+                len(sc.known_portals[MessageNetworks.SMSG][MessageNetworks.SIMPLEX])
+                == 1
+            )
+        finally:
+            sc.closeDB(cursor)
+
+    def test_fastsync_tar_members(self):
+        def makeTar(*members):
+            buf = BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as ft:
+                for name, member_type, linkname, *mode in members:
+                    info = tarfile.TarInfo(name)
+                    info.type = member_type
+                    info.mode = mode[0] if mode else 0o755
+                    info.linkname = linkname
+                    data = b"x" if member_type == tarfile.REGTYPE else b""
+                    info.size = len(data)
+                    ft.addfile(info, BytesIO(data))
+            buf.seek(0)
+            return tarfile.open(fileobj=buf)
+
+        unfiltered = (
+            {"filter": "fully_trusted"} if hasattr(tarfile, "data_filter") else {}
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_dir = os.path.join(tmp_dir, "bitcoin")
+            os.makedirs(data_dir)
+            with makeTar(
+                ("blocks", tarfile.DIRTYPE, ""),
+                ("blocks/blk00000.dat", tarfile.REGTYPE, ""),
+                ("chainstate/link", tarfile.SYMTYPE, "../blocks/blk00000.dat"),
+                ("chainstate/hard", tarfile.LNKTYPE, "blocks/blk00000.dat"),
+                ("blocks/suid", tarfile.REGTYPE, "", 0o6777),
+                ("blocks/noperm", tarfile.REGTYPE, "", 0o000),
+                ("sticky", tarfile.DIRTYPE, "", 0o1777),
+            ) as ft:
+                ft.extractall(
+                    path=data_dir, members=checkTarMembers(ft, data_dir), **unfiltered
+                )
+            for name in ("link", "hard"):
+                with open(os.path.join(data_dir, "chainstate", name), "rb") as fp:
+                    assert fp.read() == b"x"
+            for name, mode in (
+                ("blocks/suid", 0o755),
+                ("blocks/noperm", 0o600),
+                ("sticky", 0o755),
+            ):
+                assert os.stat(os.path.join(data_dir, name)).st_mode & 0o7777 == mode
+
+            for member in (
+                ("../outside", tarfile.REGTYPE, ""),
+                (os.path.join(tmp_dir, "outside"), tarfile.REGTYPE, ""),
+                ("blocks/up", tarfile.SYMTYPE, "../../outside"),
+                ("blocks/abs", tarfile.SYMTYPE, os.path.join(tmp_dir, "outside")),
+                ("blocks/hard", tarfile.LNKTYPE, "../outside"),
+                ("blocks/fifo", tarfile.FIFOTYPE, ""),
+            ):
+                with makeTar(member) as ft:
+                    with self.assertRaises(ValueError):
+                        ft.extractall(
+                            path=data_dir,
+                            members=checkTarMembers(ft, data_dir),
+                            **unfiltered,
+                        )
+            assert os.listdir(tmp_dir) == ["bitcoin"]
+            assert not os.path.lexists(os.path.join(data_dir, "blocks", "up"))
 
 
 if __name__ == "__main__":

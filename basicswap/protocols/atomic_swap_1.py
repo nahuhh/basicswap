@@ -20,6 +20,7 @@ from basicswap.script import (
 from basicswap.basicswap_util import (
     EventLogTypes,
     SwapTypes,
+    TxTypes,
 )
 from . import ProtocolInterface
 
@@ -122,18 +123,27 @@ def extractScriptSecretHash(script):
     return script[7:39]
 
 
+def extractScriptLockValue(script) -> int:
+    return decodeScriptNum(script, 64)[0]
+
+
 def redeemITx(self, bid_id: bytes, cursor):
-    bid, offer = self.getBidAndOffer(bid_id, cursor)
+    bid, offer = self.swaps_in_progress.get(bid_id) or self.getBidAndOffer(
+        bid_id, cursor
+    )
     ci_from = self.ci(offer.coin_from)
 
     txn = self.createRedeemTxn(
         ci_from.coin_type(), bid, for_txn_type="initiate", cursor=cursor
     )
-    txid = ci_from.publishTx(bytes.fromhex(txn))
+    redeem_tx = self.publishRedeemTxn(
+        ci_from, bid, TxTypes.ITX_REDEEM, bytes.fromhex(txn)
+    )
 
-    bid.initiate_tx.spend_txid = bytes.fromhex(txid)
+    bid.initiate_tx.spend_txid = redeem_tx.txid
+    self.saveBidInSession(bid_id, bid, cursor)
     self.log.debug(
-        f"Submitted initiate redeem txn {self.logIDT(txid)} to {ci_from.coin_name()} chain for bid {self.logIDB(bid_id)}"
+        f"Submitted initiate redeem txn {self.logIDT(redeem_tx.txid)} to {ci_from.coin_name()} chain for bid {self.logIDB(bid_id)}"
     )
     self.logEvent(Concepts.BID, bid_id, EventLogTypes.ITX_REDEEM_PUBLISHED, "", cursor)
 
@@ -148,10 +158,17 @@ class AtomicSwapInterface(ProtocolInterface):
         sub_fee: bool,
         feerate: int = None,
         lock_unspents: bool = False,
+        preview: bool = False,
     ) -> bytes:
         addr_to = self.getMockScriptAddr(ci)
+        # A preview's change goes to the mock output, keeping the wallet's change keys unused
         funded_tx = ci.createRawFundedTransaction(
-            addr_to, amount, sub_fee, lock_unspents=lock_unspents, feerate=feerate
+            addr_to,
+            amount,
+            sub_fee,
+            lock_unspents=lock_unspents,
+            feerate=feerate,
+            change_addr=addr_to if preview else None,
         )
         return bytes.fromhex(funded_tx)
 

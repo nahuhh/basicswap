@@ -5,6 +5,7 @@
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
+import http.client
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from .util import (
     TemporaryError,
 )
 from .util.network import (
+    is_public_ip_address,
     is_public_url,
     is_url_scheme_allowed,
 )
@@ -63,6 +65,127 @@ class PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def create_public_connection(address, timeout, source_address=None):
+    # Connects to the addresses vetted here, not to a second DNS answer.
+    host, port = address
+    addrinfo = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not addrinfo or not all(
+        is_public_ip_address(sockaddr[0]) for *_, sockaddr in addrinfo
+    ):
+        raise ValueError("URL host not permitted.")
+    err = None
+    for *_, sockaddr in addrinfo:
+        try:
+            return socket.create_connection(sockaddr[:2], timeout, source_address)
+        except OSError as e:
+            err = e
+    raise err
+
+
+class PublicHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = create_public_connection
+
+
+class PublicHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = create_public_connection
+
+
+class RequestDeadline:
+    # Shuts the request's sockets down when time is up, so a server trickling
+    # the headers or body can't hold the read open past the deadline.
+    def __init__(self, seconds: float):
+        self.lock = threading.Lock()
+        self.socks = []
+        self.expired = False
+        self.timer = threading.Timer(seconds, self.expire)
+
+    def __enter__(self):
+        self.timer.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.timer.cancel()
+        if self.expired:
+            raise TimeoutError("URL read timed out.") from exc
+
+    def track(self, sock) -> None:
+        with self.lock:
+            self.socks.append(sock)
+            if self.expired:
+                shutdown_socket(sock)
+
+    def expire(self) -> None:
+        with self.lock:
+            self.expired = True
+            for sock in self.socks:
+                shutdown_socket(sock)
+
+
+def shutdown_socket(sock) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+class DeadlineHandlerMixin:
+    def __init__(self, deadline: RequestDeadline, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.deadline = deadline
+
+    def do_open(self, http_class, req, **http_conn_args):
+        def build(*args, **kwargs):
+            conn = http_class(*args, **kwargs)
+            connect = conn.connect
+
+            def tracked_connect():
+                connect()
+                self.deadline.track(conn.sock)
+
+            conn.connect = tracked_connect
+            return conn
+
+        return super().do_open(build, req, **http_conn_args)
+
+
+class DeadlineHTTPHandler(DeadlineHandlerMixin, urllib.request.HTTPHandler):
+    pass
+
+
+class DeadlineHTTPSHandler(DeadlineHandlerMixin, urllib.request.HTTPSHandler):
+    pass
+
+
+class DeadlineSocksiPyHandler(DeadlineHandlerMixin, SocksiPyHandler):
+    pass
+
+
+class PublicHTTPHandler(DeadlineHTTPHandler):
+    def http_open(self, req):
+        return self.do_open(PublicHTTPConnection, req)
+
+
+class PublicHTTPSHandler(DeadlineHTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(PublicHTTPSConnection, req, context=self._context)
+
+
+READ_URL_MAX_BYTES = 10 * 1024 * 1024
+
+
+def read_response(response, max_bytes: int) -> bytes:
+    data = bytearray()
+    while chunk := response.read1(65536):
+        data += chunk
+        if len(data) > max_bytes:
+            raise ValueError("URL response too large.")
+    return bytes(data)
+
+
 class BaseApp(DBMethods):
     def __init__(self, data_dir, settings, chain, log_name="BasicSwap", **kwargs):
         self.fp = None
@@ -77,10 +200,15 @@ class BaseApp(DBMethods):
         self.coin_interfaces = {}
         self.mxDB = threading.RLock()
         self.debug = self.settings.get("debug", False)
+        log_level: str = self.settings.get(
+            "log_level", "debug" if self.debug else "info"
+        )
+        if log_level not in ("debug", "info"):
+            raise ValueError(f'Unknown "log_level" "{log_level}"')
+        self.debug_logs: bool = log_level == "debug"
         self.delay_event = threading.Event()
         self.chainstate_delay_event = threading.Event()
 
-        self._network = None
         self.prepareLogging()
         self.log.info(f"Network: {self.chain}")
 
@@ -97,8 +225,8 @@ class BaseApp(DBMethods):
         self._enabled_log_categories = set()
         for category in self.settings.get("enabled_log_categories", []):
             category = category.lower()
-            if category == "net":
-                self._enabled_log_categories.add(LC.NET)
+            if category.upper() in LC.__members__:
+                self._enabled_log_categories.add(LC[category.upper()])
             else:
                 self.log.warning(
                     f'Unknown entry "{category}" in "enabled_log_categories"'
@@ -137,7 +265,9 @@ class BaseApp(DBMethods):
             self.delay_event.set()
 
     def openLogFile(self):
-        self.fp = open(os.path.join(self.data_dir, "basicswap.log"), "a")
+        self.fp = open(
+            os.path.join(self.data_dir, "basicswap.log"), "a", encoding="utf-8"
+        )
 
     def prepareLogging(self):
         logging.setLoggerClass(BSXLogger)
@@ -166,7 +296,7 @@ class BaseApp(DBMethods):
         stream_fp = logging.StreamHandler(self.fp)
         stream_fp.setFormatter(formatter)
 
-        self.log.setLevel(logging.DEBUG if self.debug else logging.INFO)
+        self.log.setLevel(logging.DEBUG if self.debug_logs else logging.INFO)
         self.log.addHandler(stream_fp)
         self.log.addHandler(stream_stdout)
 
@@ -246,13 +376,13 @@ class BaseApp(DBMethods):
         except Exception as e:
             self.log.warning(f"Failed to save settings: {e}")
 
-    def setDaemonPID(self, name, pid) -> None:
+    def setDaemon(self, name, daemon) -> None:
         if isinstance(name, Coins):
-            self.coin_clients[name]["pid"] = pid
+            self.coin_clients[name]["daemon"] = daemon
             return
         for c, v in self.coin_clients.items():
             if v["name"] == name:
-                v["pid"] = pid
+                v["daemon"] = daemon
 
     def getChainDatadirPath(self, coin) -> str:
         datadir = self.coin_clients[coin]["datadir"]
@@ -370,35 +500,75 @@ class BaseApp(DBMethods):
         socket.setdefaulttimeout(self.default_socket_timeout)
 
     def readURL(
-        self, url: str, timeout: int = 120, headers={}, check_public: bool = False
+        self,
+        url: str,
+        timeout: int = 120,
+        headers={},
+        check_public: bool = False,
     ) -> bytes:
         if not is_url_scheme_allowed(url):
             raise ValueError("Unsupported URL scheme.")
-        open_handler = None
-        if self.use_tor_proxy:
-            open_handler = SocksiPyHandler(
-                socks.PROXY_TYPE_SOCKS5, self.tor_proxy_host, self.tor_proxy_port
-            )
+        deadline = RequestDeadline(timeout)
         # Tor egresses via the SOCKS proxy (rdns), so local resolution can't vet
         # the real destination; the scheme allowlist above still applies.
-        build_args = [open_handler] if self.use_tor_proxy else []
-        if check_public and not self.use_tor_proxy:
-            build_args.append(PublicOnlyRedirectHandler())
+        if self.use_tor_proxy:
+            build_args = [
+                DeadlineSocksiPyHandler(
+                    deadline,
+                    socks.PROXY_TYPE_SOCKS5,
+                    self.tor_proxy_host,
+                    self.tor_proxy_port,
+                )
+            ]
+        elif check_public:
+            build_args = [PublicOnlyRedirectHandler()]
+            # An HTTP(S) proxy resolves the host itself, so only a direct
+            # connection can be bound to the vetted address.
+            if {"http", "https"} & urllib.request.getproxies().keys():
+                build_args += [
+                    DeadlineHTTPHandler(deadline),
+                    DeadlineHTTPSHandler(deadline),
+                ]
+            else:
+                build_args += [
+                    PublicHTTPHandler(deadline),
+                    PublicHTTPSHandler(deadline),
+                ]
+        else:
+            build_args = [DeadlineHTTPHandler(deadline), DeadlineHTTPSHandler(deadline)]
         opener = urllib.request.build_opener(*build_args)
         if headers is None:
             opener.addheaders = [("User-agent", "Mozilla/5.0")]
         request = urllib.request.Request(url, headers=headers)
-        return opener.open(request, timeout=timeout).read()
+        with deadline, opener.open(request, timeout=timeout) as response:
+            return read_response(response, READ_URL_MAX_BYTES)
 
     def logException(self, message: str) -> None:
         self.log.error(message)
-        if self.debug:
+        if self.debug_logs:
             self.log.error(traceback.format_exc())
 
     def logD(self, log_category: int, message: str) -> None:
         if log_category not in self._enabled_log_categories:
             return
         self.log.debug("(" + LC(log_category).name + ") " + message)
+
+    def logCategories(self) -> dict:
+        return {c.name.lower(): c in self._enabled_log_categories for c in LC}
+
+    def setLogCategories(self, include: list[str], exclude: list[str]) -> None:
+        for name in list(include) + list(exclude):
+            if name.upper() not in LC.__members__:
+                raise ValueError(f'Unknown log category "{name}"')
+        enabled = set(self._enabled_log_categories)
+        enabled.update(LC[name.upper()] for name in include)
+        enabled.difference_update(LC[name.upper()] for name in exclude)
+        self._enabled_log_categories = enabled
+        self.log.info(
+            "Enabled logging categories: {}".format(
+                ",".join(sorted([c.name for c in enabled])) or "none"
+            )
+        )
 
     def torControl(self, query):
         try:
@@ -425,6 +595,11 @@ class BaseApp(DBMethods):
     def setMockTimeOffset(self, new_offset: int) -> None:
         self.log.warning(f"Setting mocktime to {new_offset}")
         self.mock_time_offset = new_offset
+
+    @staticmethod
+    def checkDue(now: int, last_checked: int, interval: int) -> bool:
+        # A clock moved back, real or mocked, must not stall the check
+        return not 0 <= now - last_checked < interval
 
     def get_clamped_int_from(
         self,

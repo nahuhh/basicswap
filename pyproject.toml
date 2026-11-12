@@ -36,7 +36,7 @@ dev = [
     "pre-commit",
     "pytest",
     "ruff",
-    "black==26.5.1",
+    "black==26.10.1",
     "selenium",
 ]
 
@@ -56,6 +56,7 @@ external = ["E131"]
 
 [tool.black]
 force-exclude = "contrib"
+target-version = ["py311", "py312", "py313", "py314"]
 
 [tool.codespell]
 check-filenames = true

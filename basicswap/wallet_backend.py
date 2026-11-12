@@ -162,13 +162,14 @@ class ElectrumBackend(WalletBackend):
         proxy_host=None,
         proxy_port=None,
         cert_pins=None,
+        max_servers: int = 1,
     ):
         from basicswap.interface.electrumx import ElectrumServer
         from basicswap.chainparams import Coins, chainparams
 
         self._coin_type = coin_type
         self._log = log
-        self._subscribed_scripthashes = set()
+        self._statuses: dict[str, str | None] = {}
 
         coin_params = chainparams.get(coin_type, chainparams.get(Coins.BTC))
         self._network_params = coin_params.get(chain, coin_params.get("mainnet", {}))
@@ -191,6 +192,7 @@ class ElectrumBackend(WalletBackend):
             proxy_host=proxy_host,
             proxy_port=proxy_port,
             cert_pins=cert_pins,
+            max_servers=max_servers,
         )
 
         self._realtime_callback = None
@@ -209,9 +211,27 @@ class ElectrumBackend(WalletBackend):
 
         self._max_batch_size = 5
         self._background_mode = False
+        self._txid_fn = None
 
     def setBackgroundMode(self, enabled: bool):
         self._background_mode = enabled
+
+    def setTxidFunction(self, txid_fn) -> None:
+        self._txid_fn = txid_fn
+
+    def _txMatches(self, txid: str, tx) -> bool:
+        if self._txid_fn is None:
+            return True
+        tx_hex = tx.get("hex") if isinstance(tx, dict) else tx
+        try:
+            if isinstance(tx_hex, str) and self._txid_fn(tx_hex) == txid.lower():
+                return True
+        except Exception:
+            pass
+        self._log.warning(
+            f"Electrum server returned a transaction that does not match {txid[:16]}..."
+        )
+        return False
 
     def _call(self, method: str, params: list = None, timeout: int = 10):
         if self._background_mode and hasattr(self._server, "call_background"):
@@ -232,33 +252,17 @@ class ElectrumBackend(WalletBackend):
         if batch_size is None:
             batch_size = self._max_batch_size
 
+        # A failed call must raise, never read as an empty balance, history or UTXO set
         all_results = []
         for i in range(0, len(scripthashes), batch_size):
             if self._is_server_stopping():
-                self._log.debug("_split_batch_call: server stopping, aborting")
-                break
+                raise TemporaryError("Electrum server is shutting down")
             chunk = scripthashes[i : i + batch_size]
-            try:
-                calls = [(method, [sh]) for sh in chunk]
-                results = self._call_batch(calls)
-                all_results.extend(results)
-            except Exception:
-                if self._is_server_stopping():
-                    self._log.debug(
-                        "_split_batch_call: server stopping after batch failure, aborting"
-                    )
-                    break
-                for sh in chunk:
-                    if self._is_server_stopping():
-                        self._log.debug(
-                            "_split_batch_call: server stopping during fallback, aborting"
-                        )
-                        break
-                    try:
-                        result = self._call(method, [sh])
-                        all_results.append(result)
-                    except Exception:
-                        all_results.append(None)
+            results = self._call_batch([(method, [sh]) for sh in chunk])
+            for sh, result in zip(chunk, results):
+                if result is None:
+                    raise TemporaryError(f"{method} failed for scripthash {sh}")
+            all_results.extend(results)
         return all_results
 
     def _isUnsupportedAddress(self, address: str) -> bool:
@@ -325,7 +329,7 @@ class ElectrumBackend(WalletBackend):
         batch_size = self._max_batch_size
         for batch_start in range(0, len(addr_list), batch_size):
             if self._is_server_stopping():
-                break
+                raise TemporaryError("Electrum server is shutting down")
             batch = addr_list[batch_start : batch_start + batch_size]
 
             addr_to_scripthash = {}
@@ -340,57 +344,14 @@ class ElectrumBackend(WalletBackend):
             if not addr_to_scripthash:
                 continue
 
-            scripthashes = list(addr_to_scripthash.values())
-            scripthash_to_addr = {v: k for k, v in addr_to_scripthash.items()}
-            batch_success = False
-
-            for attempt in range(2):
-                try:
-                    batch_results = self._server.get_balance_batch(scripthashes)
-                    for i, balance in enumerate(batch_results):
-                        if balance and isinstance(balance, dict):
-                            addr = scripthash_to_addr.get(scripthashes[i])
-                            if addr:
-                                result[addr] = {
-                                    "confirmed": balance.get("confirmed", 0),
-                                    "unconfirmed": balance.get("unconfirmed", 0),
-                                }
-                    batch_success = True
-                    break
-                except Exception as e:
-                    if self._is_server_stopping():
-                        break
-                    if attempt == 0:
-                        self._log.debug(
-                            f"Batch detailed balance query failed, reconnecting: {e}"
-                        )
-                        try:
-                            self._server.disconnect()
-                        except Exception:
-                            pass
-                        time.sleep(0.5)
-                    else:
-                        self._log.debug(
-                            f"Batch detailed balance query failed after retry, falling back: {e}"
-                        )
-
-            if not batch_success:
-                for addr, scripthash in addr_to_scripthash.items():
-                    if self._is_server_stopping():
-                        break
-                    try:
-                        balance = self._call(
-                            "blockchain.scripthash.get_balance", [scripthash]
-                        )
-                        if balance and isinstance(balance, dict):
-                            result[addr] = {
-                                "confirmed": balance.get("confirmed", 0),
-                                "unconfirmed": balance.get("unconfirmed", 0),
-                            }
-                    except Exception as e:
-                        self._log.debug(
-                            f"ElectrumBackend.getDetailedBalance error for {addr[:10]}...: {e}"
-                        )
+            balances = self._server.get_balance_batch(list(addr_to_scripthash.values()))
+            for addr, balance in zip(addr_to_scripthash, balances):
+                if not isinstance(balance, dict):
+                    raise TemporaryError(f"No electrum balance for {addr[:10]}...")
+                result[addr] = {
+                    "confirmed": balance.get("confirmed", 0),
+                    "unconfirmed": balance.get("unconfirmed", 0),
+                }
 
         return result
 
@@ -502,6 +463,7 @@ class ElectrumBackend(WalletBackend):
                         "bad-txns",
                         "txn-mempool-conflict",
                         "already in block chain",
+                        "already in utxo set",
                         "transaction already exists",
                         "insufficient fee",
                         "dust",
@@ -522,17 +484,22 @@ class ElectrumBackend(WalletBackend):
 
     def getTransaction(self, txid: str) -> dict | None:
         try:
-            return self._call("blockchain.transaction.get", [txid, True])
+            tx_info = self._call("blockchain.transaction.get", [txid, True])
         except Exception:
             return None
+        if tx_info and not self._txMatches(txid, tx_info):
+            return None
+        return tx_info
 
     def getTransactionRaw(self, txid: str) -> str | None:
         try:
             tx_hex = self._call("blockchain.transaction.get", [txid, False])
-            return tx_hex
         except Exception as e:
             self._log.warning(f"getTransactionRaw failed for {txid[:16]}...: {e}")
             return None
+        if tx_hex and not self._txMatches(txid, tx_hex):
+            return None
+        return tx_hex
 
     def _cacheConfirmedTx(self, txid: str, tx_info: dict) -> None:
         if not tx_info or not tx_info.get("blockhash"):
@@ -571,6 +538,8 @@ class ElectrumBackend(WalletBackend):
                 calls = [("blockchain.transaction.get", [txid, True]) for txid in chunk]
                 responses = self._call_batch(calls)
                 for txid, tx_info in zip(chunk, responses):
+                    if tx_info and not self._txMatches(txid, tx_info):
+                        tx_info = None
                     result[txid] = tx_info if tx_info else None
                     self._cacheConfirmedTx(txid, tx_info)
             except Exception as e:
@@ -593,6 +562,8 @@ class ElectrumBackend(WalletBackend):
             calls = [("blockchain.transaction.get", [txid, False]) for txid in txids]
             responses = self._call_batch(calls)
             for txid, tx_hex in zip(txids, responses):
+                if tx_hex and not self._txMatches(txid, tx_hex):
+                    tx_hex = None
                 result[txid] = tx_hex if tx_hex else None
         except Exception as e:
             self._log.debug(f"getTransactionBatchRaw error: {e}")
@@ -740,6 +711,17 @@ class ElectrumBackend(WalletBackend):
 
         return result
 
+    def getScriptHistory(self, script: bytes) -> list[dict]:
+        # Raises when the server gives no answer, unlike getAddressHistory
+        from basicswap.interface.electrumx import scripthash_from_script
+
+        history = self._split_batch_call(
+            [scripthash_from_script(script)], "blockchain.scripthash.get_history"
+        )[0]
+        return [
+            {"txid": h.get("tx_hash"), "height": h.get("height", 0)} for h in history
+        ]
+
     def getAddressHistoryBackground(self, address: str) -> list[dict]:
         if self._isUnsupportedAddress(address):
             return []
@@ -760,8 +742,6 @@ class ElectrumBackend(WalletBackend):
     def getBatchUnspent(
         self, scripthashes: list[str], min_confirmations: int = 0
     ) -> dict[str, list[dict]]:
-        # A partial or failed result must never read as "no UTXOs": callers size
-        # spends against this and would treat it as an empty wallet.
         if not scripthashes:
             return {}
 
@@ -769,15 +749,9 @@ class ElectrumBackend(WalletBackend):
         responses = self._split_batch_call(
             scripthashes, "blockchain.scripthash.listunspent"
         )
-        if len(responses) != len(scripthashes):
-            raise TemporaryError(
-                f"listunspent returned {len(responses)} of {len(scripthashes)} results"
-            )
 
         result = {}
         for sh, utxos in zip(scripthashes, responses):
-            if utxos is None:
-                raise TemporaryError(f"listunspent failed for scripthash {sh}")
             result[sh] = []
             for utxo in utxos:
                 height = utxo.get("height", 0)
@@ -796,7 +770,6 @@ class ElectrumBackend(WalletBackend):
     def enableRealtimeNotifications(self, callback) -> None:
         self._realtime_callback = callback
         self._server.enable_realtime_notifications()
-        self._log.info(f"Real-time notifications enabled for {self._coin_type}")
 
     def _create_scripthash_callback(self, scripthash):
 
@@ -806,6 +779,9 @@ class ElectrumBackend(WalletBackend):
         return callback
 
     def _handle_scripthash_notification(self, scripthash, new_status):
+        if scripthash in self._statuses and self._statuses[scripthash] == new_status:
+            return
+        self._statuses[scripthash] = new_status
         if not self._realtime_callback:
             return
 
@@ -822,26 +798,27 @@ class ElectrumBackend(WalletBackend):
         except Exception as e:
             self._log.debug(f"Error in realtime callback: {e}")
 
-    def subscribeAddressWithCallback(self, address: str) -> str:
-        if self._isUnsupportedAddress(address):
-            return None
+    def isSubscribed(self, scripthash: str) -> bool:
+        return scripthash in self._statuses
 
-        try:
+    def hasHistory(self, address: str) -> bool:
+        return self._statuses.get(self._address_to_scripthash.get(address)) is not None
+
+    def subscribeAddresses(self, addresses: list[str]) -> dict[str, str | None]:
+        """The subscribe status of each address the server answered."""
+        address_for = {}
+        for address in addresses:
+            if self._isUnsupportedAddress(address):
+                continue
             scripthash = self._addressToScripthash(address)
             self._address_to_scripthash[address] = scripthash
+            address_for[scripthash] = address
 
-            if self._realtime_callback:
-                status = self._server.subscribe_with_callback(
-                    scripthash, self._create_scripthash_callback(scripthash)
-                )
-            else:
-                status = self._call("blockchain.scripthash.subscribe", [scripthash])
-
-            self._subscribed_scripthashes.add(scripthash)
-            return status
-        except Exception as e:
-            self._log.debug(f"Failed to subscribe to {address}: {e}")
-            return None
+        statuses = self._server.subscribe_many(
+            {sh: self._create_scripthash_callback(sh) for sh in address_for}
+        )
+        self._statuses.update(statuses)
+        return {address_for[sh]: status for sh, status in statuses.items()}
 
     def getSyncStatus(self) -> dict:
         import time

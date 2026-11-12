@@ -14,7 +14,6 @@ import threading
 import traceback
 import sys
 from urllib import parse
-from urllib.request import Request, urlopen
 from basicswap import AMM_VERSION
 from .util import listAvailableCoinsWithBalances
 
@@ -31,6 +30,25 @@ amm_host = "127.0.0.1"
 amm_port = 12700
 amm_debug = False
 amm_ui_debug = False
+
+AMM_CONFIG_FORM_MARKERS = (
+    "save_global_settings",
+    "add_offer",
+    "add_bid",
+    "save_config",
+    "create_default",
+    "prune_state",
+)
+
+
+def amm_form_allowed(handler, post_string, err_messages) -> bool:
+    """Control form posts must carry the form token"""
+    form_data = parse.parse_qs(
+        post_string.decode("utf-8") if isinstance(post_string, bytes) else post_string
+    )
+    if any(marker in form_data for marker in AMM_CONFIG_FORM_MARKERS):
+        return True
+    return handler.checkForm(post_string, "amm", err_messages) is not None
 
 
 def ensure_amm_dir(swap_client):
@@ -59,7 +77,7 @@ def get_amm_script_path(swap_client):
     return os.path.join(swap_client.data_dir, "basicswap", "scripts", "createoffers.py")
 
 
-def log_capture_thread(process, swap_client):
+def log_capture_thread(process, swap_client, api_token):
     """Thread to capture and store logs from the AMM process"""
     global amm_status
 
@@ -128,6 +146,8 @@ def log_capture_thread(process, swap_client):
         amm_status = "stopped"
         amm_log_buffer.append("AMM process has stopped.")
         swap_client.log.info("AMM process has stopped.")
+        if swap_client._amm_api_token == api_token:
+            swap_client._amm_api_token = None
 
 
 def check_existing_amm_processes():
@@ -286,7 +306,8 @@ def start_amm_process(
     # Give the AMM an ephemeral API token via the environment so its login
     # credential never has to be written to disk.
     amm_api_token = secrets.token_urlsafe(32)
-    swap_client._amm_api_token = amm_api_token
+    with amm_log_lock:
+        swap_client._amm_api_token = amm_api_token
 
     try:
         amm_process = subprocess.Popen(
@@ -310,7 +331,9 @@ def start_amm_process(
             amm_log_buffer.append(f"Using state file: {state_path}")
 
         log_thread = threading.Thread(
-            target=log_capture_thread, args=(amm_process, swap_client), daemon=True
+            target=log_capture_thread,
+            args=(amm_process, swap_client, amm_api_token),
+            daemon=True,
         )
         log_thread.start()
 
@@ -506,30 +529,6 @@ def get_amm_active_count(swap_client, debug_override=False):
                 swap_client.log.error(f"Error getting network offers: {str(e)}")
                 swap_client.log.error(traceback.format_exc())
 
-        if len(active_network_offers) == 0:
-            try:
-                global amm_host, amm_port
-                if "amm_host" not in globals() or "amm_port" not in globals():
-                    amm_host = "127.0.0.1"
-                    amm_port = 12700
-
-                api_url = f"http://{amm_host}:{amm_port}/api/v1/offers"
-
-                req = Request(api_url)
-                response = urlopen(req)
-                data = json.loads(response.read().decode("utf-8"))
-
-                if "offers" in data:
-                    for offer in data["offers"]:
-                        if "id" in offer:
-                            offer_id = offer["id"]
-                            active_network_offers[offer_id] = True
-
-            except Exception as e:
-                if debug_enabled:
-                    swap_client.log.error(f"Error getting offers via API: {str(e)}")
-                    swap_client.log.error(traceback.format_exc())
-
         if "offers" in state_data:
             for template_id, offers in state_data["offers"].items():
                 if enabled_offers is None or template_id in enabled_offers:
@@ -705,7 +704,11 @@ def page_amm(self, _, post_string):
         except Exception as e:
             err_messages.append(f"Failed to create default config file: {str(e)}")
 
-    if post_string and self.command == "POST":
+    if (
+        post_string
+        and self.command == "POST"
+        and amm_form_allowed(self, post_string, err_messages)
+    ):
         try:
             form_data = parse.parse_qs(
                 post_string.decode("utf-8")
@@ -713,65 +716,62 @@ def page_amm(self, _, post_string):
                 else post_string
             )
 
-            if "start" in form_data:
-                amm_host = form_data.get("host", ["127.0.0.1"])[0]
-                amm_port = int(form_data.get("port", ["12700"])[0])
-                amm_ui_debug = "debug" in form_data
-                amm_debug = amm_ui_debug
-
-                success, msg = start_amm_process(
-                    swap_client, amm_host, amm_port, debug=amm_debug
-                )
-                if success:
-                    messages.append(msg)
-                else:
-                    err_messages.append(msg)
-
-            elif "force_start" in form_data:
-                amm_host = form_data.get("host", ["127.0.0.1"])[0]
-                amm_port = int(form_data.get("port", ["12700"])[0])
-                amm_ui_debug = "debug" in form_data
-                amm_debug = amm_ui_debug
-
-                success, msg = start_amm_process_force(
-                    swap_client, amm_host, amm_port, debug=amm_debug
-                )
-                if success:
-                    messages.append(f"Force started: {msg}")
-                else:
-                    err_messages.append(f"Force start failed: {msg}")
-
-            elif "stop" in form_data:
-                success, msg = stop_amm_process(swap_client)
-                if success:
-                    messages.append(msg)
-                else:
-                    err_messages.append(msg)
-
-            elif "check_processes" in form_data:
-                existing_pids = check_existing_amm_processes()
-                if existing_pids:
-                    messages.append(f"Found existing AMM processes: {existing_pids}")
-                else:
-                    messages.append("No existing AMM processes found")
-
-            elif "kill_orphans" in form_data:
-                success, msg = kill_existing_amm_processes(swap_client)
-                if success:
-                    messages.append(msg)
-                else:
-                    err_messages.append(msg)
-
-            is_control_action = (
-                "save_global_settings" not in form_data
-                and "add_offer" not in form_data
-                and "add_bid" not in form_data
-                and "save_config" not in form_data
-                and "create_default" not in form_data
-                and "prune_state" not in form_data
+            is_control_action = not any(
+                marker in form_data for marker in AMM_CONFIG_FORM_MARKERS
             )
 
             if is_control_action:
+                if "start" in form_data:
+                    amm_host = form_data.get("host", ["127.0.0.1"])[0]
+                    amm_port = int(form_data.get("port", ["12700"])[0])
+                    amm_ui_debug = "debug" in form_data
+                    amm_debug = amm_ui_debug
+
+                    success, msg = start_amm_process(
+                        swap_client, amm_host, amm_port, debug=amm_debug
+                    )
+                    if success:
+                        messages.append(msg)
+                    else:
+                        err_messages.append(msg)
+
+                elif "force_start" in form_data:
+                    amm_host = form_data.get("host", ["127.0.0.1"])[0]
+                    amm_port = int(form_data.get("port", ["12700"])[0])
+                    amm_ui_debug = "debug" in form_data
+                    amm_debug = amm_ui_debug
+
+                    success, msg = start_amm_process_force(
+                        swap_client, amm_host, amm_port, debug=amm_debug
+                    )
+                    if success:
+                        messages.append(f"Force started: {msg}")
+                    else:
+                        err_messages.append(f"Force start failed: {msg}")
+
+                elif "stop" in form_data:
+                    success, msg = stop_amm_process(swap_client)
+                    if success:
+                        messages.append(msg)
+                    else:
+                        err_messages.append(msg)
+
+                elif "check_processes" in form_data:
+                    existing_pids = check_existing_amm_processes()
+                    if existing_pids:
+                        messages.append(
+                            f"Found existing AMM processes: {existing_pids}"
+                        )
+                    else:
+                        messages.append("No existing AMM processes found")
+
+                elif "kill_orphans" in form_data:
+                    success, msg = kill_existing_amm_processes(swap_client)
+                    if success:
+                        messages.append(msg)
+                    else:
+                        err_messages.append(msg)
+
                 if "autostart" in form_data:
                     swap_client.settings["amm_autostart"] = True
                     swap_client.log.info("AMM autostart enabled")
@@ -1216,7 +1216,7 @@ def page_amm(self, _, post_string):
                     )
 
         except Exception as e:
-            if swap_client.debug:
+            if swap_client.debug_logs:
                 swap_client.log.error(traceback.format_exc())
             err_messages.append(str(e))
 

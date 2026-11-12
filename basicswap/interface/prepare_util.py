@@ -7,6 +7,7 @@
 import hashlib
 import mmap
 import os
+import platform
 import stat
 import sys
 import tarfile
@@ -118,6 +119,32 @@ def ensureFileHashInFile(release_hash: str, assert_path: str, logger=None) -> No
             logger.info("Found release hash in assert file.")
 
 
+def readClearsigned(assert_path: str) -> tuple:
+    """Returns (message, signed_text) for the file's one cleartext-signed message."""
+    with open(assert_path, "rb") as fp:
+        lines = fp.read().splitlines(keepends=True)
+    marks = [line.rstrip() for line in lines]
+    begin = b"-----BEGIN PGP SIGNED MESSAGE-----"
+    if marks.count(begin) != 1:
+        raise ValueError(f"Expected one signed message in {assert_path}.")
+    start = marks.index(begin)
+    text_start = marks.index(b"", start) + 1
+    sig_start = marks.index(b"-----BEGIN PGP SIGNATURE-----", text_start)
+    end = marks.index(b"-----END PGP SIGNATURE-----", sig_start) + 1
+    return b"".join(lines[start:end]), b"".join(lines[text_start:sig_start])
+
+
+def ensureFileHashInSignedText(
+    release_hash: str, assert_path: str, logger=None
+) -> None:
+    if bytes(release_hash, "utf-8") not in readClearsigned(assert_path)[1]:
+        raise ValueError(
+            f"Error: Release hash {release_hash} not found in the signed text of the assert file."
+        )
+    if logger is not None:
+        logger.info("Found release hash in the signed text of the assert file.")
+
+
 def getFileHash(file_path: str, print_progress: bool = False, logger=None) -> str:
     h = hashlib.sha256()
     if print_progress:
@@ -136,11 +163,11 @@ def getFileHash(file_path: str, print_progress: bool = False, logger=None) -> st
 
 
 @dataclass
-class CoinPrepareModule:
-    """Base class for the per-coin provisioning interface exported by interface/*/core.py.
+class ReleasePrepareModule:
+    """Base class for downloading and verifying a signed third party release.
 
-    Each coin subclasses this, overrides the methods and exports an instance
-    named prepare_module for bin/prepare.py.
+    bin/prepare.py runs downloadCore, verifyCoreHash, verifyCoreSignature
+    and extractCore in that order.
     """
 
     name: str
@@ -148,6 +175,106 @@ class CoinPrepareModule:
     version_tag: str
     signers: dict  # signer name -> expected key fingerprints
     ticker: str = ""
+
+    def downloadCore(
+        self,
+        ctx: PrepareContext,
+        bin_dir: str,
+        signing_key_name: str,
+        extra_opts: dict,
+    ) -> tuple:
+        """Returns (release_path, assert_path, assert_sig_path)."""
+        raise NotImplementedError()
+
+    def hasDetachedSig(self) -> bool:
+        # False for coins whose hashes file is itself the signed document.
+        return True
+
+    def getPubkeyFilename(self, signing_key_name: str) -> str:
+        return f"{self.name}_{signing_key_name}.pgp"
+
+    def getPubkeyUrls(self, ctx: PrepareContext) -> list:
+        return []
+
+    def getAllPubkeyUrls(self, ctx: PrepareContext) -> list:
+        pubkeyurls = self.getPubkeyUrls(ctx)
+        if self.ticker != "":
+            extra_pubkey_url: str = os.getenv(f"{self.ticker}_ADD_PUBKEY_URL", "")
+            if extra_pubkey_url != "":
+                pubkeyurls.append(extra_pubkey_url)
+        return pubkeyurls
+
+    def ensureValidSignatureBy(
+        self,
+        ctx: PrepareContext,
+        result,
+        signing_key_name: str,
+        signers=None,
+        filepath=None,
+    ) -> None:
+        ensureValidSignatureBy(
+            result, signing_key_name, signers or self.signers, ctx.logger, filepath
+        )
+
+    def verifyCoreHash(
+        self, ctx: PrepareContext, release_path: str, assert_path: str
+    ) -> str:
+        release_hash: str = getFileHash(release_path)
+        ctx.logger.info(f"{os.path.basename(release_path)} hash: {release_hash}")
+        if self.hasDetachedSig():
+            ensureFileHashInFile(release_hash, assert_path, ctx.logger)
+        else:
+            ensureFileHashInSignedText(release_hash, assert_path, ctx.logger)
+        return release_hash
+
+    def verifyCoreSignature(
+        self,
+        ctx: PrepareContext,
+        gpg,
+        release_path: str,
+        assert_path: str,
+        assert_sig_path: str,
+        signing_key_name: str,
+        extra_opts: dict,
+    ) -> None:
+        """Verify the downloaded release, raises on failure.
+
+        Default implementation covers a detached signature over the assert
+        file.  Releases with inline-signed hash files override this method,
+        ending with an ensureValidSignatureBy call.
+        """
+        pubkey_filename = self.getPubkeyFilename(signing_key_name)
+        pubkeyurls = self.getAllPubkeyUrls(ctx)
+
+        ensurePubkey(
+            gpg, ctx, signing_key_name, self.signers, pubkey_filename, pubkeyurls
+        )
+
+        with open(assert_sig_path, "rb") as fp:
+            verified = gpg.verify_file(fp, assert_path)
+
+        self.ensureValidSignatureBy(
+            ctx, verified, signing_key_name, filepath=assert_path
+        )
+
+    def extractCore(
+        self,
+        ctx: PrepareContext,
+        bin_dir: str,
+        release_path: str,
+        extra_opts: dict,
+    ) -> None:
+        raise NotImplementedError()
+
+
+@dataclass
+class CoinPrepareModule(ReleasePrepareModule):
+    """Base class for the per-coin provisioning interface exported by interface/*/core.py.
+
+    Each coin subclasses this, overrides the methods and exports an instance
+    named prepare_module for bin/prepare.py.
+    """
+
     rpc_user: str = ""
     rpc_password: str = ""
     onion_port: int = 0
@@ -164,6 +291,8 @@ class CoinPrepareModule:
 
     def getArchName(self, ctx: PrepareContext, os_name: str, use_guix: bool) -> str:
         if os_name == "osx" and use_guix:
+            if platform.machine() == "arm64":
+                return "arm64-apple-darwin"
             return "x86_64-apple-darwin"
         return ctx.bin_arch
 
@@ -171,10 +300,6 @@ class CoinPrepareModule:
         return (
             f"{self.name}-{self.version}{self.version_tag}-{arch_name}.{ctx.file_ext}"
         )
-
-    def hasDetachedSig(self) -> bool:
-        # False for coins whose hashes file is itself the signed document.
-        return True
 
     def getReleaseUrl(self, ctx: PrepareContext, release_filename: str):
         # Return one url string or a list of fallback urls
@@ -234,70 +359,6 @@ class CoinPrepareModule:
             ctx.download_file(assert_sig_url, assert_sig_path)
 
         return release_path, assert_path, assert_sig_path
-
-    def getPubkeyFilename(self, signing_key_name: str) -> str:
-        return f"{self.name}_{signing_key_name}.pgp"
-
-    def getPubkeyUrls(self, ctx: PrepareContext) -> list:
-        return []
-
-    def getAllPubkeyUrls(self, ctx: PrepareContext) -> list:
-        pubkeyurls = self.getPubkeyUrls(ctx)
-        if self.ticker != "":
-            extra_pubkey_url: str = os.getenv(f"{self.ticker}_ADD_PUBKEY_URL", "")
-            if extra_pubkey_url != "":
-                pubkeyurls.append(extra_pubkey_url)
-        return pubkeyurls
-
-    def ensureValidSignatureBy(
-        self,
-        ctx: PrepareContext,
-        result,
-        signing_key_name: str,
-        signers=None,
-        filepath=None,
-    ) -> None:
-        ensureValidSignatureBy(
-            result, signing_key_name, signers or self.signers, ctx.logger, filepath
-        )
-
-    def verifyCoreHash(
-        self, ctx: PrepareContext, release_path: str, assert_path: str
-    ) -> str:
-        release_hash: str = getFileHash(release_path)
-        ctx.logger.info(f"{os.path.basename(release_path)} hash: {release_hash}")
-        ensureFileHashInFile(release_hash, assert_path, ctx.logger)
-        return release_hash
-
-    def verifyCoreSignature(
-        self,
-        ctx: PrepareContext,
-        gpg,
-        release_path: str,
-        assert_path: str,
-        assert_sig_path: str,
-        signing_key_name: str,
-        extra_opts: dict,
-    ) -> None:
-        """Verify the downloaded release, raises on failure.
-
-        Default implementation covers a detached signature over the assert
-        file.  Coins with inline-signed hash files override this method,
-        ending with an ensureValidSignatureBy call.
-        """
-        pubkey_filename = self.getPubkeyFilename(signing_key_name)
-        pubkeyurls = self.getAllPubkeyUrls(ctx)
-
-        ensurePubkey(
-            gpg, ctx, signing_key_name, self.signers, pubkey_filename, pubkeyurls
-        )
-
-        with open(assert_sig_path, "rb") as fp:
-            verified = gpg.verify_file(fp, assert_path)
-
-        self.ensureValidSignatureBy(
-            ctx, verified, signing_key_name, filepath=assert_path
-        )
 
     def getExtractBins(self) -> list:
         bins = [self.name + "d", self.name + "-cli", self.name + "-tx"]
@@ -401,8 +462,9 @@ class CoinPrepareModule:
             ctx.logger.info("Skipping extract, files exist.")
             return
 
-        with tarfile.open(release_path) as ft:
-            for member in ft.getmembers():
+        # Stream mode, a bz2 archive decompresses from its start on each seek back
+        with tarfile.open(release_path, "r|*") as ft:
+            for member in ft:
                 if member.isdir():
                     continue
                 bin_name = os.path.basename(member.name)
@@ -516,6 +578,33 @@ class CoinPrepareModule:
 
     def getPostInitWarning(self, ctx: PrepareContext) -> str | None:
         return None
+
+    def hasLegacyWallet(self, core_settings: dict) -> bool:
+        return False
+
+    def needsWalletMigration(self, core_settings: dict, from_version: str) -> bool:
+        return False
+
+    def checkWalletBeforeMigration(
+        self, ctx: PrepareContext, swap_client, coin_id, core_settings: dict
+    ) -> None:
+        pass
+
+    def setUpgradeVersion(self, core_settings: dict, use_latest: bool) -> None:
+        pass
+
+    def getVersionNote(self) -> str:
+        return ""
+
+    def migrateWallet(
+        self,
+        ctx: PrepareContext,
+        swap_client,
+        coin_id,
+        core_settings: dict,
+        watch_wallet_name: str,
+    ) -> None:
+        raise ValueError(f"No wallet migration for {self.name.capitalize()}")
 
     def ensureWallet(
         self,

@@ -7,10 +7,12 @@
 
 
 import json
+import os
 import time
 import decimal
 
 COIN = 100000000
+FEE_RATE_CACHE_SECONDS = 60
 
 
 decimal_ctx = decimal.Context()
@@ -18,6 +20,10 @@ decimal_ctx.prec = 20
 
 
 class TemporaryError(ValueError):
+    pass
+
+
+class ChainNotSyncedError(TemporaryError):
     pass
 
 
@@ -53,9 +59,25 @@ class RevokedOffer(Exception):
     pass
 
 
+class IncompatibleProtocol(ValueError):
+    def __init__(self, kind: str, version: int, minimum: int):
+        super().__init__(
+            f"Incompatible {kind} protocol version {version}, minimum {minimum}"
+        )
+
+
 def ensure(v, err_string):
     if not v:
         raise ValueError(err_string)
+
+
+def path_exists(path: str) -> bool:
+    """os.path.exists, but a path that can't be checked raises instead of reading as missing."""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
 
 
 def toBool(s) -> bool:

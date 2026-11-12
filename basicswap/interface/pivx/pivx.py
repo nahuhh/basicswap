@@ -5,13 +5,12 @@
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
-from io import BytesIO
-
 from basicswap.interface.btc.btc import BTCInterface
 from basicswap.rpc import make_rpc_func
 from basicswap.chainparams import Coins
 from basicswap.util.address import decodeAddress
 from basicswap.interface.pivx.contrib.messages import CTransaction
+from basicswap.contrib.test_framework.messages import StrictBytesIO
 from basicswap.contrib.test_framework.script import (
     CScript,
     OP_DUP,
@@ -79,6 +78,7 @@ class PIVXInterface(BTCInterface):
         sub_fee: bool = False,
         lock_unspents: bool = True,
         feerate: int = None,
+        change_addr: str = None,
     ) -> str:
         txn = self.rpc(
             "createrawtransaction", [[], {addr_to: self.format_amount(amount)}]
@@ -95,6 +95,8 @@ class PIVXInterface(BTCInterface):
             "lockUnspents": lock_unspents,
             "feeRate": fee_rate,
         }
+        if change_addr:
+            options["changeAddress"] = change_addr
         if sub_fee:
             options["subtractFeeFromOutputs"] = [
                 0,
@@ -124,20 +126,35 @@ class PIVXInterface(BTCInterface):
     def getSpendableBalance(self) -> int:
         return self.make_int(self.rpc("getwalletinfo")["balance"])
 
+    def getBalances(self) -> tuple[int, int]:
+        wi = self.rpc("getwalletinfo")
+        balance = self.make_int(wi["balance"])
+        return balance, balance + self.make_int(wi["unconfirmed_balance"])
+
     def loadTx(self, tx_bytes: bytes, allow_witness: bool = True) -> CTransaction:
         # Load tx from bytes to internal representation
         tx = CTransaction()
-        tx.deserialize(BytesIO(tx_bytes))
+        tx.deserialize(StrictBytesIO(tx_bytes))
         return tx
 
     def getScriptForPubkeyHash(self, pkh: bytes) -> bytearray:
         # Return P2PKH
         return CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
 
+    def supportsTaproot(self) -> bool:
+        return False
+
+    def isValidTxoDest(self, script: bytes) -> bool:
+        if self.isScriptP2PKH(script):
+            return True
+        if self.isScriptP2SH(script):
+            return True
+        return False
+
     def getBLockSpendTxFee(self, tx, fee_rate: int) -> int:
         add_bytes = 107
         size = len(tx.serialize_with_witness()) + add_bytes
-        pay_fee = round(fee_rate * size / 1000)
+        pay_fee = self.feeForVSize(fee_rate, size)
         self._log.info(
             f"BLockSpendTx fee_rate, size, fee: {fee_rate}, {size}, {pay_fee}."
         )

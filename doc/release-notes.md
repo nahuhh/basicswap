@@ -1,3 +1,387 @@
+0.19.2
+==============
+
+**Adaptor-sig swaps**
+- Coin B key share proofs on secp256k1 coins and the leader's `kal_sig` sign a hash that
+  includes the key itself and the offer or bid.
+- A failed coin B lock publish is retried with the same signed tx, never with newly funded
+  inputs, so a publish that reached the node before failing can't pay the lock twice.  The
+  signed tx is recorded before its first publish, and its inputs are locked again after a
+  restart.
+- Past the coin B lock margin, a recorded lock is never published again: it is tracked if
+  the wallet already has it, otherwise it is dropped and its inputs unlocked.  A lock
+  shared by several bids counts as too late once any bid it pays is, or has left the
+  locked state.
+- A coin B lock publish with no answer, or a wallet lookup that fails, is retried instead
+  of erroring the bid.
+- The follower sends coin B only while the coin A lock is still `blocks_confirmed` deep,
+  and the leader releases coin A only while the coin B lock is still in the chain and that
+  deep.
+- When several outputs pay a lock address, the lock lookup takes the one with the agreed
+  amount, and a watched script adopts an output only with the agreed amount.
+- Lock and lock refund scripts must be byte for byte the ones this node builds,
+  and Decred swap outputs must use script version 0.
+- Bids activated at startup retry on a temporary error instead of erroring, and startup
+  waits for Electrum headers to sync first.
+- The lock spend fee is estimated from the lock refund tx's fee, and on Bitcoin Cash as
+  the covenant's flat mining fee.
+- On Bitcoin Cash and Decred, a lost coin B lock tx is found again by rescanning chain B.
+- A failed swap with nothing to recover ends in its own state, "Failed, nothing to
+  recover", and no longer counts as in progress.
+- A reverse bid follows the later of two accepts, and a bid's `pkaf` is checked as a chain
+  A key.
+- The bid page shows the error on a failed coin B lock publish.
+
+**Secret-hash swaps**
+- The buyer finds the secret in a redeem by its hash, not its position.
+- The initiate tx and its refund are saved before the initiate tx is published.  A retried
+  accept publishes the saved tx again and sends the accept, also when the offer has since
+  been disabled or the bid has expired, and an unanswered publish is retried.
+
+**Monero**
+- Settings page has a button to clean up old swap wallet caches.
+- `max_lock_amount` reaches the cached wallet info.
+
+**Litecoin**
+- MWEB outputs held in the plain wallet are left out of its spendable balance and coin
+  selection.
+- A tx that integrates MWEB funds is read correctly, and one with an MWEB body is refused.
+
+**Fees**
+- Every fee computed from a rate rounds up.
+- Fee estimates are cached for 60 seconds and the relay fee is cached.  Fee rates are no
+  longer checked for inactive offers.
+
+**Settings and logging**
+- New configs are written with `debug` off.
+- A new `log_level` setting, `debug` or `info`, sets the log level and whether tracebacks
+  are logged, and can be changed from the settings page.  Without it, the level follows
+  `debug` as before.  New configs log at `debug`.
+- Abandoning a bid no longer needs debug mode.  The button still shows only with the debug
+  UI on.
+- `safe_logs` refuses debug logs, not only debug mode.
+- Log categories can be switched at runtime through `/json/logging`, and new installs
+  leave `net` off.
+- Daemon startup is polled every second, up to `startup_timeout` (default 600 seconds).
+  `startup_tries` and `startup_delay` are still honoured.
+
+**Fixes**
+- Processed SMSG messages are marked read, so they are no longer processed again at every
+  start.
+- A balance check no longer uses up a wallet change address.
+- The auto-accept balance check adds up the amounts of the bids in flight.
+- Prices are fetched again when the rate sources change.
+- `/json/offers/<id>` finds an offer whatever its state.
+- Firo's rescan finds outputs paying P2PKH addresses.
+- Watched txs on a coin with a spent index are looked up on that coin's daemon, not
+  Particl's.
+- A watched Particl blind coin B lock tx stays out of the wallet's coin selection.
+- `--forcedbupgrade` works from the command line.
+- An idle websocket client is pinged instead of dropped.
+- Dash wallets are created to load when the node starts.
+
+**Performance**
+- Daemon RPC connections are kept alive per thread.  The connection pool is removed.
+- JSON responses are gzipped when the client accepts it.
+
+**Security / hardening**
+- `basicswap-prepare` matches a release hash only inside the signed text of an
+  inline-signed hash file (Firo, Bitcoin Cash, Monero, Wownero) and verifies only that
+  text.  The Bitcoin fastsync snapshot hash is checked the same way.
+- An Electrum header chunk below the last checkpoint must be complete.
+
+**Docker**
+- The production swapclient is built from a local `basicswap.zip` when one is beside the
+  Dockerfile, otherwise from the pinned commit.
+- The production cores log to stdout only, within the compose files' log limits.
+
+**Daemon updates**
+- Bitcoin Cash Node  v29.1.0 -> v29.2.0
+- Dash  v23.1.8 -> v24.0.0
+- Wownero  v0.11.3.0 -> v0.11.6.0, downloaded from GitHub, with jwinterm as a signer.
+
+**Upgrade notes**
+- The adaptor-sig protocol version is raised to 8, and the minimum accepted version with
+  it.  This release won't take adaptor-sig offers or bids from 0.19.1 and earlier, and an
+  offer posted before upgrading takes no bids.  Swaps already in progress finish on the old protocol.
+  Secret-hash swaps are unchanged.
+- Dash v24.0.0 is a hard fork, expected on November 28.  Update the cores before then with
+  `basicswap-prepare --upgradecores`, see [doc/upgrade.md](upgrade.md).
+- Debug mode is turned off once on the first start, as it accepts refund locks as short as
+  60 seconds instead of 2 hours.  The log level stays as it was, and abandoning a bid no
+  longer needs debug mode.  To turn it back on, set `"debug": true` in `basicswap.json`.
+- The data upgrade to version 11 runs on the first start, and re-checks bids an earlier
+  version left at "Failed".  The database stays at version 42.
+
+
+0.19.1
+==============
+
+**Bitcoin Core 31.1**
+- New installs use Bitcoin Core 31.1 by default.
+- Existing installs stay on Bitcoin Core 29.4 by default.
+- To move a legacy install to 31.1, run `--upgradecores --uselatest=bitcoin`.
+  See [doc/upgrade.md](upgrade.md#legacy-bitcoin-wallets).
+- Core 30 and later can't load the legacy wallet.
+
+**Swaps**
+- The coin A lock refunds to a fresh address for each bid, and swap addresses a bid never
+  paid go back to the pool, so a restored wallet's gap limit still covers them.
+- A bid checks that the wallet can send the bid's amount, not the whole offer's.
+- Each swap destination is paid as the script its address means, and the witness version
+  is checked wherever an address is decoded.  Forward and reverse swaps accept the same
+  destinations.
+- Secret-hash redeems, adaptor-sig lock spends and the leader's lock refund spend are
+  rebroadcast until they confirm.
+- The bid page shows the depth of each swap tx, and the log notes when the coin B lock
+  spend confirms.
+
+**Secret-hash swaps**
+- A participant refuses an initiate tx whose refund unlocks too soon, and sizes its margin
+  from each coin's confirmation time instead of a fixed 30 minutes.
+- A seller's bid no longer times out once the initiate tx is sent.
+- The initiate and participate tx block times are fetched again until they're set, so one
+  failed lookup no longer stalls the margin and refund checks.
+
+**Adaptor-sig swaps**
+- Coin B isn't locked too close to the timeout: the margin leaves time for coin B to
+  confirm, and an abandoned coin B lock is no longer queued again.
+- An accept that arrives after the bid expires is refused, checked when it arrives, and
+  leaders accept with a margin so their accept arrives in time.
+- The coin A lock's block time is fetched again until it's set, and the lock refund's
+  block info is refreshed when a reorg moves it.
+- An unsynced coin B chain waits for sync instead of reporting the coin B lock missing or
+  logging a lost daemon connection.  Transient coin B errors no longer count towards the
+  check and action caps.
+- The mercy tx is signed against the swipe key's own hash.
+- A self-bid on a reverse offer keeps its intent accept and its accept apart.
+
+**Monero**
+- Max bidding works: input sizes come from the wallet, capped at 100 inputs, and lock fees
+  and the bid max are sized for whatever inputs the wallet picks.
+- The coin B lock is retried when the wallet answers "tx not possible" or "not enough
+  unlocked money".
+- The coin B lock spend is tracked through the daemon and rebuilt when the daemon rejects
+  it.  It counts as confirmed at `blocks_confirmed`, one block sooner than before, and the
+  bid page no longer counts one confirmation too many for Monero and Wownero.
+- A reverse swap's refund goes to the wallet's main address, as a forward swap's does.
+- The wallet is closed when locked, and locked after its first password is set.  Routine
+  lookups no longer run a blocking `refresh`.
+- `basicswap-prepare` keeps `trusted_daemon` when enabling or disabling Tor.
+
+**Electrum**
+- Heights, depths and merkle proofs are checked against a header chain synced from
+  checkpoints, spend watchers verify merkle proofs before acting, and a tx whose id isn't
+  the one requested is refused.
+- A server that sends invalid txids is dropped and blacklisted.  Responses, tx parsing and
+  peer discovery are bounded, and discovered peers are only reached on public addresses.
+- Settings has a Kept Connected value: how many Electrum servers stay connected.
+- The server pushes balance updates, and the total counts unconfirmed funds.  A failed
+  balance or history lookup raises instead of reading as zero.
+- Addresses with history are marked used and the address pool extends past them, so a
+  restored wallet doesn't hand out emptied addresses.  The lowest unused index goes out
+  first, change is claimed only when its tx is kept, and the deposit address is handed out
+  as in the other wallets.
+- A lock can be funded from the wallet's own unconfirmed change.
+- Headers sync on their own thread, a dead server fails calls fast instead of stalling the
+  update loop, and address subscriptions are pipelined.
+- A tx the chain already has isn't broadcast again.
+
+**Smart Buy**
+- Spend-max plans are sized in the backend from the wallet's inputs, replacing the page's
+  fixed 0.1% reserve, and no longer leave 1 atomic unit unfilled.
+- Checking for a leg's prefunded tx no longer uses it up, which left its inputs locked.
+- Electrum split locks are assigned to the right bids.
+
+**Wallets**
+- Withdrawals accept bech32m (taproot) and uppercase bech32 addresses.
+- Wallet pages show new balances once the background update stores them, and a receive in
+  the mempool is announced without waiting for a block.
+- Setting or changing the wallet password is more robust: unlocking no longer fails when
+  the Monero wallet can't be opened, and a failed change leaves the lock state right.
+- Particl addresses starting with `Pw1` are no longer read as bech32, which made revokes of
+  those offers fail.  Particl fee estimates use the right input size.
+
+**Security / hardening**
+- The HTTP server gives the request line and headers 30 seconds, limits post sizes and
+  handlers (the large post budget needs verified basic auth), refuses a body shorter than
+  its content-length, and bounds websocket handshakes.
+- Form tokens stay off pre-login pages and are required for every AMM control, a form
+  submitted twice from the same page is refused, pages can't be framed, and browsers don't
+  sniff content types.  Untrusted text is escaped in the wallet, discovery, identity, rate
+  and AMM views and in the notification history.
+- The AMM API token only authorizes the requests the AMM script sends.
+- Offer replays with a changed TTL, future-dated messages and spoofed early revokes are
+  refused, and Nostr and SimpleX messages may be up to 2 minutes ahead.  Seen ids, queues,
+  connect requests, portals, split chunks and SimpleX frames are bounded, and the portal
+  difficulty cap follows Particl's SMSG difficulty.
+- Proof of funds fails closed when a balance lookup errors, caps and checks its outpoints,
+  and counts only the signer's unique outputs for Firo and Decred.
+- URL reads are capped, bounded as a whole by the caller's timeout, and only reach vetted
+  public addresses.  NAT64 addresses are judged by the IPv4 address they carry.
+- Seeds, passwords and RPC credentials are kept out of the logs.  `basicswap-prepare`
+  prompts for the Particl mnemonic and UI password when their flags have no value,
+  generates Monero and Wownero wallet RPC passwords for new installs, and fails when a
+  wallet can't be encrypted.  The dcrwallet password goes over stdin, and its stored copy
+  is cleared before the wallet is locked.
+- Fastsync archives are checked member by member on Python without the tar data filter.
+  SimpleX starts without a shell on Windows and checks SMP server addresses.
+- The update check only accepts a numeric tag.
+- The unfinished p2p listener is removed, and the unused Electrum fee bump code is
+  disabled.
+- [doc/notes.md](notes.md) warns against exposing BasicSwap beyond loopback.
+
+**Fixes**
+- Outbound onion connections work where torcontrol overrides the SOCKS port.
+- `basicswap-prepare --disablenetwork` no longer starts Tor.
+- `basicswap-prepare` downloads the right cores on ARM Macs, and Decred's ARM builds.
+- A daemon that fails to start logs why.
+- Bitcoin Cash wallet txs are looked up through the wallet RPC.
+- SimpleX direct chats are addressed by contact id, so a route whose chat dropped out of
+  the 20 most recent can still send and close.
+- The `--trustremotenode` help line is corrected.
+
+**Docker**
+- The production swapclient is built from a pinned commit, the daemons and Tor run as uid
+  1000 instead of root, and the core and wallet daemons get ten minutes to shut down.
+- `example.env` no longer ships RPC passwords, and an RPC user with an empty password is
+  refused.
+- Files BasicSwap creates are readable by their owner only.
+- The non-production setup (`docker/docker-compose.yml`) tags its images
+  `i_swapclient_dev` and `i_tor_dev`.  Both setups used `i_swapclient` and `i_tor`, so
+  on a host that built both, `docker compose up` could start the other setup's image.  The
+  first `docker compose up` after updating builds the new images.
+
+**Daemon updates**
+- Bitcoin Core  v29.4 -> v31.1
+- Monero  v0.18.5.1 -> v0.18.5.4
+- Firo  v0.14.18.1 -> v0.14.18.2
+- Decred  v2.1.6 -> v2.1.7
+- SimpleX Chat  v7.0.0 -> v7.0.3
+- Navcoin support, already disabled, is removed.
+
+**Upgrade notes**
+- The database will upgrade to version 42 on the first start.
+- A Bitcoin install prepared before Bitcoin Core 30 must migrate its legacy wallet to move
+  to 31.1, see [doc/upgrade.md](upgrade.md#legacy-bitcoin-wallets).  With the production
+  Docker setup, migrate before rebuilding the bitcoin container, see "Migrate a legacy
+  Bitcoin wallet" in [docker/production/notes.md](../docker/production/notes.md).
+- The AMM API token is refused for any other request, with "Not allowed for the AMM
+  token".  Scripts that used it for other calls need the UI's authentication.
+- The docker production `example.env` leaves the RPC passwords empty, and `basicswap-prepare`
+  refuses an empty one: set random passwords.
+
+
+0.19.0
+==============
+
+**Smart Buy (beta)**
+- New Smart Buy page.  Enter an amount to pay or to receive, and BasicSwap finds the
+  cheapest way to fill it from the open offers, split over at most the number of bids you
+  choose.
+- Cap the price against the market rate or the best offer, set how long each bid may wait,
+  or pick the offers yourself.
+- The bids page groups a Smart Buy's bids together, and the History tab lists past Smart
+  Buys.
+- Each bid funds its lock from its own coins, so bids placed together don't compete for the
+  same wallet outputs.
+- Bids placed together send their coin B locks in one transaction, and secret-hash bids
+  that share a secret settle in one transaction.  A bid waits a bounded time for the rest
+  of its group, then goes without the stragglers.
+- API: `POST /json/bids/plan` finds a fill without placing anything, and
+  `POST /json/bids/bulk` places its bids.  Bid listings include `plan_id` and
+  `plan_target`.
+
+**Networks**
+- Nostr can carry offers and swap messages, alongside or instead of SMSG and SimpleX.  Add
+  it under Settings, Networks, or with `basicswap-prepare --addnetwork=nostr`
+  (`NOSTR_RELAYS` and `NOSTR_POW_TARGET` override the defaults).  Each swap signs with its
+  own key pair, relays are reached through Tor when Tor is enabled, and plaintext `ws://`
+  relays used without a proxy are logged as a warning.  See [doc/nostr.md](nostr.md).
+- More than one message network can be enabled at once.  `basicswap-prepare --addnetwork`
+  no longer disables the others, and `--disablenetwork` won't disable the last one.
+- Settings has a Networks tab: enable or disable each network, and set the Nostr relays and
+  PoW target, the SimpleX server, port and group link, and network bridging.
+- SimpleX moves to SimpleX Chat v7.  The group link defaults to the official BasicSwap
+  group, and changing it switches groups at the next restart.  Sends retry while
+  simplex-chat is unreachable instead of failing the bid.  See
+  [doc/simplex.md](simplex.md).
+- `/json/networks` lists the message networks and whether each is enabled and active.
+
+**Fixes**
+- Monero and Wownero redeem fees are estimated at the rate the wallet will pay, and reverse
+  offers use the right fee rate.  This corrects the redeem fee on the offers page and the
+  costs Smart Buy compares.
+- An offerer that retries an adaptor-sig accept re-sends the accept it built the first time
+  instead of building a new one, for reverse bids too.  A rebuilt accept carried a new lock
+  transaction and proof, so the bidder and offerer could end up on different accepts and
+  the swap failed.
+- The split messages that carry a Monero-family swap's proofs now name the message they
+  complete, so the parts of two accepts for one bid can't be mixed.
+- A bidder still receiving an accept takes a later one for the same bid, instead of
+  refusing it.  From offerers on earlier versions, whose parts don't name their message,
+  it only switches to an accept sent a second or more later.
+- `basicswap-prepare` reads `SIMPLEX_SERVER_ADDRESS` from the `SIMPLEX_CHAT_VERSION`
+  environment variable.
+
+**Daemon updates**
+- Firo  v0.14.18.0 -> v0.14.18.1
+- SimpleX Chat  v6.3.5 -> v7.0.0
+
+**GUI**
+- GUI bumped to v4.1.0.
+
+**Upgrade notes**
+- The database is upgraded to version 40 on the first start.
+- SimpleX Chat 7.0.0's signed release manifest lists only the Ubuntu x86_64 build, so
+  prepare can't verify the download on other platforms.  Place a binary at
+  `bin/simplex/simplex-chat` and add the network with `--nocores`, see
+  [doc/simplex.md](simplex.md).
+- Nodes already running SimpleX record their configured group link as joined at the first
+  start, so change the group link only after that restart.
+
+
+0.18.10
+==============
+
+**Rates**
+- CoinGecko's API has changed, see
+  [CoinGecko API authentication](https://docs.coingecko.com/v3.0.1/reference/authentication).
+- BasicSwap no longer ships a CoinGecko API key.
+  - Add your own under Settings, Charts Configuration,
+    and set CoinGecko Plan to Demo or Pro to match it.
+  - See [doc/notes.md](notes.md#coingecko-steps-for-user).
+  - Without a key, prices come from the other oracles and price charts stay empty.
+- Kraken, KuCoin, MEXC, CoinLore, CoinPaprika and neroswap back up CoinGecko.  They are
+  tried in that order, and each coin takes its rate from the first enabled oracle that has
+  a fresh one.  Each oracle can be turned off under Settings, Oracles.
+- A rate older than 15 minutes is ignored when the oracle reports its age (CoinGecko,
+  CoinPaprika and neroswap).
+- An oracle that returns a rate limit backs off on its own, and the others carry on.
+
+**Security / hardening**
+- The CoinGecko API key is sent in a request header instead of the URL.
+
+**Fixes**
+- When one transaction pays more than one watched script, each one is found.  The scan
+  could skip a script after processing the one before it.
+- A Decred lock tx output past output 1 is found when the tx is in the wallet.  Only
+  outputs 0 and 1 were checked, so the lock tx could go unseen.
+- New databases store text columns as TEXT.  SQLite gave the old STRING type numeric
+  affinity.  Existing databases keep their old column types.
+
+**Daemon updates**
+- Particl Core  v27.2.5 -> v27.2.6
+
+**Upgrade notes**
+- `/json/rates` and `/json/rateslist` return `oracle` and `oracle_error` in place of
+  `coingecko` and `coingecko_error`.  Scripts that read the old keys need updating,
+  including createoffers.py from earlier releases.
+- All oracles are enabled by default.  The AMM prices offers from whichever oracle supplies
+  the rate, which can be a single exchange's last trade when CoinGecko has none.  Turn off
+  any oracle you don't want the AMM to rely on.
+
+
 0.18.9
 ==============
 

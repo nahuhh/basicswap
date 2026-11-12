@@ -14,6 +14,7 @@ from Crypto.Cipher import ChaCha20_Poly1305  # pycryptodome
 
 from .chainparams import Coins
 from .contrib.test_framework import segwit_addr
+from .contrib.test_framework.script import CScript, CScriptOp
 from .db_wallet import (
     WalletAddress,
     WalletLockedUTXO,
@@ -50,7 +51,7 @@ class WalletManager:
     }
 
     GAP_LIMIT = 50
-    ELECTRUM_GAP_LIMIT = 20
+    POOL_SIZE = 20
 
     def __init__(self, swap_client, log):
         self._gap_limits: dict[Coins, int] = {}
@@ -58,6 +59,7 @@ class WalletManager:
         self._log = log
         self._seed: bytes = None
         self._master_keys: dict[Coins, bytes] = {}
+        self._root_extkeys: dict[Coins, ExtKeyPair] = {}
         self._external_chains: dict[Coins, ExtKeyPair] = {}
         self._internal_chains: dict[Coins, ExtKeyPair] = {}
         self._initialized: set = set()
@@ -91,6 +93,7 @@ class WalletManager:
                 f"root_key must be bytes or ExtKeyPair, got {type(root_key)}"
             )
 
+        self._root_extkeys[coin_type] = ek
         bip44_coin = self.BIP84_COIN_TYPES.get(coin_type, 0)
         ext_path = f"84h/{bip44_coin}h/0h/0"
         int_path = f"84h/{bip44_coin}h/0h/1"
@@ -103,9 +106,6 @@ class WalletManager:
             self.runMigration(coin_type)
 
         self._log.debug(f"WalletManager: {Coins(coin_type).name} initialized")
-
-    def getDepositAddress(self, coin_type: Coins) -> str | None:
-        return self.getAddress(coin_type, index=0, internal=False)
 
     def isInitialized(self, coin_type: Coins) -> bool:
         return coin_type in self._initialized
@@ -127,7 +127,7 @@ class WalletManager:
         key = self._deriveKey(coin_type, index, internal)
         pubkey = PublicKey.from_secret(key).format()
         pkh = hash160(pubkey)
-        address = segwit_addr.encode(self._getHRP(coin_type), 0, pkh)
+        address = segwit_addr.encode_segwit_address(self._getHRP(coin_type), 0, pkh)
         scripthash = sha256(bytes([0x00, 0x14]) + pkh)[::-1].hex()
         return address, scripthash, pubkey
 
@@ -163,8 +163,8 @@ class WalletManager:
     def _findReusableAddress(self, coin_type: Coins, internal: bool, cursor):
         query = (
             "SELECT derivation_index, address FROM wallet_addresses"
-            " WHERE coin_type = ? AND is_internal = ? AND is_funded = 0"
-            " AND ever_used = 0"
+            " WHERE coin_type = ? AND is_internal = ? AND ever_used = 0"
+            " AND COALESCE(cached_balance, 0) = 0"
             " ORDER BY derivation_index ASC LIMIT 1"
         )
         cursor.execute(query, (int(coin_type), internal))
@@ -173,24 +173,175 @@ class WalletManager:
             return row[0], row[1]
         return None, None
 
-    def _trailingUnusedGap(
-        self, coin_type: Coins, internal: bool, next_index: int, cursor
-    ) -> int:
+    def _nextUnusedIndex(self, coin_type: Coins, internal: bool, cursor) -> int:
         cursor.execute(
-            "SELECT derivation_index, ever_used FROM wallet_addresses"
-            " WHERE coin_type = ? AND is_internal = ? AND derivation_index < ?"
-            " ORDER BY derivation_index DESC",
-            (int(coin_type), internal, next_index),
+            "SELECT MAX(derivation_index) FROM wallet_addresses"
+            " WHERE coin_type = ? AND is_internal = ?",
+            (int(coin_type), internal),
         )
-        gap = 0
-        for _, ever_used in cursor.fetchall():
-            if ever_used:
-                break
-            gap += 1
-        return gap
+        row = cursor.fetchone()
+        return 0 if row is None or row[0] is None else row[0] + 1
+
+    def _setHighWaterIndex(self, state, internal: bool, index: int, cursor) -> None:
+        # last_*_index is the highest index derived, used to extend the pool and
+        # to build the subscription window. It is not an allocation cursor.
+        if state is None:
+            return
+        current = (
+            state.last_internal_index if internal else state.last_external_index
+        ) or 0
+        if index <= current:
+            return
+        if internal:
+            state.last_internal_index = index
+        else:
+            state.last_external_index = index
+        state.updated_at = int(time.time())
+        self._swap_client.updateDB(state, cursor, constraints=["coin_type"])
+
+    def _addDerivedAddress(
+        self, coin_type: Coins, index: int, internal: bool, ever_used: bool, cursor
+    ) -> tuple[str, str]:
+        address, scripthash, pubkey = self._deriveAddress(coin_type, index, internal)
+        bip44_coin = self.BIP84_COIN_TYPES.get(coin_type, 0)
+        chain_idx = 1 if internal else 0
+        self._swap_client.add(
+            WalletAddress(
+                coin_type=int(coin_type),
+                derivation_index=index,
+                is_internal=internal,
+                derivation_path=f"m/84'/{bip44_coin}'/0'/{chain_idx}/{index}",
+                address=address,
+                scripthash=scripthash,
+                pubkey=pubkey,
+                is_funded=False,
+                ever_used=ever_used,
+                cached_balance=0,
+                created_at=int(time.time()),
+            ),
+            cursor,
+        )
+        return address, scripthash
+
+    def markAddressesUsed(self, coin_type: Coins, addresses: list[str]) -> None:
+        if not addresses:
+            return
+        cursor = self._swap_client.openDB()
+        try:
+            cursor.executemany(
+                "UPDATE wallet_addresses SET ever_used = 1"
+                " WHERE coin_type = ? AND address = ? AND ever_used = 0",
+                [(int(coin_type), address) for address in addresses],
+            )
+            self._swap_client.commitDB()
+        finally:
+            self._swap_client.closeDB(cursor, commit=False)
+
+    def claimAddresses(self, coin_type: Coins, addresses: list[str], cursor) -> bool:
+        """Mark this wallet's addresses among `addresses` used. False, with
+        nothing marked, if one already was."""
+        if not addresses:
+            return True
+        in_list = ",".join("?" * len(addresses))
+        params = (int(coin_type), *addresses)
+        cursor.execute(
+            "SELECT COUNT(*) FROM wallet_addresses WHERE coin_type = ?"
+            f" AND address IN ({in_list}) AND ever_used = 1",
+            params,
+        )
+        if cursor.fetchone()[0] > 0:
+            return False
+        cursor.execute(
+            "UPDATE wallet_addresses SET ever_used = 1"
+            f" WHERE coin_type = ? AND address IN ({in_list})",
+            params,
+        )
+        return True
+
+    def releaseAddresses(self, coin_type: Coins, addresses: list[str], cursor) -> None:
+        if not addresses:
+            return
+        cursor.execute(
+            "UPDATE wallet_addresses SET ever_used = 0 WHERE coin_type = ?"
+            f" AND address IN ({','.join('?' * len(addresses))})"
+            " AND COALESCE(cached_balance, 0) = 0",
+            (int(coin_type), *addresses),
+        )
+
+    def usedAddressesAtPoolHead(self, coin_type: Coins) -> list[list[str]]:
+        """The used addresses among the last POOL_SIZE derived on each chain,
+        highest index first: only these can extend the pool."""
+        cursor = self._swap_client.openDB()
+        try:
+            chains = []
+            for internal in (False, True):
+                cursor.execute(
+                    "SELECT address FROM wallet_addresses"
+                    " WHERE coin_type = ? AND is_internal = ? AND ever_used = 1"
+                    " AND derivation_index > (SELECT MAX(derivation_index)"
+                    " FROM wallet_addresses WHERE coin_type = ? AND is_internal = ?) - ?"
+                    " ORDER BY derivation_index DESC",
+                    (
+                        int(coin_type),
+                        internal,
+                        int(coin_type),
+                        internal,
+                        self.POOL_SIZE,
+                    ),
+                )
+                chains.append([row[0] for row in cursor.fetchall()])
+            return chains
+        finally:
+            self._swap_client.closeDB(cursor, commit=False)
+
+    def extendAddressPool(
+        self, coin_type: Coins, addresses: list[str]
+    ) -> list[tuple[str, str]]:
+        """Derive until POOL_SIZE unused addresses follow the highest of
+        `addresses` on each chain, as a restoring wallet's gap scan does.
+        Returns the new (address, scripthash) pairs."""
+        added = []
+        if not addresses:
+            return added
+        cursor = self._swap_client.openDB()
+        try:
+            state = self._swap_client.queryOne(
+                WalletState, cursor, {"coin_type": int(coin_type)}
+            )
+            for internal in (False, True):
+                cursor.execute(
+                    "SELECT MAX(derivation_index) FROM wallet_addresses"
+                    " WHERE coin_type = ? AND is_internal = ?"
+                    f" AND address IN ({','.join('?' * len(addresses))})",
+                    (int(coin_type), internal, *addresses),
+                )
+                last_used = cursor.fetchone()[0]
+                if last_used is None:
+                    continue
+                first_index = self._nextUnusedIndex(coin_type, internal, cursor)
+                last_index = last_used + self.POOL_SIZE
+                for index in range(first_index, last_index + 1):
+                    added.append(
+                        self._addDerivedAddress(
+                            coin_type, index, internal, False, cursor
+                        )
+                    )
+                self._setHighWaterIndex(state, internal, last_index, cursor)
+            self._swap_client.commitDB()
+        except Exception:
+            self._swap_client.rollbackDB()
+            raise
+        finally:
+            self._swap_client.closeDB(cursor, commit=False)
+        return added
 
     def getNewAddress(
-        self, coin_type: Coins, internal: bool = False, label: str = "", cursor=None
+        self,
+        coin_type: Coins,
+        internal: bool = False,
+        label: str = "",
+        cursor=None,
+        mark_used: bool = True,
     ) -> str:
         if not self.isInitialized(coin_type):
             raise ValueError(f"Wallet not initialized for {Coins(coin_type).name}")
@@ -216,95 +367,30 @@ class WalletManager:
                     ),
                     use_cursor,
                 )
-            else:
-                if internal:
-                    next_index = (state.last_internal_index or 0) + 1
-                else:
-                    next_index = (state.last_external_index or 0) + 1
-
-            trailing_gap = self._trailingUnusedGap(
-                coin_type, internal, next_index, use_cursor
+            # Always hand out the lowest index never handed out, and only derive
+            # past the pool once every index in it has been. Skipping an index
+            # strands every later address behind a gap a restoring wallet stops
+            # scanning at.
+            reuse_index, reuse_addr = self._findReusableAddress(
+                coin_type, internal, use_cursor
             )
-            if trailing_gap + 1 >= self.ELECTRUM_GAP_LIMIT:
-                reuse_index, reuse_addr = self._findReusableAddress(
-                    coin_type, internal, use_cursor
-                )
-                if reuse_addr is not None:
-                    self._log.debug(
-                        f"Reusing unfunded address at index {reuse_index}"
-                        f" (next would be {next_index},"
-                        f" trailing unused gap {trailing_gap},"
-                        f" electrum gap limit {self.ELECTRUM_GAP_LIMIT})"
-                    )
+            if reuse_addr is not None:
+                if mark_used:
                     use_cursor.execute(
                         "UPDATE wallet_addresses SET ever_used = 1"
                         " WHERE coin_type = ? AND derivation_index = ?"
                         " AND is_internal = ?",
                         (int(coin_type), reuse_index, internal),
                     )
-                    self._swap_client.commitDB()
-                    return reuse_addr
-
-            existing = self._swap_client.queryOne(
-                WalletAddress,
-                use_cursor,
-                {
-                    "coin_type": int(coin_type),
-                    "derivation_index": next_index,
-                    "is_internal": internal,
-                },
-            )
-
-            if existing:
-                address = existing.address
-                use_cursor.execute(
-                    "UPDATE wallet_addresses SET ever_used = 1"
-                    " WHERE coin_type = ? AND derivation_index = ?"
-                    " AND is_internal = ?",
-                    (int(coin_type), next_index, internal),
-                )
-                if state:
-                    if internal:
-                        state.last_internal_index = next_index
-                    else:
-                        state.last_external_index = next_index
-                    state.updated_at = int(time.time())
-                    self._swap_client.updateDB(
-                        state, use_cursor, constraints=["coin_type"]
-                    )
+                self._setHighWaterIndex(state, internal, reuse_index, use_cursor)
                 self._swap_client.commitDB()
-                return address
+                return reuse_addr
 
-            address, scripthash, pubkey = self._deriveAddress(
-                coin_type, next_index, internal
+            next_index = self._nextUnusedIndex(coin_type, internal, use_cursor)
+            address, _ = self._addDerivedAddress(
+                coin_type, next_index, internal, mark_used, use_cursor
             )
-            bip44_coin = self.BIP84_COIN_TYPES.get(coin_type, 0)
-            chain_idx = 1 if internal else 0
-            now = int(time.time())
-            self._swap_client.add(
-                WalletAddress(
-                    coin_type=int(coin_type),
-                    derivation_index=next_index,
-                    is_internal=internal,
-                    derivation_path=f"m/84'/{bip44_coin}'/0'/{chain_idx}/{next_index}",
-                    address=address,
-                    scripthash=scripthash,
-                    pubkey=pubkey,
-                    is_funded=False,
-                    ever_used=True,
-                    cached_balance=0,
-                    created_at=now,
-                ),
-                use_cursor,
-            )
-
-            if state:
-                if internal:
-                    state.last_internal_index = next_index
-                else:
-                    state.last_external_index = next_index
-                state.updated_at = now
-                self._swap_client.updateDB(state, use_cursor, constraints=["coin_type"])
+            self._setHighWaterIndex(state, internal, next_index, use_cursor)
 
             self._swap_client.commitDB()
             return address
@@ -485,56 +571,6 @@ class WalletManager:
             return row[0] if row and row[0] else None
         except Exception:
             return None
-
-    def getNewInternalAddress(self, coin_type: Coins) -> str | None:
-        if coin_type not in self._initialized:
-            return None
-
-        cursor = None
-        try:
-            cursor = self._swap_client.openDB()
-
-            cursor.execute(
-                "SELECT MAX(derivation_index) FROM wallet_addresses WHERE coin_type = ? AND is_internal = 1",
-                (int(coin_type),),
-            )
-            row = cursor.fetchone()
-            next_index = (row[0] or -1) + 1
-
-            address, scripthash, pubkey = self._deriveAddress(
-                coin_type, next_index, internal=True
-            )
-            path = f"84h/{self.BIP84_COIN_TYPES.get(coin_type, 0)}h/0h/1/{next_index}"
-
-            now = int(time.time())
-            self._swap_client.add(
-                WalletAddress(
-                    coin_type=int(coin_type),
-                    derivation_index=next_index,
-                    is_internal=True,
-                    derivation_path=path,
-                    address=address,
-                    scripthash=scripthash,
-                    pubkey=pubkey,
-                    is_funded=False,
-                    ever_used=True,
-                    created_at=now,
-                ),
-                cursor,
-            )
-            self._swap_client.commitDB()
-
-            self._log.debug(
-                f"Generated new internal address for {coin_type.name}: {address[:16]}..."
-            )
-            return address
-        except Exception as e:
-            self._log.warning(f"Failed to generate new internal address: {e}")
-            self._swap_client.rollbackDB()
-            return None
-        finally:
-            if cursor:
-                self._swap_client.closeDB(cursor, commit=False)
 
     def getAddressInfo(self, coin_type: Coins, address: str) -> dict | None:
         try:
@@ -919,7 +955,9 @@ class WalletManager:
         try:
             pubkey = PublicKey.from_secret(private_key).format()
             if (
-                segwit_addr.encode(self._getHRP(coin_type), 0, hash160(pubkey))
+                segwit_addr.encode_segwit_address(
+                    self._getHRP(coin_type), 0, hash160(pubkey)
+                )
                 != address
             ):
                 return False
@@ -1023,13 +1061,17 @@ class WalletManager:
                 if self.getPrivateKey(coin_type, address):
                     continue
                 try:
-                    wif = rpc_callback("dumpprivkey", [address])
-                    if wif:
-                        privkey = self._decodeWIF(wif, coin_type)
-                        if privkey and self.importAddressWithKey(
-                            coin_type, address, privkey, source="rpc_migration"
-                        ):
-                            imported += 1
+                    try:
+                        wif = rpc_callback("dumpprivkey", [address])
+                        privkey = self._decodeWIF(wif, coin_type) if wif else None
+                    except Exception:
+                        privkey = self._deriveKeyAtHDKeyPath(
+                            coin_type, rpc_callback("getaddressinfo", [address])
+                        )
+                    if privkey and self.importAddressWithKey(
+                        coin_type, address, privkey, source="rpc_migration"
+                    ):
+                        imported += 1
                 except Exception:
                     pass
 
@@ -1040,6 +1082,15 @@ class WalletManager:
         except Exception as e:
             self._log.warning(f"importKeysFromRPC error: {e}")
             return imported
+
+    def _deriveKeyAtHDKeyPath(self, coin_type: Coins, addr_info: dict) -> bytes | None:
+        path: str = addr_info.get("hdkeypath", "")
+        if not path.startswith("m/") or coin_type not in self._root_extkeys:
+            return None
+        key = self._root_extkeys[coin_type].derive_path(path[2:])._key
+        pkh = hash160(PublicKey.from_secret(key).format())
+        address = segwit_addr.encode_segwit_address(self._getHRP(coin_type), 0, pkh)
+        return key if address == addr_info.get("address") else None
 
     def _b58decode(self, s: str) -> bytes:
         ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -1119,10 +1170,13 @@ class WalletManager:
         return bytes(a ^ b for a, b in zip(encrypted_key, self._getXorKey(coin_type)))
 
     def _computeScripthash(self, coin_type: Coins, address: str) -> str:
-        _, data = segwit_addr.decode(self._getHRP(coin_type), address)
+        version, data = segwit_addr.decode_segwit_address(
+            self._getHRP(coin_type), address
+        )
         if data is None:
             return ""
-        return sha256(bytes([0x00, 0x14]) + bytes(data))[::-1].hex()
+        script = CScript([CScriptOp.encode_op_n(version), bytes(data)])
+        return sha256(bytes(script))[::-1].hex()
 
     def needsMigration(self, coin_type: Coins) -> bool:
         cursor = self._swap_client.openDB()
@@ -1153,7 +1207,7 @@ class WalletManager:
         coin_type: Coins,
         full_node_addresses: list[str] | None = None,
         cached_address: str | None = None,
-        num_addresses: int = 20,
+        num_addresses: int = POOL_SIZE,
     ) -> int:
         if not self.isInitialized(coin_type):
             raise ValueError(f"Wallet not initialized for {Coins(coin_type).name}")
@@ -1603,7 +1657,14 @@ class WalletManager:
             if cursor is None:
                 self._swap_client.closeDB(use_cursor, commit=False)
 
-    def isUTXOLocked(self, coin_type: Coins, txid: str, vout: int, cursor=None) -> bool:
+    def isUTXOLocked(
+        self,
+        coin_type: Coins,
+        txid: str,
+        vout: int,
+        cursor=None,
+        bid_id: bytes = None,
+    ) -> bool:
         use_cursor = self._swap_client.openDB(cursor)
         try:
             existing = self._swap_client.queryOne(
@@ -1620,6 +1681,8 @@ class WalletManager:
                 )
                 if cursor is None:
                     self._swap_client.commitDB()
+                return False
+            if bid_id is not None and existing.bid_id == bid_id:
                 return False
             return True
         finally:

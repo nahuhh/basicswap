@@ -28,6 +28,7 @@ from basicswap.basicswap import (
 from basicswap.basicswap_util import (
     EventLogTypes,
     TxLockTypes,
+    TxTypes,
 )
 from basicswap.chainparams import (
     chainparams,
@@ -63,7 +64,12 @@ from basicswap.contrib.test_framework.script import (
     CScript,
     OP_CHECKLOCKTIMEVERIFY,
 )
-from tests.basicswap.test_xmr import BaseTest, test_delay_event, callnoderpc
+from tests.basicswap.test_xmr import (
+    BaseTest,
+    test_delay_event,
+    callnoderpc,
+    pause_event,
+)
 
 logger = logging.getLogger()
 
@@ -83,6 +89,7 @@ class Test(BaseTest):
             "getnewaddress",
             ["initial funds", "bech32"],
             base_rpc_port=BTC_BASE_RPC_PORT,
+            wallet="bsx_wallet",
         )
         ltc_addr1 = callnoderpc(
             1,
@@ -93,7 +100,11 @@ class Test(BaseTest):
         )
 
         callnoderpc(
-            0, "sendtoaddress", [btc_addr1, 1000], base_rpc_port=BTC_BASE_RPC_PORT
+            0,
+            "sendtoaddress",
+            [btc_addr1, 1000],
+            base_rpc_port=BTC_BASE_RPC_PORT,
+            wallet="bsx_wallet",
         )
         callnoderpc(
             0,
@@ -153,10 +164,10 @@ class Test(BaseTest):
 
     def test_002_lookup_rates(self):
         rv = self.swap_clients[0].lookupRates(Coins.BTC, Coins.PART)
-        assert "coingecko" in rv
+        assert "oracle" in rv
 
         rv = self.swap_clients[0].lookupRates(Coins.LTC, Coins.BTC)
-        assert "coingecko" in rv
+        assert "oracle" in rv
 
         rv = read_json_api(1800, "rateslist?from=PART&to=BTC")
         assert len(rv) == 1
@@ -668,6 +679,158 @@ class Test(BaseTest):
         assert js_0["num_swapping"] == 0 and js_0["num_watched_outputs"] == 0
         assert js_1["num_swapping"] == 0 and js_1["num_watched_outputs"] == 0
 
+    def test_04_ltc_btc_dropped_redeems(self):
+        logging.info("---------- Test LTC to BTC, both redeems dropped once")
+        swap_clients = self.swap_clients
+
+        offer_id = swap_clients[0].postOffer(
+            Coins.LTC,
+            Coins.BTC,
+            10 * COIN,
+            0.1 * COIN,
+            10 * COIN,
+            SwapTypes.SELLER_FIRST,
+        )
+
+        wait_for_offer(test_delay_event, swap_clients[1], offer_id)
+        offer = swap_clients[1].getOffer(offer_id)
+        bid_id = swap_clients[1].postBid(offer_id, offer.amount_from)
+        swap_clients[1].setBidDebugInd(bid_id, DebugTypes.SKIP_FIRST_REDEEM_BROADCAST)
+
+        wait_for_bid(test_delay_event, swap_clients[0], bid_id)
+        swap_clients[0].setBidDebugInd(bid_id, DebugTypes.SKIP_FIRST_REDEEM_BROADCAST)
+
+        rebroadcast_seconds = swap_clients[0]._redeem_rebroadcast_seconds
+        try:
+            for sc in swap_clients[:2]:
+                sc._redeem_rebroadcast_seconds = 10
+            swap_clients[0].acceptBid(bid_id)
+
+            for sc in swap_clients[:2]:
+                wait_for_event(
+                    test_delay_event,
+                    sc,
+                    Concepts.BID,
+                    bid_id,
+                    EventLogTypes.DEBUG_TWEAK_APPLIED,
+                    wait_for=120,
+                )
+            wait_for_bid(
+                test_delay_event,
+                swap_clients[0],
+                bid_id,
+                BidStates.SWAP_COMPLETED,
+                wait_for=120,
+            )
+            wait_for_bid(
+                test_delay_event,
+                swap_clients[1],
+                bid_id,
+                BidStates.SWAP_COMPLETED,
+                sent=True,
+                wait_for=60,
+            )
+        finally:
+            for sc in swap_clients[:2]:
+                sc._redeem_rebroadcast_seconds = rebroadcast_seconds
+
+        js_0 = read_json_api(1800)
+        js_1 = read_json_api(1801)
+        assert js_0["num_swapping"] == 0 and js_0["num_watched_outputs"] == 0
+        assert js_1["num_swapping"] == 0 and js_1["num_watched_outputs"] == 0
+
+    def test_04_ltc_btc_redeem_reorg(self):
+        logging.info("---------- Test LTC to BTC, initiate redeem reorged out")
+        swap_clients = self.swap_clients
+
+        offer_id = swap_clients[0].postOffer(
+            Coins.LTC,
+            Coins.BTC,
+            10 * COIN,
+            0.1 * COIN,
+            10 * COIN,
+            SwapTypes.SELLER_FIRST,
+        )
+
+        wait_for_offer(test_delay_event, swap_clients[1], offer_id)
+        offer = swap_clients[1].getOffer(offer_id)
+        bid_id = swap_clients[1].postBid(offer_id, offer.amount_from)
+        swap_clients[1].setBidDebugInd(bid_id, DebugTypes.SKIP_FIRST_REDEEM_BROADCAST)
+
+        wait_for_bid(test_delay_event, swap_clients[0], bid_id)
+
+        rebroadcast_seconds = swap_clients[1]._redeem_rebroadcast_seconds
+        try:
+            swap_clients[1]._redeem_rebroadcast_seconds = 24 * 3600
+            swap_clients[0].acceptBid(bid_id)
+            wait_for_event(
+                test_delay_event,
+                swap_clients[1],
+                Concepts.BID,
+                bid_id,
+                EventLogTypes.DEBUG_TWEAK_APPLIED,
+                wait_for=120,
+            )
+
+            pause_event.clear()
+            test_delay_event.wait(2)
+            bid = swap_clients[1].getBid(bid_id)
+            redeem_txid = bid.txns[TxTypes.ITX_REDEEM].txid.hex()
+            swap_clients[1]._redeem_rebroadcast_seconds = 1
+            for i in range(30):
+                mempool = callnoderpc(
+                    0, "getrawmempool", base_rpc_port=LTC_BASE_RPC_PORT
+                )
+                if redeem_txid in mempool:
+                    break
+                test_delay_event.wait(1)
+            else:
+                raise ValueError("Initiate redeem tx not in the mempool.")
+            block_hash = callnoderpc(
+                0,
+                "generatetoaddress",
+                [1, self.ltc_addr],
+                base_rpc_port=LTC_BASE_RPC_PORT,
+            )[0]
+
+            wait_for_bid_tx_state(
+                test_delay_event,
+                swap_clients[1],
+                bid_id,
+                TxStates.TX_REDEEMED,
+                None,
+                wait_for=30,
+            )
+            test_delay_event.wait(10)
+            assert swap_clients[1].getBid(bid_id).state != BidStates.SWAP_COMPLETED
+
+            for i in range(len(self.ltc_daemons)):
+                callnoderpc(
+                    i,
+                    "invalidateblock",
+                    [block_hash],
+                    base_rpc_port=LTC_BASE_RPC_PORT,
+                )
+        finally:
+            swap_clients[1]._redeem_rebroadcast_seconds = rebroadcast_seconds
+            pause_event.set()
+
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[1],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            sent=True,
+            wait_for=60,
+        )
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[0],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            wait_for=60,
+        )
+
     def test_05_refund(self):
         # Seller submits initiate txn, buyer doesn't respond
         logging.info("---------- Test refund, LTC to BTC")
@@ -725,6 +888,47 @@ class Test(BaseTest):
 
         assert compare_bid_states(offerer_states, self.states_offerer_sh[1]) is True
         assert bidder_states[-1][1] == "Bid Abandoned"
+
+    def test_05_refund_slow_itx(self):
+        logging.info("---------- Test refund after a slow initiate txn, LTC to BTC")
+        swap_clients = self.swap_clients
+
+        offer_id = swap_clients[0].postOffer(
+            Coins.LTC,
+            Coins.BTC,
+            10 * COIN,
+            0.1 * COIN,
+            10 * COIN,
+            SwapTypes.SELLER_FIRST,
+            TxLockTypes.SEQUENCE_LOCK_BLOCKS,
+            10,
+        )
+
+        wait_for_offer(test_delay_event, swap_clients[1], offer_id)
+        offer = swap_clients[1].getOffer(offer_id)
+        bid_id = swap_clients[1].postBid(offer_id, offer.amount_from)
+
+        wait_for_bid(test_delay_event, swap_clients[0], bid_id)
+        read_json_api(1801, "bids/{}".format(bid_id.hex()), {"abandon": True})
+
+        try:
+            pause_event.clear()
+            swap_clients[0].acceptBid(bid_id)
+            swap_clients[0].setMockTimeOffset(swap_clients[0]._sc_lock_tx_timeout)
+            swap_clients[0].checkAcceptedBids()
+        finally:
+            swap_clients[0].setMockTimeOffset(0)
+            pause_event.set()
+
+        wait_for_bid(
+            test_delay_event,
+            swap_clients[0],
+            bid_id,
+            BidStates.SWAP_COMPLETED,
+            wait_for=80,
+        )
+        js_0_bid = read_json_api(1800, "bids/{}".format(bid_id.hex()))
+        assert js_0_bid["itx_state"] == "Refunded"
 
     def test_06_self_bid(self):
         logging.info("---------- Test same client, BTC to LTC")

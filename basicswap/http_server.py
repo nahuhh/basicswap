@@ -14,9 +14,12 @@ import hashlib
 import secrets
 import traceback
 import threading
+import time
 import http.client
 import base64
+import socket
 
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from jinja2 import Environment, PackageLoader, select_autoescape
 from socket import error as SocketError
@@ -71,6 +74,7 @@ from .ui.page_amm import (
 )
 from .ui.page_bids import page_bids, page_bid
 from .ui.page_offers import page_offers, page_offer, page_newoffer
+from .ui.page_smartbuy import page_smartbuy
 from .ui.page_tor import page_tor, get_tor_established_state
 from .ui.page_wallet import page_wallets, page_wallet
 from .ui.page_settings import page_settings
@@ -82,6 +86,12 @@ from .ui.page_debug import page_debug
 SESSION_COOKIE_NAME = "basicswap_session_id"
 LOGIN_NEXT_COOKIE_NAME = "basicswap_login_next"
 SESSION_DURATION_MINUTES = 15
+MAX_POST_BYTES = 10 * 1024 * 1024
+MAX_REFUSED_POST_BYTES = 64 * 1024
+MAX_HTTP_HANDLERS = 256
+HTTP_SOCKET_TIMEOUT = 300
+POST_BODY_TIMEOUT = 60
+HEADER_TIMEOUT = 30
 
 env = Environment(
     loader=PackageLoader("basicswap", "templates"),
@@ -175,18 +185,53 @@ JSON_GET_ALLOWED = frozenset(
         "automationstrategies",
         "validateamount",
         "help",
+        "logging",
         "readurl",
         "active",
         "coinprices",
         "coinvolume",
         "coinhistory",
         "messageroutes",
+        "networks",
         "modeswitchinfo",
     }
 )
 # Read sub-commands of /wallets/<coin>/<cmd>; every other wallet sub-command
 # mutates and requires POST.
 JSON_WALLET_GET_CMDS = frozenset({"listaddresses", "mwebbalance"})
+# Every request scripts/createoffers.py sends; "*" matches one path component.
+AMM_API_REQUESTS = frozenset(
+    {
+        ("GET", "coins"),
+        ("GET", "wallets/*"),
+        ("GET", "sentoffers/*"),
+        ("GET", "bids/*"),
+        ("GET", "identities/*"),
+        ("POST", "offers"),
+        ("POST", "offers/new"),
+        ("POST", "sentoffers"),
+        ("POST", "revokeoffer/*"),
+        ("POST", "bids"),
+        ("POST", "bids/new"),
+        ("POST", "sentbids"),
+        ("POST", "rates"),
+        ("POST", "offerfeeestimate"),
+        ("POST", "validateamount"),
+    }
+)
+
+
+def amm_request_allowed(method: str, url_split) -> bool:
+    if len(url_split) < 3 or url_split[1] != "json":
+        return False
+    path = url_split[2:]
+    for allowed_method, pattern in AMM_API_REQUESTS:
+        parts = pattern.split("/")
+        if allowed_method != method or len(parts) != len(path):
+            continue
+        if all((p == "*" and c != "") or p == c for p, c in zip(parts, path)):
+            return True
+    return False
 
 
 def json_requires_post(url_split) -> bool:
@@ -203,10 +248,59 @@ def json_requires_post(url_split) -> bool:
         return True
     if route == "offers" and len(url_split) > 3 and url_split[3] == "new":
         return True
+    if route == "smsgaddresses" and len(url_split) > 3 and url_split[3] != "":
+        return True
     return False
 
 
 class HttpHandler(BaseHTTPRequestHandler):
+    timeout = HTTP_SOCKET_TIMEOUT
+
+    def handle_one_request(self):
+        # The socket timeout restarts on every byte, so a trickled request line
+        # or header would hold a handler slot indefinitely.
+        self._header_timer = threading.Timer(HEADER_TIMEOUT, self._drop_slow_request)
+        self._header_timer.daemon = True
+        self._header_timer.start()
+        try:
+            super().handle_one_request()
+        finally:
+            self._header_timer.cancel()
+
+    def parse_request(self) -> bool:
+        try:
+            return super().parse_request()
+        finally:
+            self._header_timer.cancel()
+
+    def basic_auth(self) -> str | None:
+        # "amm", "operator", "invalid", "malformed", or None without a Basic header
+        auth_header = self.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Basic "):
+            return None
+        swap_client = self.server.swap_client
+        try:
+            encoded_creds = auth_header.split(" ", 1)[1]
+            decoded_creds = base64.b64decode(encoded_creds).decode("utf-8")
+            _, password = decoded_creds.split(":", 1)
+
+            amm_token = getattr(swap_client, "_amm_api_token", None)
+            if amm_token and hmac.compare_digest(password, amm_token):
+                return "amm"
+            client_auth_hash = swap_client.settings.get("client_auth_hash")
+            if client_auth_hash and verify_rfc2440_password(client_auth_hash, password):
+                return "operator"
+            return "invalid"
+        except Exception as e:
+            swap_client.log.error(f"Error processing Basic Auth header: {e}")
+            return "malformed"
+
+    def _drop_slow_request(self) -> None:
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
     def _get_session_cookie(self):
         if "Cookie" in self.headers:
             cookie = SimpleCookie(self.headers["Cookie"])
@@ -405,6 +499,9 @@ class HttpHandler(BaseHTTPRequestHandler):
         # TODO: Add debug flag to re-enable.
         pass
 
+    def generate_form_id(self):
+        return self.server.session_tokens["csrf"] + "." + secrets.token_hex(8)
+
     def checkForm(self, post_string, name, messages):
         if post_string == "":
             return None
@@ -414,12 +511,19 @@ class HttpHandler(BaseHTTPRequestHandler):
         except (KeyError, IndexError):
             messages.append("Missing form token.")
             return None
-        # Real CSRF check: the form must carry the server-issued token. Replaces
-        # the former per-form-name double-submit latch, which was not a security
-        # control (any fresh value passed).
-        if not hmac.compare_digest(form_id, self.server.session_tokens.get("csrf", "")):
+        token, _, nonce = form_id.rpartition(".")
+        if not nonce or not hmac.compare_digest(
+            token, self.server.session_tokens.get("csrf", "")
+        ):
             messages.append("Invalid form token.")
             return None
+        # One nonce per render, shared by its forms: a page must reload between posts.
+        with self.server.form_id_lock:
+            used = self.server.used_form_ids.setdefault(name, deque(maxlen=100))
+            if nonce in used:
+                messages.append("Prevented double submit for form {}.".format(name))
+                return None
+            used.append(nonce)
         return form_data
 
     def render_template(
@@ -491,10 +595,12 @@ class HttpHandler(BaseHTTPRequestHandler):
         else:
             args_dict["current_page"] = "index"
 
-        shutdown_token = os.urandom(8).hex()
-        with self.server.session_lock:
-            self.server.session_tokens["shutdown"] = shutdown_token
-        args_dict["shutdown_token"] = shutdown_token
+        issue_tokens = is_authenticated or getattr(self, "_basic_auth_ok", False)
+        if issue_tokens:
+            shutdown_token = os.urandom(8).hex()
+            with self.server.session_lock:
+                self.server.session_tokens["shutdown"] = shutdown_token
+            args_dict["shutdown_token"] = shutdown_token
 
         if is_authenticated:
             try:
@@ -504,7 +610,7 @@ class HttpHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 args_dict["encrypted"] = False
                 args_dict["locked"] = False
-                if swap_client.debug:
+                if swap_client.debug_logs:
                     swap_client.log.warning(f"Could not get wallet locked state: {e}")
         else:
             args_dict["encrypted"] = args_dict.get("encrypted", False)
@@ -523,11 +629,13 @@ class HttpHandler(BaseHTTPRequestHandler):
         try:
             static_dir = os.path.join(os.path.dirname(__file__), "static")
             mtimes = []
-            for rel in (
-                os.path.join("css", "style.css"),
-                os.path.join("js", "pages", "offer-new-page.js"),
-            ):
-                mtimes.append(int(os.path.getmtime(os.path.join(static_dir, rel))))
+            for sub_dir in ("css", "js"):
+                for root, _, filenames in os.walk(os.path.join(static_dir, sub_dir)):
+                    for filename in filenames:
+                        if filename.endswith((".css", ".js")):
+                            mtimes.append(
+                                int(os.path.getmtime(os.path.join(root, filename)))
+                            )
             args_dict["static_v"] = "{}-{}".format(version, max(mtimes))
         except Exception:
             args_dict["static_v"] = version
@@ -542,7 +650,7 @@ class HttpHandler(BaseHTTPRequestHandler):
             template.render(
                 title=self.server.title,
                 h2=self.server.title,
-                form_id=self.server.session_tokens["csrf"],
+                form_id=self.generate_form_id() if issue_tokens else "",
                 **args_dict,
             ),
             "UTF-8",
@@ -804,7 +912,7 @@ class HttpHandler(BaseHTTPRequestHandler):
                         result = cmd + "\n" + swap_client.callcoincli(coin_type, cmd)
             except Exception as ex:
                 result = cmd + "\n" + str(ex)
-                if self.server.swap_client.debug is True:
+                if self.server.swap_client.debug_logs:
                     self.server.swap_client.log.error(traceback.format_exc())
 
         template = env.get_template("rpc.html")
@@ -960,10 +1068,25 @@ class HttpHandler(BaseHTTPRequestHandler):
         if self.server.allow_cors:
             self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Type", content_type)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if content_type.startswith("text/html"):
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
         if extra_headers:
             for header_tuple in extra_headers:
                 self.send_header(header_tuple[0], header_tuple[1])
         self.end_headers()
+
+    def putJson(self, status_code, content: bytes) -> bytes:
+        # Not for HTML: those pages carry the CSRF token beside reflected input,
+        # which compressed lengths can leak (BREACH).
+        extra_headers = [("Vary", "Accept-Encoding")]
+        if "gzip" in self.headers.get("Accept-Encoding", ""):
+            content = gzip.compress(content)
+            extra_headers.append(("Content-Encoding", "gzip"))
+        extra_headers.append(("Content-Length", str(len(content))))
+        self.putHeaders(status_code, "application/json", extra_headers=extra_headers)
+        return content
 
     def handle_http(self, status_code, path, post_string="", is_json=False):
         swap_client = self.server.swap_client
@@ -979,45 +1102,31 @@ class HttpHandler(BaseHTTPRequestHandler):
             return b"Host not allowed"
 
         exempt_pages = ["login", "static", "error", "info"]
-        auth_header = self.headers.get("Authorization")
+        basic_auth = self.basic_auth()
         basic_auth_ok = False
-
-        if auth_header and auth_header.startswith("Basic "):
-            try:
-                encoded_creds = auth_header.split(" ", 1)[1]
-                decoded_creds = base64.b64decode(encoded_creds).decode("utf-8")
-                _, password = decoded_creds.split(":", 1)
-
-                amm_token = getattr(swap_client, "_amm_api_token", None)
-                client_auth_hash = swap_client.settings.get("client_auth_hash")
-                if amm_token and hmac.compare_digest(password, amm_token):
-                    basic_auth_ok = True
-                elif client_auth_hash and verify_rfc2440_password(
-                    client_auth_hash, password
-                ):
-                    basic_auth_ok = True
-                else:
-                    self.send_response(401)
-                    self.send_header("WWW-Authenticate", 'Basic realm="Basicswap"')
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(
-                        json.dumps({"error": "Invalid Basic Auth credentials"}).encode(
-                            "utf-8"
-                        )
-                    )
-                    return b""
-            except Exception as e:
-                swap_client.log.error(f"Error processing Basic Auth header: {e}")
-                self.send_response(401)
-                self.send_header("WWW-Authenticate", 'Basic realm="Basicswap"')
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps({"error": "Malformed Basic Auth header"}).encode("utf-8")
+        if basic_auth == "amm":
+            if not amm_request_allowed(self.command, url_split):
+                self.putHeaders(403, "application/json")
+                return json.dumps({"error": "Not allowed for the AMM token"}).encode(
+                    "utf-8"
                 )
-                return b""
+            basic_auth_ok = True
+        elif basic_auth == "operator":
+            basic_auth_ok = True
+        elif basic_auth is not None:
+            error = (
+                "Malformed Basic Auth header"
+                if basic_auth == "malformed"
+                else "Invalid Basic Auth credentials"
+            )
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Basicswap"')
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": error}).encode("utf-8"))
+            return b""
 
+        self._basic_auth_ok = basic_auth_ok
         if not basic_auth_ok and page not in exempt_pages:
             if not self.is_authenticated():
                 if page == "json":
@@ -1068,21 +1177,22 @@ class HttpHandler(BaseHTTPRequestHandler):
                 self.putHeaders(405, "application/json")
                 return json.dumps({"error": "POST required"}).encode("utf-8")
             try:
-                self.putHeaders(status_code, "application/json")
                 func = js_url_to_function(url_split)
-                return func(self, url_split, post_string, is_json)
+                response = func(self, url_split, post_string, is_json)
             except Exception as ex:
                 if isinstance(ex, LockedCoinError):
                     clean_msg = f"Wallet locked: {getCoinName(ex.coinid)} wallet must be unlocked"
                     swap_client.log.warning(clean_msg)
-                    return js_error(self, clean_msg)
-                elif isinstance(ex, BalanceError):
-                    # Suppress traceback
-                    method: str = url_split[2] if len(url_split) > 2 else "unknown"
-                    swap_client.log.error(f"js method: {method} failed - {ex}")
-                elif swap_client.debug is True:
-                    swap_client.log.error(traceback.format_exc())
-                return js_error(self, str(ex))
+                    response = js_error(self, clean_msg)
+                else:
+                    if isinstance(ex, BalanceError):
+                        # Suppress traceback
+                        method: str = url_split[2] if len(url_split) > 2 else "unknown"
+                        swap_client.log.error(f"js method: {method} failed - {ex}")
+                    elif swap_client.debug_logs:
+                        swap_client.log.error(traceback.format_exc())
+                    response = js_error(self, str(ex))
+            return self.putJson(status_code, response)
 
         if page == "static":
             try:
@@ -1201,7 +1311,7 @@ class HttpHandler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 return self.page_404(url_split)
             except Exception as ex:
-                if swap_client.debug is True:
+                if swap_client.debug_logs:
                     swap_client.log.error(traceback.format_exc())
                 return self.page_error(str(ex))
 
@@ -1237,6 +1347,8 @@ class HttpHandler(BaseHTTPRequestHandler):
                     return page_offers(self, url_split, post_string)
                 if page == "newoffer":
                     return page_newoffer(self, url_split, post_string, get_string)
+                if page == "smartbuy":
+                    return page_smartbuy(self, url_split, post_string)
                 if page == "sentoffers":
                     return page_offers(self, url_split, post_string, sent=True)
                 if page == "bid":
@@ -1278,8 +1390,9 @@ class HttpHandler(BaseHTTPRequestHandler):
                         status_data = amm_status_api(
                             swap_client, self.path, query_params
                         )
-                        self.putHeaders(200, "application/json")
-                        return json.dumps(status_data).encode("utf-8")
+                        return self.putJson(
+                            200, json.dumps(status_data).encode("utf-8")
+                        )
                     elif len(url_split) > 2 and url_split[2] == "autostart":
                         query_params = {}
                         if parsed.query:
@@ -1289,8 +1402,9 @@ class HttpHandler(BaseHTTPRequestHandler):
                         autostart_data = amm_autostart_api(
                             swap_client, post_string, query_params
                         )
-                        self.putHeaders(200, "application/json")
-                        return json.dumps(autostart_data).encode("utf-8")
+                        return self.putJson(
+                            200, json.dumps(autostart_data).encode("utf-8")
+                        )
                     elif len(url_split) > 2 and url_split[2] == "debug":
                         query_params = {}
                         if parsed.query:
@@ -1300,8 +1414,7 @@ class HttpHandler(BaseHTTPRequestHandler):
                         debug_data = amm_debug_api(
                             swap_client, post_string, query_params
                         )
-                        self.putHeaders(200, "application/json")
-                        return json.dumps(debug_data).encode("utf-8")
+                        return self.putJson(200, json.dumps(debug_data).encode("utf-8"))
                     elif len(url_split) > 2 and url_split[2] == "config":
                         query_params = {}
                         if parsed.query:
@@ -1311,8 +1424,9 @@ class HttpHandler(BaseHTTPRequestHandler):
                         config_result = amm_config_api(
                             swap_client, post_string, query_params
                         )
-                        self.putHeaders(200, "application/json")
-                        return json.dumps(config_result).encode("utf-8")
+                        return self.putJson(
+                            200, json.dumps(config_result).encode("utf-8")
+                        )
                     elif len(url_split) > 2 and url_split[2] == "state":
                         query_params = {}
                         if parsed.query:
@@ -1322,8 +1436,9 @@ class HttpHandler(BaseHTTPRequestHandler):
                         state_result = amm_state_api(
                             swap_client, post_string, query_params
                         )
-                        self.putHeaders(200, "application/json")
-                        return json.dumps(state_result).encode("utf-8")
+                        return self.putJson(
+                            200, json.dumps(state_result).encode("utf-8")
+                        )
                     return page_amm(self, url_split, post_string)
                 if page == "shutdown":
                     return self.page_shutdown(url_split, post_string)
@@ -1339,7 +1454,7 @@ class HttpHandler(BaseHTTPRequestHandler):
         except LockedCoinError:
             return page_unlock(self, url_split, post_string)
         except Exception as ex:
-            if swap_client.debug is True:
+            if swap_client.debug_logs:
                 swap_client.log.error(traceback.format_exc())
             return self.page_error(str(ex))
 
@@ -1353,10 +1468,54 @@ class HttpHandler(BaseHTTPRequestHandler):
         finally:
             pass
 
+    def _post_may_be_accepted(self) -> bool:
+        if not self.is_allowed_host():
+            return False
+        return self.basic_auth() in ("amm", "operator") or self.is_authenticated()
+
+    def _read_post_body(self, content_length: int) -> bytes:
+        deadline = time.monotonic() + POST_BODY_TIMEOUT
+        chunks = []
+        remaining = content_length
+        try:
+            while remaining > 0:
+                time_left = deadline - time.monotonic()
+                if time_left <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(time_left)
+                chunk = self.rfile.read1(min(remaining, 65536))
+                if not chunk:
+                    raise EOFError
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            self.connection.settimeout(self.timeout)
+        return b"".join(chunks)
+
     def do_POST(self):
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            post_string = self.rfile.read(content_length)
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                content_length = -1
+            if content_length < 0:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if self._post_may_be_accepted():
+                max_bytes = MAX_POST_BYTES
+            else:
+                max_bytes = MAX_REFUSED_POST_BYTES
+            if content_length > max_bytes:
+                self.send_error(413)
+                return
+            try:
+                post_string = self._read_post_body(content_length)
+            except TimeoutError:
+                self.send_error(408)
+                return
+            except EOFError:
+                self.send_error(400, "Incomplete request body")
+                return
 
             is_json = True if "json" in self.headers.get("Content-Type", "") else False
             response = self.handle_http(200, self.path, post_string, is_json)
@@ -1392,17 +1551,20 @@ class HttpThread(threading.Thread, ThreadingHTTPServer):
         self.title = "BasicSwap - " + __version__
         self.session_tokens = dict()
         self.session_tokens["csrf"] = secrets.token_urlsafe(32)
+        self.used_form_ids = dict()
         self.active_sessions = {}
         self.env = env
         self.msg_id_counter = 0
 
         self.session_lock = threading.Lock()
+        self.form_id_lock = threading.Lock()
         self.msg_id_lock = threading.Lock()
+        self._handler_slots = threading.BoundedSemaphore(MAX_HTTP_HANDLERS)
 
         self.timeout = 60
         ThreadingHTTPServer.__init__(self, (self.host_name, self.port_no), HttpHandler)
 
-        if swap_client.debug:
+        if swap_client.debug_logs:
             swap_client.log.info("HTTP server initialized with threading support")
 
     def stop(self):
@@ -1421,6 +1583,18 @@ class HttpThread(threading.Thread, ThreadingHTTPServer):
             self.handle_request()
         self.socket.close()
         self.swap_client.log.info("HTTP server stopped.")
+
+    def process_request(self, request, client_address):
+        if not self._handler_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._handler_slots.release()
 
     def run(self):
         self.serve_forever()

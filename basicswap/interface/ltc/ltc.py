@@ -5,10 +5,32 @@
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
+import os
+from io import BytesIO
+
+from basicswap.contrib.test_framework.messages import (
+    CTransaction,
+    CTxIn,
+    CTxInWitness,
+    CTxOut,
+    deser_vector,
+)
 from basicswap.interface.btc.btc import BTCInterface
+from basicswap.interface.electrum_blockchain import (
+    HeaderNet,
+    hash_encode,
+    serialize_header,
+)
 from basicswap.rpc import make_rpc_func
 from basicswap.chainparams import Coins, chainparams
-from basicswap.interface.ltc.util import check_header_pow_scrypt
+from basicswap.interface.ltc.util import scrypt_hash
+
+
+def pow_hash_header(header: dict) -> str:
+    return hash_encode(scrypt_hash(serialize_header(header)))
+
+
+MWEB_FLAG = 0x08
 
 
 class LTCInterface(BTCInterface):
@@ -18,6 +40,35 @@ class LTCInterface(BTCInterface):
 
     def max_money(self) -> int:
         return 84000000 * self.COIN()
+
+    def loadTx(self, tx_bytes: bytes, allow_witness: bool = True) -> CTransaction:
+        if not (
+            allow_witness
+            and len(tx_bytes) > 5
+            and tx_bytes[4] == 0
+            and tx_bytes[5] & MWEB_FLAG
+        ):
+            return super().loadTx(tx_bytes, allow_witness)
+        # The integrating (HogEx) tx that pays MWEB peg-outs: its MWEB body is
+        # empty, and a tx with a body is refused rather than misread
+        flags: int = tx_bytes[5]
+        if flags & ~(MWEB_FLAG | 1):
+            raise ValueError("Unknown transaction optional data")
+        f = BytesIO(tx_bytes[6:])
+        tx = CTransaction()
+        tx.nVersion = int.from_bytes(tx_bytes[:4], "little")
+        tx.vin = deser_vector(f, CTxIn)
+        tx.vout = deser_vector(f, CTxOut)
+        if flags & 1:
+            tx.wit.vtxinwit = [CTxInWitness() for _ in range(len(tx.vin))]
+            tx.wit.deserialize(f)
+        if f.read(1) != b"\x00":
+            raise ValueError("MWEB transaction body not supported")
+        locktime = f.read(4)
+        if len(locktime) != 4:
+            raise ValueError("Transaction too short")
+        tx.nLockTime = int.from_bytes(locktime, "little")
+        return tx
 
     def __init__(self, coin_settings, network, swap_client=None, **kwargs):
         super().__init__(
@@ -34,9 +85,20 @@ class LTCInterface(BTCInterface):
             wallet=self._rpc_wallet_mweb,
         )
 
-    @staticmethod
-    def _checkHeaderPoW(header_bytes: bytes) -> bool:
-        return check_header_pow_scrypt(header_bytes)
+    def _electrumCheckpointsDir(self) -> str:
+        return os.path.join(os.path.dirname(__file__), "checkpoints")
+
+    def _electrumHeaderNet(self) -> HeaderNet:
+        return HeaderNet(
+            genesis=self.chainparams_network()["genesis_hash"],
+            checkpoints=self._electrumCheckpoints(),
+            testnet=self._network != "mainnet",
+            max_target=0x00000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF,
+            first_target=0x00000FFFF0000000000000000000000000000000000000000000000000000000,
+            target_timespan=84 * 60 * 60,
+            pow_hash_header=pow_hash_header,
+            timestamp_before_chunk=True,
+        )
 
     def getNewMwebAddress(self, use_segwit=False, label="swap_receive") -> str:
         if self.useBackend():
@@ -75,6 +137,9 @@ class LTCInterface(BTCInterface):
     def getWalletInfo(self):
         rv = super(LTCInterface, self).getWalletInfo()
         if not self.useBackend():
+            rv["balance"] = (
+                self.make_int(rv["balance"]) - self.getMWEBBalance()
+            ) / self.COIN()
             try:
                 mweb_info = self.rpc_wallet_mweb("getwalletinfo")
                 rv["mweb_balance"] = mweb_info["balance"]
@@ -153,6 +218,32 @@ class LTCInterface(BTCInterface):
                 utxo_address, 0
             ) + self.make_int(u["amount"], r=1)
         return unspent_addr
+
+    def getSpendableBalance(self) -> int:
+        if self.useBackend():
+            return super().getSpendableBalance()
+        return super().getSpendableBalance() - self.getMWEBBalance()
+
+    def getBalances(self) -> tuple[int, int]:
+        spendable, total = super().getBalances()
+        if self.useBackend():
+            return spendable, total
+        mweb_in_plain: int = self.getMWEBBalance()
+        return spendable - mweb_in_plain, total - mweb_in_plain
+
+    def getSpendableOutputs(self):
+        if self.useBackend():
+            return super().getSpendableOutputs()
+
+        return [
+            {
+                "txid": u["txid"],
+                "vout": u["vout"],
+                "value": self.make_int(u["amount"]),
+            }
+            for u in self.rpc_wallet("listunspent", [0])
+            if "vout" in u and u.get("spendable", False) and u.get("safe", True)
+        ]
 
     def getMWEBBalance(self) -> int:
         if self.useBackend():
@@ -264,10 +355,18 @@ class LTCInterfaceMWEB(LTCInterface):
     def getNewAddress(self, use_segwit=False, label="swap_receive") -> str:
         return self.getNewMwebAddress()
 
+    def getMWEBBalance(self) -> int:
+        # Counts MWEB outputs held in the plain wallet, to leave them out of its balances
+        return 0
+
+    def getSpendableOutputs(self):
+        # MWEB outputs have no txid and vout to preselect
+        return None
+
     def has_mweb_wallet(self) -> bool:
         return "mweb" in self.rpc("listwallets")
 
-    def init_wallet(self, password=None):
+    def init_wallet(self, password=None, encrypt_if_unencrypted: bool = False):
         # If system is encrypted mweb wallet will be created at first unlock
 
         wallet_name: str = self._rpc_wallet
@@ -299,6 +398,8 @@ class LTCInterfaceMWEB(LTCInterface):
                     raise
 
         if password is not None:
+            if encrypt_if_unencrypted:
+                self.encryptIfUnencrypted(password)
             # Max timeout value, ~3 years
             self.rpc_wallet("walletpassphrase", [password, 100000000], timeout=120)
 
@@ -312,7 +413,12 @@ class LTCInterfaceMWEB(LTCInterface):
                 self.rpc_wallet("walletpassphrase", [password, 100000000], timeout=120)
             self.rpc_wallet("keypoolrefill")
 
-    def unlockWallet(self, password: str, check_seed: bool = True) -> None:
+    def unlockWallet(
+        self,
+        password: str,
+        check_seed: bool = True,
+        encrypt_if_unencrypted: bool = False,
+    ) -> None:
         if password == "":
             return
         self._log.info("unlockWallet - {}".format(self.ticker()))
@@ -321,8 +427,10 @@ class LTCInterfaceMWEB(LTCInterface):
             return
 
         if not self.has_mweb_wallet():
-            self.init_wallet(password)
+            self.init_wallet(password, encrypt_if_unencrypted)
         else:
+            if encrypt_if_unencrypted:
+                self.encryptIfUnencrypted(password)
             self.rpc_wallet("walletpassphrase", [password, 100000000], timeout=120)
             if self.getWalletSeedIDRetry() == "Not found":
                 self._log.info(f"Initializing HD seed for {self.coin_name()}.")

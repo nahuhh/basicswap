@@ -448,7 +448,7 @@ def page_wallet(self, url_split, post_string):
                     if not estimate_fee:
                         withdrawal_successful = True
                 except Exception as e:
-                    if swap_client.debug is True:
+                    if swap_client.debug_logs:
                         swap_client.log.error(traceback.format_exc())
                     err_messages.append(str(e))
             if not estimate_fee:
@@ -472,7 +472,7 @@ def page_wallet(self, url_split, post_string):
                 )
             except Exception as e:
                 err_messages.append(str(e))
-                if swap_client.debug is True:
+                if swap_client.debug_logs:
                     swap_client.log.error(traceback.format_exc())
 
     is_electrum_mode = (
@@ -520,7 +520,7 @@ def page_wallet(self, url_split, post_string):
         wallet_data["fee_rate"] = ci.format_amount(int(fee_rate * ci.COIN()))
         wallet_data["fee_rate_src"] = fee_src
         wallet_data["est_fee"] = (
-            "Unknown" if est_fee is None else ci.format_amount(int(est_fee * ci.COIN()))
+            "Unknown" if est_fee is None else ci.format_amount(est_fee)
         )
         wallet_data["deposit_address"] = w.get("deposit_address", "Refresh necessary")
 

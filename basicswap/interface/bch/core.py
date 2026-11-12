@@ -12,10 +12,11 @@ from basicswap.interface.prepare_util import (
     CoinPrepareModule,
     PrepareContext,
     ensurePubkey,
+    readClearsigned,
     getOSDirNames,
 )
 
-BITCOINCASH_VERSION = os.getenv("BITCOINCASH_VERSION", "29.1.0")
+BITCOINCASH_VERSION = os.getenv("BITCOINCASH_VERSION", "29.2.0")
 BITCOINCASH_VERSION_TAG = os.getenv("BITCOINCASH_VERSION_TAG", "")
 bitcoincash_signers = {"Calin_Culianu": ("D465135F97D0047E18E99DC321810A542031C02C",)}
 
@@ -109,8 +110,7 @@ class BCHPrepare(CoinPrepareModule):
             gpg, ctx, signing_key_name, self.signers, pubkey_filename, pubkeyurls
         )
 
-        with open(assert_path, "rb") as fp:
-            verified = gpg.verify_file(fp)
+        verified = gpg.verify(readClearsigned(assert_path)[0])
 
         self.ensureValidSignatureBy(
             ctx, verified, signing_key_name, filepath=assert_path

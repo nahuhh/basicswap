@@ -50,6 +50,7 @@ def base_swap_client():
     sc.fp = None
     sc.log = StubLog()
     sc.debug = False
+    sc.debug_logs = False
     sc.is_reverse_ads_bid = lambda cf, ct: False
     sc.isBchXmrSwap = lambda offer: False
     sc.logIDT = lambda t: str(t)
@@ -165,9 +166,7 @@ class TestRecoveredKeyshareCheckLeader(unittest.TestCase):
         sc.getXmrOfferFromSession = lambda cursor, offer_id: (offer, xmr_offer)
         sc.ci = lambda coin: ci_to if coin == int(Coins.XMR) else ci_from
         sc.getPathKey = lambda *args, **kwargs: GOOD_KEY
-        sc.countBidEvents = lambda bid, event, cursor: 0
         sc.is_transient_error = lambda ex: False
-        sc._max_transient_errors = 3
         sc.bid_errors = []
         sc.setBidError = lambda bid, msg, save_bid=True, xmr_swap=None, cursor=None: sc.bid_errors.append(
             msg

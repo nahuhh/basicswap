@@ -116,14 +116,14 @@ const NotificationManager = (function() {
       const typeColor = getToastColor(item.type, item);
       const typeIconHtml = `<div class="inline-flex flex-shrink-0 justify-center items-center w-8 h-8 ${typeColor} rounded-lg text-white mr-3">${typeIcon}</div>`;
 
-      let enhancedTitle = item.title;
+      let enhancedTitle = window.config.utils.escapeHtml(String(item.title ?? ''));
       if ((item.type === 'new_offer' || item.type === 'new_bid') && item.coinFrom && item.coinTo) {
         const coinFromIcon = getCoinIcon(getCoinDisplayName(item.coinFrom));
         const coinToIcon = getCoinIcon(getCoinDisplayName(item.coinTo));
         const coinFromName = getCoinDisplayName(item.coinFrom);
         const coinToName = getCoinDisplayName(item.coinTo);
 
-        enhancedTitle = item.title
+        enhancedTitle = enhancedTitle
           .replace(new RegExp(`(\\d+\\.\\d+)\\s+${coinFromName}`, 'g'), `<img src="/static/images/coins/${coinFromIcon}" class="w-4 h-4 inline mr-1" alt="${coinFromName}" onerror="this.style.display='none'">$1 ${coinFromName}`)
           .replace(new RegExp(`(\\d+\\.\\d+)\\s+${coinToName}`, 'g'), `<img src="/static/images/coins/${coinToIcon}" class="w-4 h-4 inline mr-1" alt="${coinToName}" onerror="this.style.display='none'">$1 ${coinToName}`);
       }
@@ -281,7 +281,6 @@ function ensureToastContainer() {
       11: 'PIVX',
       12: 'DASH',
       13: 'FIRO',
-      14: 'NAV',
       15: 'LTC (MWEB)',
       17: 'BCH',
       18: 'DOGE'
@@ -303,7 +302,6 @@ function ensureToastContainer() {
       11: 100000000,    // PIVX - 8 decimals
       12: 100000000,    // DASH - 8 decimals
       13: 100000000,    // FIRO - 8 decimals
-      14: 100000000,    // NAV - 8 decimals
       15: 100000000,    // LTC (MWEB) - 8 decimals
       17: 100000000,    // BCH - 8 decimals
       18: 100000000     // DOGE - 8 decimals
@@ -323,12 +321,6 @@ function ensureToastContainer() {
 
       this.initializeBalanceTracking();
       this.checkForPendingUpdateNotification();
-
-      if (window.CleanupManager) {
-        window.CleanupManager.registerResource('notificationManager', this, (mgr) => {
-          mgr.dispose();
-        });
-      }
 
       return this;
     },
@@ -629,7 +621,7 @@ function ensureToastContainer() {
             <div class="flex items-center ml-3 text-sm font-medium text-gray-900 dark:text-white">
               ${coinIconHtml}
               <div class="flex flex-col">
-                <span class="font-semibold">${title}</span>
+                <span class="font-semibold">${window.config.utils.escapeHtml(String(title ?? ''))}</span>
                 ${options.subtitle ? `<span class="text-xs text-gray-500 dark:text-gray-400">${options.subtitle}</span>` : ''}
               </div>
             </div>
@@ -750,7 +742,7 @@ function ensureToastContainer() {
 
         case 'coin_balance_updated':
           if (data.coin && config.showBalanceChanges) {
-            this.handleBalanceUpdate(data);
+            this.fetchAndShowBalanceChange(data.coin);
           }
           return;
       }
@@ -758,25 +750,6 @@ function ensureToastContainer() {
       if (toastTitle && shouldShowToast) {
         this.createToast(toastTitle, toastType, toastOptions);
       }
-    },
-
-    handleBalanceUpdate: function(data) {
-      if (!data.coin) return;
-
-      this.fetchAndShowBalanceChange(data.coin);
-      const balanceKey = `balance_${data.coin}`;
-
-      if (this.balanceTimeouts && this.balanceTimeouts[balanceKey]) {
-        clearTimeout(this.balanceTimeouts[balanceKey]);
-      }
-
-      if (!this.balanceTimeouts) {
-        this.balanceTimeouts = {};
-      }
-
-      this.balanceTimeouts[balanceKey] = CleanupManager.setTimeout(() => {
-        this.fetchAndShowBalanceChange(data.coin);
-      }, 2000);
     },
 
     fetchAndShowBalanceChange: function(coinSymbol) {
@@ -956,15 +929,6 @@ function ensureToastContainer() {
     manualResetBalanceTracking: function() {
       this.resetBalanceTracking();
       this.initializeBalanceTracking();
-    },
-
-    dispose: function() {
-      if (this.balanceTimeouts) {
-        Object.values(this.balanceTimeouts).forEach(timeout => {
-          clearTimeout(timeout);
-        });
-        this.balanceTimeouts = {};
-      }
     }
   };
 

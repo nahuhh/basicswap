@@ -27,7 +27,15 @@ from coincurve.dleag import (
 from basicswap.interface.base import (
     Curves,
 )
-from basicswap.util import i2b, b2i, b2h, dumpj, ensure, TemporaryError
+from basicswap.util import (
+    i2b,
+    b2i,
+    b2h,
+    dumpj,
+    ensure,
+    ChainNotSyncedError,
+    TemporaryError,
+)
 from basicswap.util.network import is_private_ip_address
 from basicswap.rpc_xmr import make_xmr_rpc_func, make_xmr_rpc2_func
 from basicswap.chainparams import Coins
@@ -35,6 +43,7 @@ from basicswap.interface.xmr.chainparams import XMR_COIN
 from basicswap.interface.base import CoinInterface
 
 ed25519_l = 2**252 + 27742317777372353535851937790883648493
+CHAIN_SYNCED_CACHE_SECONDS: int = 30
 
 
 class XMRInterface(CoinInterface):
@@ -71,10 +80,6 @@ class XMRInterface(CoinInterface):
         return 10
 
     @staticmethod
-    def xmr_swap_a_lock_spend_tx_vsize() -> int:
-        raise ValueError("Not possible")
-
-    @staticmethod
     def est_lock_tx_vsize() -> int:
         # TODO: Estimate with ringsize
         return 1604
@@ -92,6 +97,9 @@ class XMRInterface(CoinInterface):
                 "failed to get earliest fork height",
                 "failed to get output distribution",
                 "not enough money",
+                "not enough unlocked money",
+                "tx not possible",  # v0.18
+                "transaction not possible",  # v0.19+
                 "request-sent",
                 "idle",
                 "busy",
@@ -123,12 +131,15 @@ class XMRInterface(CoinInterface):
         self._wallet_filename = coin_settings.get("wallet_name", "swap_wallet")
         self._cached_main_wallet_address = None
 
+        self._coin_settings = coin_settings
+
         daemon_login = None
         if coin_settings.get("rpcuser", "") != "":
             daemon_login = (
                 coin_settings.get("rpcuser", ""),
                 coin_settings.get("rpcpassword", ""),
             )
+        self._daemon_login = daemon_login
 
         rpchost = coin_settings.get("rpchost", "127.0.0.1")
         proxy_host = None
@@ -169,25 +180,11 @@ class XMRInterface(CoinInterface):
         self._walletrpctimeoutlong = coin_settings.get("walletrpctimeoutlong", 600)
         self._num_chaininfo_retries = coin_settings.get("numchaininforetries", 20)
         self._chaininfo_retry_delay = coin_settings.get("chaininforetrydelay", 1)
+        self._chain_synced_until: float = 0
 
-        self.rpc = make_xmr_rpc_func(
-            coin_settings["rpcport"],
-            daemon_login,
-            host=rpchost,
-            proxy_host=proxy_host,
-            proxy_port=proxy_port,
-            default_timeout=self._rpctimeout,
-            tag="Node(j) ",
+        self._buildDaemonRpcFuncs(
+            rpchost, coin_settings["rpcport"], proxy_host, proxy_port
         )
-        self.rpc2 = make_xmr_rpc2_func(
-            coin_settings["rpcport"],
-            daemon_login,
-            host=rpchost,
-            proxy_host=proxy_host,
-            proxy_port=proxy_port,
-            default_timeout=self._rpctimeout,
-            tag="Node ",
-        )  # non-json endpoint
         self.rpc_wallet = make_xmr_rpc_func(
             coin_settings["walletrpcport"],
             coin_settings["walletrpcauth"],
@@ -195,6 +192,80 @@ class XMRInterface(CoinInterface):
             default_timeout=self._walletrpctimeout,
             tag="Wallet ",
         )
+
+    def _buildDaemonRpcFuncs(self, rpchost, rpcport, proxy_host, proxy_port) -> None:
+        # (Re)build the direct-daemon conns; rebound on a runtime daemon switch.
+        self._rpchost = rpchost
+        self._rpcport = rpcport
+        self.rpc = make_xmr_rpc_func(
+            rpcport,
+            self._daemon_login,
+            host=rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            default_timeout=self._rpctimeout,
+            tag="Node(j) ",
+        )
+        self.rpc2 = make_xmr_rpc2_func(
+            rpcport,
+            self._daemon_login,
+            host=rpchost,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            default_timeout=self._rpctimeout,
+            tag="Node ",
+        )  # non-json endpoint
+
+    def setDaemonAddress(self, rpchost: str, rpcport) -> None:
+        # set_daemon the wallet-rpc and rebuild the direct-daemon connections.
+        rpcport = int(rpcport)
+        with self._mx_wallet:
+            trusted: bool = True
+            proxy_host = None
+            proxy_port = None
+            if self._sc is not None:
+                trusted = self._sc.getXMRTrustedDaemon(self.coin_type(), rpchost)
+                proxy_host, proxy_port = self._sc.getXMRWalletProxy(
+                    self.coin_type(), rpchost
+                )
+
+            params = {
+                "address": f"{rpchost}:{rpcport}",
+                "trusted": trusted,
+            }
+            if self._daemon_login is not None:
+                params["username"] = self._daemon_login[0]
+                params["password"] = self._daemon_login[1]
+            if proxy_host:
+                params["proxy"] = f"{proxy_host}:{proxy_port}"
+                params["ssl_support"] = "autodetect"
+                params["ssl_allow_any_cert"] = True
+
+            try:
+                self.rpc_wallet("set_daemon", params)
+            except Exception as e:
+                if "proxy" not in params:
+                    raise
+                # Wownero's older wallet-rpc may not accept the 'proxy' argument.
+                self._log.warning(
+                    f"{self.coin_name()} set_daemon failed ({e}); retrying without proxy arg."
+                )
+                params.pop("proxy", None)
+                self.rpc_wallet("set_daemon", params)
+
+            self._log.info(
+                "Set {} daemon to {}:{} ({}){}.".format(
+                    self.coin_name(),
+                    rpchost,
+                    rpcport,
+                    "trusted" if trusted else "untrusted",
+                    " through proxy" if proxy_host else "",
+                )
+            )
+
+            self._buildDaemonRpcFuncs(rpchost, rpcport, proxy_host, proxy_port)
+            self._coin_settings["rpchost"] = rpchost
+            self._coin_settings["rpcport"] = rpcport
 
     def setFeePriority(self, new_priority):
         ensure(new_priority >= 0 and new_priority < 4, "Invalid fee_priority value")
@@ -241,6 +312,7 @@ class XMRInterface(CoinInterface):
                 pass
 
     def _openWallet(self, filename):
+        self._chain_synced_until = 0
         params = {"filename": filename}
         if self._wallet_password is not None:
             params["password"] = self._wallet_password
@@ -250,7 +322,7 @@ class XMRInterface(CoinInterface):
         except Exception as e:
             if "no connection to daemon" in str(e):
                 self._log.debug(f"{self.coin_name()} {e}")
-                return  # Bypass refresh error to allow startup with a busy daemon
+                return  # Allow startup with a busy daemon
             if any(
                 x in str(e)
                 for x in (
@@ -299,6 +371,9 @@ class XMRInterface(CoinInterface):
 
             self.rpc_wallet("open_wallet", params)
             self._log.debug(f"Attempting to open {self.coin_name()} wallet")
+
+        if self._network == "regtest":
+            self.rpc_wallet("auto_refresh", {"enable": True, "period": 1})
 
     def initialiseWallet(
         self, key_view: bytes, key_spend: bytes, restore_height=None
@@ -368,16 +443,46 @@ class XMRInterface(CoinInterface):
 
         return rv
 
-    def getChainHeight(self, full_output: bool = False):
-        for i in range(self._num_chaininfo_retries):
+    def getChainHeight(self, full_output: bool = False, retries: int = None):
+        if retries is None:
+            retries = self._num_chaininfo_retries
+        for i in range(retries):
             try:
                 get_height = self.rpc2("get_height", timeout=self._rpctimeout)
                 return get_height if full_output else get_height["height"]
             except Exception as e:
-                if i < self._num_chaininfo_retries - 1 and self.is_transient_error(e):
+                if i < retries - 1 and self.is_transient_error(e):
                     time.sleep(self._chaininfo_retry_delay)
                     continue
                 raise
+
+    def isChainSynced(self) -> bool:
+        if time.monotonic() < self._chain_synced_until:
+            return True
+        info = self.rpc2("get_info", timeout=self._rpctimeout)
+        target_height = info.get("target_height", 0)
+        daemon_height = info.get("height", 0)
+        if target_height > 0 and target_height > daemon_height:
+            return False
+        wallet_height = self.rpc_wallet("get_height")["height"]
+        if wallet_height + 2 < daemon_height:
+            return False
+        self._chain_synced_until = time.monotonic() + CHAIN_SYNCED_CACHE_SECONDS
+        return True
+
+    def getMainWalletHeight(self, timeout: int = 5):
+        # None while the wallet is in use or a swap wallet is open.
+        if self._cached_main_wallet_address is None:
+            return None
+        if not self._mx_wallet.acquire(blocking=False):
+            return None
+        try:
+            address = self.rpc_wallet("get_address", timeout=timeout)["address"]
+            if address != self._cached_main_wallet_address:
+                return None
+            return self.rpc_wallet("get_height", timeout=timeout)["height"]
+        finally:
+            self._mx_wallet.release()
 
     def getWalletInfo(self):
         with self._mx_wallet:
@@ -397,8 +502,6 @@ class XMRInterface(CoinInterface):
                 raise
 
             rv = {}
-            self.rpc_wallet("refresh")
-            self._log.debug(f"Refreshing {self.coin_name()} wallet")
             balance_info = self.rpc_wallet("get_balance")
 
             rv["wallet_blocks"] = self.rpc_wallet("get_height")["height"]
@@ -408,7 +511,11 @@ class XMRInterface(CoinInterface):
             )
             rv["encrypted"] = False if self._wallet_password is None else True
             rv["locked"] = False
-            return rv
+        try:
+            rv["max_lock_amount"] = self.format_amount(self.estMaxLockAmount(1))
+        except Exception as e:
+            self._log.debug(f"{self.coin_name()} max lock amount unavailable: {e}")
+        return rv
 
     def getMainWalletAddress(self) -> str:
         with self._mx_wallet:
@@ -451,6 +558,23 @@ class XMRInterface(CoinInterface):
         fee_per_k_bytes = fee_est["fees"][conf_target] * 1000
 
         return float(self.format_amount(fee_per_k_bytes)), "get_fee_estimate"
+
+    def getSendFeeEstimate(self) -> tuple[int, int, int]:
+        """(fee per byte of weight, low tier fee per byte, quantization mask)
+        a send pays."""
+        # Priority 0 is resolved by the wallet against the backlog, so assume
+        # the higher tier it can land on.
+        priority: int = self._fee_priority if self._fee_priority > 0 else 2
+        fee_est = self.rpc("get_fee_estimate")
+        return (
+            fee_est["fees"][priority - 1],
+            fee_est["fees"][0],
+            fee_est["quantization_mask"],
+        )
+
+    def getRedeemFeeRate(self) -> int:
+        # A sweep ignores the offer's rate.
+        return self.getSendFeeEstimate()[0] * 1000
 
     def getNewRandomKey(self) -> bytes:
         # Note: Returned bytes are in big endian order
@@ -498,6 +622,25 @@ class XMRInterface(CoinInterface):
     def encodeSharedAddress(self, Kbv: bytes, Kbs: bytes) -> str:
         return xmr_util.encode_address(Kbv, Kbs, self._addr_prefix)
 
+    def findPendingLockTx(self, lock_addrs):
+        """The first in-flight tx paying any of lock_addrs, and the subset it pays."""
+        # An in-flight send is invisible to findTxB: incoming_transfers reads
+        # m_transfers, which monero only fills for mined txs.
+        lock_addrs = set(lock_addrs)
+        txns = self.rpc_wallet("get_transfers", {"out": True, "pending": True})
+        for tag in ("pending", "out"):
+            for tx in txns.get(tag, []):
+                paid = {
+                    d.get("address", None) for d in tx.get("destinations", [])
+                } & lock_addrs
+                if paid:
+                    tx_hash: bytes = bytes.fromhex(tx["txid"])
+                    self._log.warning(
+                        f"Already sending to {len(paid)} of {len(lock_addrs)} lock address(es) in tx: {self._log.id(tx_hash)}"
+                    )
+                    return tx_hash, paid
+        return None
+
     def publishBLockTx(
         self,
         kbv: bytes,
@@ -508,25 +651,15 @@ class XMRInterface(CoinInterface):
     ) -> bytes:
         with self._mx_wallet:
             self.openWallet(self._wallet_filename)
-            self.rpc_wallet("refresh")
             self._log.debug(f"Refreshing {self.coin_name()} wallet")
+            self.rpc_wallet("refresh")
 
             Kbv = self.getPubkey(kbv)
             shared_addr: str = xmr_util.encode_address(Kbv, Kbs, self._addr_prefix)
 
-            # Check that the wallet is not already sending to the lock address
-            txns = self.rpc_wallet("get_transfers", {"out": True, "pending": True})
-            for tag in ("pending", "out"):
-                if tag not in txns:
-                    continue
-                for tx in txns[tag]:
-                    for destination in tx.get("destinations", []):
-                        if destination.get("address", None) == shared_addr:
-                            tx_hash: bytes = bytes.fromhex(tx["txid"])
-                            self._log.warning(
-                                f"Already sending to lock address {shared_addr} in tx: {self._log.id(tx_hash)}"
-                            )
-                            return tx_hash
+            in_flight = self.findPendingLockTx({shared_addr})
+            if in_flight is not None:
+                return in_flight[0]
 
             params = {
                 "destinations": [{"amount": output_amount, "address": shared_addr}],
@@ -543,6 +676,129 @@ class XMRInterface(CoinInterface):
             )
             tx_hash: bytes = bytes.fromhex(rv["tx_hash"])
             return tx_hash
+
+    def max_batched_lock_outputs(self) -> int:
+        # Monero caps a tx at 16 outputs (BULLETPROOF_MAX_OUTPUTS); one is change.
+        return 15
+
+    @staticmethod
+    def max_tx_inputs() -> int:
+        # TODO: change to 128 at fcmp hard fork
+        return 100
+
+    def _lockTxFeeModel(self):
+        """Unlocked output amounts, smallest first, and the fee of a tx paying
+        one coin B lock from n of them. Skips outputs worth less than their
+        input fee at the low tier, which the wallet won't spend."""
+        with self._mx_wallet:
+            self.openWallet(self._wallet_filename)
+            if not self.isChainSynced():
+                raise TemporaryError(f"{self.coin_name()} wallet is syncing")
+            transfers = self.rpc_wallet(
+                "incoming_transfers", {"transfer_type": "available"}
+            ).get("transfers", [])
+            weight_1, weight_2 = (
+                self.rpc_wallet(
+                    "estimate_tx_size_and_weight", {"n_inputs": n, "n_outputs": 2}
+                )["weight"]
+                for n in (1, 2)
+            )
+        fee_per_byte, low_fee_per_byte, mask = self.getSendFeeEstimate()
+        input_weight: int = weight_2 - weight_1
+
+        def fee(n_inputs: int) -> int:
+            return (weight_1 + (n_inputs - 1) * input_weight) * fee_per_byte + mask
+
+        values = sorted(
+            t["amount"]
+            for t in transfers
+            if t["unlocked"] and t["amount"] >= input_weight * low_fee_per_byte
+        )
+        return values, fee
+
+    def estLockTxsFee(self, amount: int, num_locks: int) -> int:
+        """Fee for num_locks coin B locks of amount between them, whichever
+        unlocked outputs the wallet spends. It takes one output that covers the
+        amount if it has one, else picks at random, so the smallest first is
+        the worst case. A tx may take a second, small input. Locks that don't
+        batch go in their own txs, each spending the change of the one before.
+        Raises when the worst case is more inputs than one tx can take."""
+        values, fee_for = self._lockTxFeeModel()
+        ensure(
+            len(values) > 0,
+            "The {} wallet has no unlocked outputs to spend".format(self.coin_name()),
+        )
+        extra: int = (num_locks - 1) * fee_for(1)
+        if values[-1] >= amount + fee_for(2) + extra:
+            return fee_for(2) + extra
+        covered: int = 0
+        for n_inputs, value in enumerate(values, start=1):
+            covered += value
+            fee: int = fee_for(max(n_inputs, 2)) + extra
+            if covered >= amount + fee:
+                ensure(
+                    n_inputs <= self.max_tx_inputs(),
+                    "The {} wallet could spend {} outputs, more than the {} one transaction can take. Consolidate it first by sending the balance to yourself.".format(
+                        self.coin_name(), n_inputs, self.max_tx_inputs()
+                    ),
+                )
+                return fee
+        return fee
+
+    def estMaxLockAmount(self, num_locks: int) -> int:
+        """Largest total of num_locks coin B locks estLockTxsFee covers."""
+        values, fee_for = self._lockTxFeeModel()
+        if len(values) < 1:
+            return 0
+        best: int = values[-1] - fee_for(2)
+        covered: int = 0
+        for n_inputs, value in enumerate(values[: self.max_tx_inputs()], start=1):
+            covered += value
+            best = max(best, covered - fee_for(max(n_inputs, 2)))
+        return max(0, best - (num_locks - 1) * fee_for(1))
+
+    def publishBLockTxs(self, locks, feerate: int = 0, unlock_time: int = 0):
+        """Lock for several swaps at once, so their change is not chained.
+
+        Returns the txid and the indexes of locks it pays.
+        """
+        with self._mx_wallet:
+            self.openWallet(self._wallet_filename)
+            self.rpc_wallet("refresh")
+
+            destinations = [
+                {
+                    "amount": output_amount,
+                    "address": xmr_util.encode_address(
+                        self.getPubkey(kbv), Kbs, self._addr_prefix
+                    ),
+                }
+                for kbv, Kbs, output_amount in locks
+            ]
+            in_flight = self.findPendingLockTx({d["address"] for d in destinations})
+            if in_flight is not None:
+                tx_hash, paid = in_flight
+                covered = [
+                    n for n, d in enumerate(destinations) if d["address"] in paid
+                ]
+                if len(covered) < len(destinations):
+                    self._log.warning(
+                        "In-flight lock tx {} pays {} of {} locks, the rest must send their own.".format(
+                            self._log.id(tx_hash), len(covered), len(destinations)
+                        )
+                    )
+                return tx_hash, covered
+
+            params = {"destinations": destinations, "unlock_time": unlock_time}
+            if self._fee_priority > 0:
+                params["priority"] = self._fee_priority
+            rv = self.rpc_wallet("transfer", params)
+            self._log.info(
+                "publishBLockTxs {} to {} lock addresses".format(
+                    self._log.id(rv["tx_hash"]), len(destinations)
+                )
+            )
+            return bytes.fromhex(rv["tx_hash"]), list(range(len(destinations)))
 
     def findTxB(
         self,
@@ -572,8 +828,8 @@ class XMRInterface(CoinInterface):
                 self.createWallet(params)
                 self.openWallet(address_b58)
 
-            self.rpc_wallet("refresh")
             self._log.debug(f"Refreshing {self.coin_name()} wallet")
+            self.rpc_wallet("refresh")
 
             """
             # Debug
@@ -629,43 +885,38 @@ class XMRInterface(CoinInterface):
                             )
                         )
                         rv = -1
+
+            if rv is None:
+                synced: bool = False
+                try:
+                    synced = self.isChainSynced()
+                except Exception as e:
+                    self._log.debug(f"findTxB isChainSynced failed: {e}")
+                if not synced:
+                    raise ChainNotSyncedError(
+                        "findTxB: chain/wallet not fully synced, refusing to report the coin B lock tx as missing"
+                    )
             return rv
 
-    def findConfirmedTxnByHash(self, txid: str):
-        # TODO: Use get_transfer_by_txid and sending wallet when destination address is not owned
-        with self._mx_wallet:
-            self.openWallet(self._wallet_filename)
-            self.rpc_wallet("refresh")
-            self._log.debug(f"Refreshing {self.coin_name()} wallet")
+    def getTxDepth(self, txid: bytes) -> int | None:
+        return self.getTxDepthAndHeight(txid)[0]
 
-            try:
-                current_height: int = self.getChainHeight()
-                self._log.info(
-                    f"findConfirmedTxnByHash {self.ticker_str()} current_height {current_height}\nhash: {txid}"
-                )
-            except Exception as e:
-                self._log.info("rpc failed %s", str(e))
-                current_height = (
-                    None  # If the transfer is available it will be deep enough
-                )
+    def getTxDepthAndHeight(self, txid: bytes) -> tuple[int | None, int | None]:
+        rv = self.getTransaction(txid)
+        if txid.hex() in rv.get("missed_tx", []):
+            return None, None
+        tx = rv["txs"][0]
+        if tx["in_pool"]:
+            return 0, None
+        return self.getChainHeight() - tx["block_height"], tx["block_height"]
 
-            params = {"transfer_type": "available"}
-            rv = self.rpc_wallet("incoming_transfers", params)
-            if "transfers" in rv:
-                for transfer in rv["transfers"]:
-                    if transfer["tx_hash"] == txid and (
-                        current_height is None
-                        or current_height - transfer["block_height"]
-                        > self.blocks_confirmed
-                    ):
-                        return {
-                            "txid": transfer["tx_hash"],
-                            "amount": transfer["amount"],
-                            "height": transfer["block_height"],
-                        }
-            return None
+    def spendBLockTx(self, *args, **kwargs) -> bytes:
+        txid, tx = self.createBLockSpendTx(*args, **kwargs)
+        if tx is not None:
+            self.publishTx(tx)
+        return txid
 
-    def spendBLockTx(
+    def createBLockSpendTx(
         self,
         chain_b_lock_txid: bytes,
         address_to: str,
@@ -676,8 +927,11 @@ class XMRInterface(CoinInterface):
         restore_height: int,
         spend_actual_balance: bool = False,
         lock_tx_vout=None,
-    ) -> bytes:
+    ) -> tuple[bytes, bytes | None]:
         """
+        Returns the txid and the unrelayed tx, or None in place of the tx
+        when the lock was already spent.
+
         Notes:
         "Error: No unlocked balance in the specified subaddress(es)" can mean not enough funds after tx fee.
         """
@@ -702,8 +956,8 @@ class XMRInterface(CoinInterface):
                 self.createWallet(params)
                 self.openWallet(wallet_filename)
 
-            self.rpc_wallet("refresh")
             self._log.debug(f"Refreshing {self.coin_name()} wallet")
+            self.rpc_wallet("refresh")
             rv = self.rpc_wallet("get_balance")
             try:
                 open_wallet_addr = self.rpc_wallet("get_address")["address"]
@@ -724,7 +978,7 @@ class XMRInterface(CoinInterface):
 
                         # Should check for address_to, but only the from address is found in the output
                         if txns[0]["address"] == address_b58:
-                            return bytes.fromhex(txid)
+                            return bytes.fromhex(txid), None
 
                 self._log.error(
                     "wallet {} balance {}, expected {}".format(
@@ -753,21 +1007,23 @@ class XMRInterface(CoinInterface):
                 )
                 raise TemporaryError("Invalid unlocked_balance")
 
-            params = {"address": address_to}
+            params = {"address": address_to, "do_not_relay": True, "get_tx_hex": True}
             if self._fee_priority > 0:
                 params["priority"] = self._fee_priority
 
             rv = self.rpc_wallet("sweep_all", params)
 
-            return bytes.fromhex(rv["tx_hash_list"][0])
+            return bytes.fromhex(rv["tx_hash_list"][0]), bytes.fromhex(
+                rv["tx_blob_list"][0]
+            )
 
     def withdrawCoin(
         self, value, addr_to: str, sweepall: bool, estimate_fee: bool = False
     ) -> str:
         with self._mx_wallet:
             self.openWallet(self._wallet_filename)
-            self.rpc_wallet("refresh")
             self._log.debug(f"Refreshing {self.coin_name()} wallet")
+            self.rpc_wallet("refresh")
 
             if sweepall:
                 balance = self.rpc_wallet("get_balance")
@@ -847,8 +1103,8 @@ class XMRInterface(CoinInterface):
                         self.createWallet(params)
                         self.openWallet(address_b58)
 
-                self.rpc_wallet("refresh")
                 self._log.debug(f"Refreshing {self.coin_name()} wallet")
+                self.rpc_wallet("refresh")
 
                 rv = self.rpc_wallet(
                     "get_transfers",
@@ -860,13 +1116,56 @@ class XMRInterface(CoinInterface):
                 return {"error": str(e)}
 
     def getSpendableBalance(self) -> int:
+        return self.getBalances()[0]
+
+    def getBalances(self) -> tuple[int, int]:
         with self._mx_wallet:
             self.openWallet(self._wallet_filename)
-            self.rpc_wallet("refresh")
-            self._log.debug(f"Refreshing {self.coin_name()} wallet")
+            if not self.isChainSynced():
+                raise TemporaryError(f"{self.coin_name()} wallet is syncing")
 
             balance_info = self.rpc_wallet("get_balance")
-            return balance_info["unlocked_balance"]
+            return balance_info["unlocked_balance"], balance_info["balance"]
+
+    def findUnusedSwapWalletCaches(self, max_age_days: int) -> list[tuple[str, int]]:
+        wallets_dir = os.path.join(
+            self._sc.getChainClientSettings(self.coin_type())["datadir"], "wallets"
+        )
+        cutoff: float = time.time() - max_age_days * 86400
+        caches = []
+        for entry in os.scandir(wallets_dir):
+            address: str = entry.name.removesuffix("_spend")
+            if not entry.is_file():
+                continue
+            if not os.path.isfile(entry.path + ".keys"):
+                continue
+            try:
+                xmr_util.decode_address(address, self._addr_prefix)
+            except Exception:
+                continue
+            file_stat = entry.stat()
+            if file_stat.st_mtime > cutoff:
+                continue
+            caches.append((entry.path, file_stat.st_size))
+        return caches
+
+    def pruneSwapWalletCaches(self, max_age_days: int) -> tuple[int, int]:
+        num_removed: int = 0
+        bytes_removed: int = 0
+        with self._mx_wallet:
+            self.openWallet(self._wallet_filename)
+            for path, size in self.findUnusedSwapWalletCaches(max_age_days):
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    self._log.warning(f"Could not remove {path}: {e}")
+                    continue
+                num_removed += 1
+                bytes_removed += size
+        self._log.info(
+            f"Removed {num_removed} {self.coin_name()} swap wallet caches ({bytes_removed} bytes)"
+        )
+        return num_removed, bytes_removed
 
     def changeWalletPassword(
         self, old_password, new_password, check_seed_if_encrypt: bool = True
@@ -887,17 +1186,56 @@ class XMRInterface(CoinInterface):
         except Exception as e:  # noqa: F841
             self._wallet_password = orig_password
             raise
+        # Setting the first password leaves the wallet locked, as encryptwallet does
+        if old_password == "":
+            self.lockWallet()
+        else:
+            self._wallet_password = new_password
 
-    def unlockWallet(self, password: str, check_seed: bool = True) -> None:
+    def unlockWallet(
+        self,
+        password: str,
+        check_seed: bool = True,
+        encrypt_if_unencrypted: bool = False,
+    ) -> None:
         self._log.info("unlockWallet - {}".format(self.ticker()))
         self._wallet_password = password
+        if encrypt_if_unencrypted:
+            self.encryptIfUnencrypted(password)
 
         if check_seed and not self._have_checked_seed:
             self._sc.checkWalletSeed(self.coin_type())
 
     def lockWallet(self) -> None:
         self._log.info("lockWallet - {}".format(self.ticker()))
-        self._wallet_password = None
+        with self._mx_wallet:
+            self._wallet_password = None
+            self._cached_main_wallet_address = None
+            try:
+                self.rpc_wallet("close_wallet")
+            except Exception as e:
+                if "No wallet file" not in str(e):
+                    raise
+
+    def encryptIfUnencrypted(self, password: str) -> None:
+        with self._mx_wallet:
+            self._cached_main_wallet_address = None
+            try:
+                self.openWallet(self._wallet_filename)
+                return
+            except Exception as e:
+                if "invalid password" not in str(e).lower():
+                    self._log.warning(
+                        f"Could not open {self.coin_name()} wallet to check its password: {e}"
+                    )
+                    return
+        # Left without a password by a password change that failed partway
+        self._log.warning(f"{self.coin_name()} wallet has no password, setting it.")
+        self._wallet_password = ""
+        try:
+            self.changeWalletPassword("", password)
+        finally:
+            self._wallet_password = password
 
     def isAddressMine(self, address: str) -> bool:
         try:
@@ -915,6 +1253,16 @@ class XMRInterface(CoinInterface):
     def ensureFunds(self, amount: int) -> None:
         if self.getSpendableBalance() < amount:
             raise ValueError("Balance too low")
+
+    def publishTx(self, tx: bytes) -> None:
+        rv = self.rpc2("send_raw_transaction", {"tx_as_hex": tx.hex()})
+        if rv["status"] == "BUSY":
+            raise TemporaryError("send_raw_transaction: daemon busy")
+        if rv["status"] != "OK":
+            raise ValueError(f"send_raw_transaction failed: {rv['reason']}")
+
+    def isTxDoubleSpendError(self, err_str: str) -> bool:
+        return "double spend" in err_str
 
     def getTransaction(self, txid: bytes):
         return self.rpc2(

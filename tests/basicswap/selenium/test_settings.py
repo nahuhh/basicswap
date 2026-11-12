@@ -18,7 +18,6 @@ from util import (
     BSX_0_PORT,
     get_driver,
 )
-from basicswap.explorers import default_coingecko_api_key
 
 
 def click_option(el, option_text):
@@ -88,7 +87,7 @@ def test_settings(driver):
                 expected_chart_state = True
 
             difficult_text = "`~!@#$%^&*()-_=+[{}]\\|;:'\",<>./? "
-            el = driver.find_element(By.NAME, "chartapikey")
+            el = driver.find_element(By.NAME, "coingeckoapikey")
             el.clear()
             el.send_keys(difficult_text)
 
@@ -107,7 +106,7 @@ def test_settings(driver):
             ).decode("utf-8")
             assert coingecko_api_key == difficult_text
 
-            hex_text = default_coingecko_api_key
+            hex_text = "a1b2c3d4e5f67890"
             el = driver.find_element(By.NAME, "coingeckoapikey")
             el.clear()
             el.send_keys(hex_text)
@@ -124,6 +123,19 @@ def test_settings(driver):
                 settings = json.load(fs)
 
             assert settings.get("coingecko_api_key") == hex_text
+
+            el = driver.find_element(By.NAME, "coingeckoapiplan")
+            click_option(el, "Pro")
+            btn_apply_chart = wait.until(
+                EC.element_to_be_clickable((By.NAME, "apply_chart"))
+            )
+            btn_apply_chart.click()
+            time.sleep(1)
+
+            with open(settings_path_0) as fs:
+                settings = json.load(fs)
+
+            assert settings.get("coingecko_api_plan") == "pro"
         else:
             print("Chart settings not accessible, skipping chart tests")
             expected_chart_state = None
@@ -163,16 +175,39 @@ def test_settings(driver):
         btn_apply_chart.click()
         time.sleep(1)
 
-    # Apply XMR settings with blank nodes list
+    # Drive the interactive Monero daemon node list
     try:
-        driver.find_element(By.ID, "coins-tab").click()
-        time.sleep(1)
 
+        def open_coins_tab():
+            driver.find_element(By.ID, "coins-tab").click()
+            time.sleep(1)
+
+        def monero_nodes():
+            return driver.find_element(
+                By.CSS_SELECTOR, '.daemon-nodes[data-coin="monero"]'
+            )
+
+        def remove_all_nodes():
+            for btn in monero_nodes().find_elements(
+                By.CSS_SELECTOR, ".daemon-node-remove"
+            ):
+                btn.click()
+
+        def add_node(url):
+            container = monero_nodes()
+            add_input = container.find_element(
+                By.CSS_SELECTOR, ".daemon-node-add-input"
+            )
+            add_input.clear()
+            add_input.send_keys(url)
+            container.find_element(By.CSS_SELECTOR, ".daemon-node-add-btn").click()
+
+        # Apply with an empty node list
+        open_coins_tab()
         btn_apply_monero = wait.until(
             EC.element_to_be_clickable((By.NAME, "apply_monero"))
         )
-        el = driver.find_element(By.NAME, "remotedaemonurls_monero")
-        el.clear()
+        remove_all_nodes()
         btn_apply_monero.click()
         time.sleep(1)
 
@@ -180,12 +215,13 @@ def test_settings(driver):
             settings = json.load(fs)
         assert len(settings["chainclients"]["monero"]["remote_daemon_urls"]) == 0
 
+        # Add two nodes and apply
+        open_coins_tab()
         btn_apply_monero = wait.until(
             EC.element_to_be_clickable((By.NAME, "apply_monero"))
         )
-        el = driver.find_element(By.NAME, "remotedaemonurls_monero")
-        el.clear()
-        el.send_keys("node.xmr.to:18081\nnode1.xmr.to:18082")
+        add_node("node.xmr.to:18081")
+        add_node("node1.xmr.to:18082")
         btn_apply_monero.click()
         time.sleep(1)
 
@@ -193,12 +229,18 @@ def test_settings(driver):
             settings = json.load(fs)
         remotedaemonurls = settings["chainclients"]["monero"]["remote_daemon_urls"]
         assert len(remotedaemonurls) == 2
+        assert {n["url"] for n in remotedaemonurls} == {
+            "node.xmr.to:18081",
+            "node1.xmr.to:18082",
+        }
+        assert all(n["failover"] is True for n in remotedaemonurls)
 
+        # Remove all nodes and apply
+        open_coins_tab()
         btn_apply_monero = wait.until(
             EC.element_to_be_clickable((By.NAME, "apply_monero"))
         )
-        el = driver.find_element(By.NAME, "remotedaemonurls_monero")
-        el.clear()
+        remove_all_nodes()
         btn_apply_monero.click()
         time.sleep(1)
 

@@ -51,7 +51,7 @@ PIVX_BASE_ZMQ_PORT = 36892
 
 PREFIX_SECRET_KEY_REGTEST = 0x2E
 
-BTC_USE_DESCRIPTORS = toBool(os.getenv("BTC_USE_DESCRIPTORS", False))
+BTC_USE_DESCRIPTORS = toBool(os.getenv("BTC_USE_DESCRIPTORS", True))
 BTC_USE_LEGACY_KEY_PATHS = toBool(os.getenv("BTC_USE_LEGACY_KEY_PATHS", False))
 
 PORT_OFS = int(os.getenv("PORT_OFS", 1))
@@ -226,7 +226,8 @@ def prepareDataDir(
             fp.write(opt + "\n")
 
         if base_p2p_port == BTC_BASE_PORT:
-            fp.write("deprecatedrpc=create_bdb\n")
+            if not BTC_USE_DESCRIPTORS:
+                fp.write("deprecatedrpc=create_bdb\n")
             fp.write("changetype=bech32\n")
         elif base_p2p_port == LTC_BASE_PORT:
             fp.write("changetype=bech32\n")
@@ -295,8 +296,8 @@ def prepare_balance(
     wait_for_amount: float = amount
     if not test_balance:
         wait_for_amount += current_balance
-    delay_iterations = 100 if coin == Coins.NAV else 30
-    delay_time = 5 if coin == Coins.NAV else 3
+    delay_iterations = 30
+    delay_time = 3
 
     if wait_until_spendable is False:
         return

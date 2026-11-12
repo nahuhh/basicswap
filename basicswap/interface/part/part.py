@@ -45,6 +45,14 @@ class BalanceTypes(IntEnum):
     ANON = 3
 
 
+def findStealthOutput(tx, sx_addr: str):
+    # A batched lock tx pays several swaps, so the output may not be the first.
+    for output in tx["outputs"]:
+        if output.get("stealth_address") == sx_addr:
+            return output
+    return None
+
+
 class PARTInterface(BTCInterface):
     @staticmethod
     def coin_type():
@@ -71,6 +79,10 @@ class PARTInterface(BTCInterface):
     @staticmethod
     def xmr_swap_a_lock_spend_tx_vsize() -> int:
         return 200
+
+    @staticmethod
+    def xmr_swap_a_lock_refund_tx_vsize() -> int:
+        return 204
 
     @staticmethod
     def xmr_swap_b_lock_spend_tx_vsize() -> int:
@@ -166,6 +178,9 @@ class PARTInterface(BTCInterface):
     def getScriptForPubkeyHash(self, pkh: bytes) -> CScript:
         return CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
 
+    def supportsTaproot(self) -> bool:
+        return False
+
     def isValidTxoDest(self, script: bytes) -> bool:
         if self.isScriptP2PKH(script):
             return True
@@ -186,6 +201,30 @@ class PARTInterface(BTCInterface):
         prefix_byte = chainparams[self.coin_type()][self._network]["stealth_key_prefix"]
 
         return encodeStealthAddress(prefix_byte, scan_pubkey, spend_pubkey)
+
+    def lockWatchOnlyOutput(self, txid_hex: str, vout: int) -> None:
+        # Particl's blinded coin selection doesn't skip watch-only outputs
+        try:
+            self.rpc_wallet(
+                "lockunspent", [False, [{"txid": txid_hex, "vout": vout}], True]
+            )
+        except Exception as e:
+            if "expected unspent output" not in str(e):
+                self._log.warning(
+                    f"Locking watch-only output {self._log.id(txid_hex)}:{vout} failed: {e}"
+                )
+
+    def unlockTxOutputs(self, txid_hex: str) -> None:
+        try:
+            locked = [
+                o for o in self.rpc_wallet("listlockunspent") if o["txid"] == txid_hex
+            ]
+            if len(locked) > 0:
+                self.rpc_wallet("lockunspent", [True, locked])
+        except Exception as e:
+            self._log.warning(
+                f"Unlocking outputs of {self._log.id(txid_hex)} failed: {e}"
+            )
 
     def getWitnessStackSerialisedLength(self, witness_stack) -> int:
         length: int = 0
@@ -277,9 +316,20 @@ class PARTInterfaceBlind(PARTInterface):
     def est_lock_tx_vsize() -> int:
         return 980
 
+    @classmethod
+    def est_split_tx_vsize(cls, num_outputs: int) -> int:
+        # One input, plus change. A blind output is 95 bytes and a 677 byte
+        # rangeproof witness.
+        output_vsize: int = 95 + -(-677 // cls.witnessScaleFactor())
+        return 14 + cls.est_tx_input_vsize() + (num_outputs + 1) * output_vsize
+
     @staticmethod
     def xmr_swap_a_lock_spend_tx_vsize() -> int:
         return 1032
+
+    def estLockSpendFee(self, fee_rate: int) -> int:
+        # The daemon sets the fee from the rate
+        return self.feeForVSize(fee_rate, self.xmr_swap_a_lock_spend_tx_vsize())
 
     @staticmethod
     def xmr_swap_b_lock_spend_tx_vsize() -> int:
@@ -357,6 +407,50 @@ class PARTInterfaceBlind(PARTInterface):
         rv = self.rpc_wallet("createrawparttransaction", params)
         return bytes.fromhex(rv["hex"])
 
+    def getSpendableOutputs(self):
+        return [
+            {
+                "txid": u["txid"],
+                "vout": u["vout"],
+                "value": self.make_int(u["amount"], r=1),
+            }
+            for u in self.rpc_wallet("listunspentblind", [0])
+            if u.get("spendable", False) and u.get("safe", True)
+        ]
+
+    def splitOutputs(self, values):
+        """Pay each value to a new stealth address of this wallet in one blind
+        transaction and broadcast it. Returns the outputs it created."""
+        addr_to: str = self.getNewStealthAddress("plan_split")
+        outputs = [
+            {"address": addr_to, "amount": self.format_amount(value)}
+            for value in values
+        ]
+        params = [
+            "blind",
+            "blind",
+            outputs,
+            "",
+            "",
+            self._anon_tx_ring_size,
+            1,
+            False,
+            {"conf_target": self._conf_target, "blind_watchonly_visible": True},
+        ]
+        txid: str = self.rpc_wallet("sendtypeto", params)
+        self._log.info(
+            "Split {} plan outputs in tx {}".format(len(values), self._log.id(txid))
+        )
+        return [
+            {
+                "txid": u["txid"],
+                "vout": u["vout"],
+                "value": self.make_int(u["amount"], r=1),
+            }
+            for u in self.rpc_wallet("listunspentblind", [0])
+            if u["txid"] == txid and u.get("spendable", False)
+        ]
+
     def fundSCLockTx(
         self,
         tx_bytes: bytes,
@@ -364,6 +458,7 @@ class PARTInterfaceBlind(PARTInterface):
         vkbv: bytes,
         bid_id: bytes = None,
         cursor=None,
+        prevouts=None,
     ) -> bytes:
         feerate_str = self.format_amount(feerate)
         # TODO: unlock unspents if bid cancelled
@@ -391,6 +486,12 @@ class PARTInterfaceBlind(PARTInterface):
             "lockUnspents": True,
             "feeRate": feerate_str,
         }
+        if prevouts:
+            # allow_other_inputs defaults true, so pin the leg to its own inputs.
+            options["inputs"] = [
+                {"tx": prevout["txid"], "n": prevout["vout"]} for prevout in prevouts
+            ]
+            options["allow_other_inputs"] = False
         rv = self.rpc_wallet(
             "fundrawtransactionfrom", ["blind", tx_hex, {}, outputs_info, options]
         )
@@ -683,6 +784,11 @@ class PARTInterfaceBlind(PARTInterface):
         ensure(B == Kaf, "Bad script pubkey")
         ensure(csv_val == csv_val_expect, "Bad script csv value")
         ensure(C == Kaf, "Bad script pubkey")
+        # A non-minimal push decodes to the same values but makes the lock 2 spend non-standard
+        ensure(
+            script_out == self.genScriptLockRefundTxScript(Kal, Kaf, csv_val_expect),
+            "Bad lock refund script",
+        )
 
         # Check rangeproofs and commitments sum
         lock_tx_obj = self.rpc("decoderawtransaction", [lock_tx_bytes.hex()])
@@ -1057,24 +1163,6 @@ class PARTInterfaceBlind(PARTInterface):
                     self._log.debug(f"getaddressinfo {addr} failed: {e}")
         raise ValueError("Swipe payout output not found")
 
-    def swipePaysKey(
-        self, swipe_tx_bytes: bytes, swipe_txid_hex: str, key: bytes
-    ) -> bool:
-        # TODO: Remove with the rest of the pre KA_SWIPE compatibility.
-        # A blind output hides its value, not its address.
-        addr_key: str = self.pkh_to_address(self.pkh(self.getPubkey(key)))
-        swipe_tx = self.rpc("decoderawtransaction", [swipe_tx_bytes.hex()])
-        for txo in swipe_tx["vout"]:
-            if txo["type"] != "blind":
-                continue
-            script_pubkey = txo.get("scriptPubKey", {})
-            addrs = list(script_pubkey.get("addresses", []))
-            if "address" in script_pubkey:
-                addrs.append(script_pubkey["address"])
-            if addr_key in addrs:
-                return True
-        return False
-
     def prepareMercySpend(self, key: bytes, rescan_from: int) -> None:
         # Spending a blind output needs its blinding factor, which the wallet
         # derives once it holds the key.  Imported here rather than when the
@@ -1208,6 +1296,21 @@ class PARTInterfaceBlind(PARTInterface):
     def getSpendableBalance(self) -> int:
         return self.make_int(self.rpc_wallet("getbalances")["mine"]["blind_trusted"])
 
+    def fundBLockTx(
+        self,
+        Kbs: bytes,
+        output_amount: int,
+        feerate: int,
+        bid_id: bytes = None,
+        cursor=None,
+    ) -> tuple[bytes, int] | None:
+        return None
+
+    def fundBLockTxs(
+        self, locks, feerate: int, bid_id: bytes = None, cursor=None
+    ) -> bytes | None:
+        return None
+
     def publishBLockTx(
         self,
         vkbv: bytes,
@@ -1237,6 +1340,42 @@ class PARTInterfaceBlind(PARTInterface):
 
         txid = self.rpc_wallet("sendtypeto", params)
         return bytes.fromhex(txid)
+
+    def max_batched_lock_outputs(self) -> int:
+        # TODO: Confirm the real limit; Particl bounds a tx by size, not output count.
+        return 15
+
+    def publishBLockTxs(self, locks, feerate: int, unlock_time: int = 0):
+        """Lock several swaps in one transaction, so their change is not chained.
+
+        Returns the txid and the indexes of locks it pays.
+        """
+        outputs = [
+            {
+                "address": self.formatStealthAddress(self.getPubkey(vkbv), Kbs),
+                "amount": self.format_amount(output_amount),
+            }
+            for vkbv, Kbs, output_amount in locks
+        ]
+        params = [
+            "blind",
+            "blind",
+            outputs,
+            "",
+            "",
+            self._anon_tx_ring_size,
+            1,
+            False,
+            {"conf_target": self._conf_target, "blind_watchonly_visible": True},
+        ]
+
+        txid = self.rpc_wallet("sendtypeto", params)
+        self._log.info(
+            "publishBLockTxs {} to {} lock addresses".format(
+                self._log.id(txid), len(outputs)
+            )
+        )
+        return bytes.fromhex(txid), list(range(len(outputs)))
 
     def findTxB(
         self,
@@ -1268,14 +1407,17 @@ class PARTInterfaceBlind(PARTInterface):
         found_invalid_txid_hex: str = None
         for tx in txns:
             txid_hex: str = tx["txid"]
-            if tx["outputs"][0]["stealth_address"] != sx_addr:
+            output = findStealthOutput(tx, sx_addr)
+            if output is None:
                 # Should not be possible
                 self._log.warning(
                     f"Skipping tx {txid_hex} received on different stealth address"
                 )
                 continue
-            ensure(tx["outputs"][0]["type"] == "blind", "Output is not blind")
-            tx_amount = self.make_int(tx["outputs"][0]["amount"])
+            ensure(output["type"] == "blind", "Output is not blind")
+            if not bid_sender:
+                self.lockWatchOnlyOutput(txid_hex, output["vout"])
+            tx_amount = self.make_int(output["amount"])
             if bid_sender:
                 tx_amount *= -1
             if tx_amount == cb_swap_value or check_amount is False:
@@ -1283,7 +1425,7 @@ class PARTInterfaceBlind(PARTInterface):
                 if tx["confirmations"] > 0:
                     chain_height = self.rpc("getblockcount")
                     height = chain_height - (tx["confirmations"] - 1)
-                vout: int = tx["outputs"][0]["vout"]
+                vout: int = output["vout"]
 
                 return {
                     "txid": tx["txid"],
@@ -1327,6 +1469,7 @@ class PARTInterfaceBlind(PARTInterface):
             )
             self.rpc_wallet("rescanblockchain", [restore_height])
 
+        self.unlockTxOutputs(chain_b_lock_txid.hex())
         butxos = self.rpc_wallet("listunspentblind", [1, 9999999, [sx_addr]])
         utxo = None
         for blind_utxo in butxos:
@@ -1500,10 +1643,6 @@ class PARTInterfaceAnon(PARTInterface):
         return 1153
 
     @staticmethod
-    def xmr_swap_a_lock_spend_tx_vsize() -> int:
-        raise ValueError("Not possible")
-
-    @staticmethod
     def xmr_swap_b_lock_spend_tx_vsize() -> int:
         # TODO: Estimate with ringsize
         return 1153
@@ -1518,6 +1657,21 @@ class PARTInterfaceAnon(PARTInterface):
 
     def ticker(self) -> str:
         return super().ticker() + " Anon"
+
+    def fundBLockTx(
+        self,
+        Kbs: bytes,
+        output_amount: int,
+        feerate: int,
+        bid_id: bytes = None,
+        cursor=None,
+    ) -> tuple[bytes, int] | None:
+        return None
+
+    def fundBLockTxs(
+        self, locks, feerate: int, bid_id: bytes = None, cursor=None
+    ) -> bytes | None:
+        return None
 
     def publishBLockTx(
         self,
@@ -1547,6 +1701,42 @@ class PARTInterfaceAnon(PARTInterface):
 
         txid = self.rpc_wallet("sendtypeto", params)
         return bytes.fromhex(txid)
+
+    def max_batched_lock_outputs(self) -> int:
+        # TODO: Confirm the real limit; Particl bounds a tx by size, not output count.
+        return 15
+
+    def publishBLockTxs(self, locks, feerate: int, unlock_time: int = 0):
+        """Lock several swaps in one transaction, so their change is not chained.
+
+        Returns the txid and the indexes of locks it pays.
+        """
+        outputs = [
+            {
+                "address": self.formatStealthAddress(self.getPubkey(kbv), Kbs),
+                "amount": self.format_amount(output_amount),
+            }
+            for kbv, Kbs, output_amount in locks
+        ]
+        params = [
+            "anon",
+            "anon",
+            outputs,
+            "",
+            "",
+            self._anon_tx_ring_size,
+            1,
+            False,
+            {"conf_target": self._conf_target, "blind_watchonly_visible": True},
+        ]
+
+        txid = self.rpc_wallet("sendtypeto", params)
+        self._log.info(
+            "publishBLockTxs {} to {} lock addresses".format(
+                self._log.id(txid), len(outputs)
+            )
+        )
+        return bytes.fromhex(txid), list(range(len(outputs)))
 
     def findTxB(
         self,
@@ -1578,14 +1768,15 @@ class PARTInterfaceAnon(PARTInterface):
         found_invalid_txid_hex: str = None
         for tx in txns:
             txid_hex: str = tx["txid"]
-            if tx["outputs"][0]["stealth_address"] != sx_addr:
+            output = findStealthOutput(tx, sx_addr)
+            if output is None:
                 # Should not be possible
                 self._log.warning(
                     f"Skipping tx {txid_hex} received on different stealth address"
                 )
                 continue
-            ensure(tx["outputs"][0]["type"] == "anon", "Output is not anon")
-            tx_amount: int = self.make_int(tx["outputs"][0]["amount"])
+            ensure(output["type"] == "anon", "Output is not anon")
+            tx_amount: int = self.make_int(output["amount"])
             if bid_sender:
                 tx_amount *= -1
             if tx_amount == cb_swap_value or check_amount is False:
@@ -1593,7 +1784,7 @@ class PARTInterfaceAnon(PARTInterface):
                 if tx["confirmations"] > 0:
                     chain_height = self.rpc("getblockcount")
                     height = chain_height - (tx["confirmations"] - 1)
-                vout: int = tx["outputs"][0]["vout"]
+                vout: int = output["vout"]
                 return {
                     "txid": tx["txid"],
                     "amount": tx_amount,
@@ -1701,3 +1892,6 @@ class PARTInterfaceAnon(PARTInterface):
 
     def getSpendableBalance(self) -> int:
         return self.make_int(self.rpc_wallet("getbalances")["mine"]["anon_trusted"])
+
+    def getSpendableOutputs(self):
+        return None

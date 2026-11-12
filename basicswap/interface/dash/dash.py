@@ -44,6 +44,15 @@ class DASHInterface(BTCInterface):
     def decodeAddress(self, address: str) -> bytes:
         return decodeAddress(address)[1:]
 
+    def createWallet(self, wallet_name: str, password: str = "") -> None:
+        if self._connection_type == "electrum":
+            return
+        # wallet_name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup
+        self.rpc(
+            "createwallet",
+            [wallet_name, False, True, password, False, self._use_descriptors, True],
+        )
+
     def getWalletSeedID(self) -> str:
         hdseed: str = self.rpc_wallet("dumphdinfo")["hdseed"]
         return self.getSeedHash(bytes.fromhex(hdseed)).hex()
@@ -91,14 +100,29 @@ class DASHInterface(BTCInterface):
     def getSpendableBalance(self) -> int:
         return self.make_int(self.rpc_wallet("getwalletinfo")["balance"])
 
+    def getBalances(self) -> tuple[int, int]:
+        wi = self.rpc_wallet("getwalletinfo")
+        balance = self.make_int(wi["balance"])
+        return balance, balance + self.make_int(wi["unconfirmed_balance"])
+
     def getScriptForPubkeyHash(self, pkh: bytes) -> bytearray:
         # Return P2PKH
         return CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
 
+    def supportsTaproot(self) -> bool:
+        return False
+
+    def isValidTxoDest(self, script: bytes) -> bool:
+        if self.isScriptP2PKH(script):
+            return True
+        if self.isScriptP2SH(script):
+            return True
+        return False
+
     def getBLockSpendTxFee(self, tx, fee_rate: int) -> int:
         add_bytes = 107
         size = len(tx.serialize_with_witness()) + add_bytes
-        pay_fee = round(fee_rate * size / 1000)
+        pay_fee = self.feeForVSize(fee_rate, size)
         self._log.info(
             f"BLockSpendTx fee_rate, size, fee: {fee_rate}, {size}, {pay_fee}."
         )
@@ -119,8 +143,13 @@ class DASHInterface(BTCInterface):
 
         return None
 
-    def unlockWallet(self, password: str, check_seed: bool = True) -> None:
-        super().unlockWallet(password, check_seed)
+    def unlockWallet(
+        self,
+        password: str,
+        check_seed: bool = True,
+        encrypt_if_unencrypted: bool = False,
+    ) -> None:
+        super().unlockWallet(password, check_seed, encrypt_if_unencrypted)
         if self._wallet_v20_compatible:
             # Store password for initialiseWallet
             self._wallet_passphrase = password

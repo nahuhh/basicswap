@@ -5,20 +5,23 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 import os
+import platform
+import secrets
 
 from basicswap.interface.xmr.chainparams import params
 from basicswap.interface.prepare_util import (
     CoinPrepareModule,
     PrepareContext,
     ensurePubkey,
+    readClearsigned,
     exitWithError,
     getOSDirNames,
 )
 
-MONERO_VERSION = os.getenv("MONERO_VERSION", "0.18.5.1")
+MONERO_VERSION = os.getenv("MONERO_VERSION", "0.18.5.4")
 MONERO_VERSION_TAG = os.getenv("MONERO_VERSION_TAG", "")
 XMR_SITE_COMMIT = (
-    "76f3846db3442be40676fd2e5432dd809d44ea3f"  # Lock hashes.txt to monero version
+    "947eb388c5028baea0dacb56cdd37b25710f2b55"  # Lock hashes.txt to monero version
 )
 monero_signers = {"binaryfate": ("81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92",)}
 
@@ -29,7 +32,7 @@ XMR_ZMQ_PORT = int(os.getenv("XMR_ZMQ_PORT", 30898))
 XMR_WALLET_RPC_PORT = int(os.getenv("XMR_WALLET_RPC_PORT", 29998))
 XMR_WALLET_RPC_HOST = os.getenv("XMR_WALLET_RPC_HOST", "127.0.0.1")
 XMR_WALLET_RPC_USER = os.getenv("XMR_WALLET_RPC_USER", "xmr_wallet_user")
-XMR_WALLET_RPC_PWD = os.getenv("XMR_WALLET_RPC_PWD", "xmr_wallet_pwd")
+XMR_WALLET_RPC_PWD = os.getenv("XMR_WALLET_RPC_PWD", "") or secrets.token_hex(16)
 XMR_RPC_USER = os.getenv("XMR_RPC_USER", "")
 XMR_RPC_PWD = os.getenv("XMR_RPC_PWD", "")
 DEFAULT_XMR_RESTORE_HEIGHT = int(os.getenv("DEFAULT_XMR_RESTORE_HEIGHT", 2245107))
@@ -75,19 +78,22 @@ class XMRPrepare(CoinPrepareModule):
         extra_opts: dict,
     ) -> tuple:
         use_file_ext = "tar.bz2" if ctx.file_ext == "tar.gz" else ctx.file_ext
-        release_filename = f"{self.name}-{self.version}-{ctx.bin_arch}.{use_file_ext}"
 
         os_name, _ = getOSDirNames(ctx.bin_arch)
+        architecture = "x64"
         if os_name == "osx":
             os_name = "mac"
-
-        architecture = "x64"
-        if "aarch64" in ctx.bin_arch:
+            if platform.machine() == "arm64":
+                architecture = "armv8"
+        elif "aarch64" in ctx.bin_arch:
             architecture = "armv8"
         elif "arm" in ctx.bin_arch:
             architecture = "armv7"
 
-        release_url = f"https://downloads.getmonero.org/cli/monero-{os_name}-{architecture}-v{self.version}.{use_file_ext}"
+        release_filename = (
+            f"monero-{os_name}-{architecture}-v{self.version}.{use_file_ext}"
+        )
+        release_url = f"https://downloads.getmonero.org/cli/{release_filename}"
         release_path = os.path.join(bin_dir, release_filename)
         ctx.download_release(release_url, release_path, extra_opts)
 
@@ -99,6 +105,9 @@ class XMRPrepare(CoinPrepareModule):
             ctx.download_file(assert_url, assert_path)
 
         return release_path, assert_path, None
+
+    def hasDetachedSig(self) -> bool:
+        return False
 
     def getPubkeyUrls(self, ctx: PrepareContext) -> list:
         return [
@@ -123,8 +132,7 @@ class XMRPrepare(CoinPrepareModule):
             gpg, ctx, signing_key_name, self.signers, pubkey_filename, pubkeyurls
         )
 
-        with open(assert_path, "rb") as fp:
-            verified = gpg.verify_file(fp)
+        verified = gpg.verify(readClearsigned(assert_path)[0])
 
         self.ensureValidSignatureBy(
             ctx, verified, signing_key_name, filepath=assert_path

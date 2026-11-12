@@ -49,6 +49,19 @@ from .ui.util import (
 )
 from .ui.page_offers import postNewOffer
 from .protocols.xmr_swap_1 import recoverNoScriptTxnWithKey, getChainBSplitKey
+from .bidplanner import FILL_RECEIVE, FILL_SPEND
+from .multibid import (
+    ANCHOR_MARKET,
+    DEFAULT_BID_VALID_SECONDS,
+    DEFAULT_MAX_BIDS,
+    DEFAULT_SLIP_PERCENT,
+    MAX_CONFIRM_WAIT_SECONDS,
+    MIN_LEG_TIMEOUT_SECONDS,
+    describePlan,
+    placeMultiBid,
+    planMultiBid,
+    PLAN_ID_LENGTH,
+)
 from .db import Concepts
 
 
@@ -639,6 +652,7 @@ def parseBidFilters(post_data):
 def formatBids(swap_client, bids, filters) -> bytes:
     with_extra_info = filters.get("with_extra_info", False)
     rv = []
+    plan_targets = {}
     for b in bids:
         ci_from = swap_client.ci(b[9])
         offer = swap_client.getOffer(b[3])
@@ -663,7 +677,17 @@ def formatBids(swap_client, bids, filters) -> bytes:
             "bid_state": strBidState(b[5]),
             "addr_from": b[11],
             "addr_to": offer.addr_to if offer else None,
+            "plan_id": b[15].hex() if b[15] else None,
         }
+
+        if b[15] is not None:
+            plan_id_hex = b[15].hex()
+            if plan_id_hex not in plan_targets:
+                raw = swap_client.getStringKV(f"plan_target:{plan_id_hex}")
+                plan_targets[plan_id_hex] = (
+                    ci_from.format_amount(int(raw)) if raw is not None else None
+                )
+            bid_data["plan_target"] = plan_targets[plan_id_hex]
 
         if with_extra_info:
             bid_data.update(
@@ -671,6 +695,160 @@ def formatBids(swap_client, bids, filters) -> bytes:
             )
         rv.append(bid_data)
     return bytes(json.dumps(rv), "UTF-8")
+
+
+def parseMultiBidRequest(swap_client, post_data):
+    coin_from = Coins(getCoinType(get_data_entry(post_data, "coin_from")))
+    coin_to = Coins(getCoinType(get_data_entry(post_data, "coin_to")))
+    ci_from = swap_client.ci(coin_from)
+    ci_to = swap_client.ci(coin_to)
+
+    have_receive: bool = have_data_entry(post_data, "receive_amount")
+    have_spend: bool = have_data_entry(post_data, "spend_amount")
+    spend_max: bool = toBool(get_data_entry_or(post_data, "spend_max", "false"))
+    ensure(
+        have_receive + have_spend + spend_max == 1,
+        "Requires one of receive_amount, spend_amount or spend_max",
+    )
+
+    target = None
+    if have_receive:
+        mode = FILL_RECEIVE
+        target = inputAmount(get_data_entry(post_data, "receive_amount"), ci_from)
+    else:
+        mode = FILL_SPEND
+        if have_spend:
+            target = inputAmount(get_data_entry(post_data, "spend_amount"), ci_to)
+
+    max_bids = int(get_data_entry_or(post_data, "max_bids", DEFAULT_MAX_BIDS))
+    ensure(max_bids >= 1, "max_bids must be at least 1")
+    batch_cap = ci_to.max_batched_lock_outputs()
+    if batch_cap is not None:
+        max_bids = min(max_bids, batch_cap)
+
+    return {
+        "coin_from": coin_from,
+        "coin_to": coin_to,
+        "mode": mode,
+        "target": target,
+        "spend_max": spend_max,
+        "anchor": get_data_entry_or(post_data, "anchor", ANCHOR_MARKET),
+        "slip_percent": float(
+            get_data_entry_or(post_data, "slip_percent", DEFAULT_SLIP_PERCENT)
+        ),
+        "max_bids": max_bids,
+        "allow_known_only": toBool(
+            get_data_entry_or(post_data, "allow_known_only", "false")
+        ),
+        "allow_self_bids": toBool(
+            get_data_entry_or(post_data, "allow_self_bids", "false")
+        ),
+        "manual_offers": [
+            bytes.fromhex(offer_id)
+            for offer_id in get_data_entry_or(post_data, "manual_offers", [])
+        ],
+    }
+
+
+def js_bids_plan(self, post_string: str, is_json: bool) -> bytes:
+    swap_client = self.server.swap_client
+    post_data = getFormData(post_string, is_json)
+    args = parseMultiBidRequest(swap_client, post_data)
+
+    plan, market_rate, limit_rate = planMultiBid(swap_client, **args)
+
+    rv = describePlan(
+        swap_client,
+        args["coin_from"],
+        args["coin_to"],
+        args["mode"],
+        plan,
+        market_rate,
+        limit_rate,
+    )
+    return bytes(json.dumps(rv), "UTF-8")
+
+
+def js_bids_bulk(self, post_string: str, is_json: bool) -> bytes:
+    swap_client = self.server.swap_client
+    post_data = getFormData(post_string, is_json)
+
+    legs_in = get_data_entry(post_data, "legs")
+    if isinstance(legs_in, str):
+        legs_in = json.loads(legs_in)
+    ensure(isinstance(legs_in, list) and len(legs_in) > 0, "Requires a list of legs")
+
+    legs = []
+    coin_from = None
+    coin_to = None
+    for leg in legs_in:
+        ensure(
+            isinstance(leg, dict) and "offer_id" in leg and "amount" in leg,
+            "Each leg requires an offer_id and an amount",
+        )
+        offer_id = bytes.fromhex(leg["offer_id"])
+        ensure(len(offer_id) == 28, "Invalid offer_id")
+        offer = swap_client.getOffer(offer_id)
+        ensure(offer, "Offer not found")
+        if coin_from is None:
+            coin_from, coin_to = offer.coin_from, offer.coin_to
+        ci_from = swap_client.ci(offer.coin_from)
+        legs.append(
+            {
+                "offer_id": offer_id,
+                "amount": inputAmount(leg["amount"], ci_from),
+            }
+        )
+
+    valid_for_seconds: int = DEFAULT_BID_VALID_SECONDS
+    if have_data_entry(post_data, "validmins"):
+        valid_for_seconds = int(get_data_entry(post_data, "validmins")) * 60
+    elif have_data_entry(post_data, "valid_for_seconds"):
+        valid_for_seconds = int(get_data_entry(post_data, "valid_for_seconds"))
+
+    addr_from = None
+    if have_data_entry(post_data, "addr_from"):
+        addr_from = get_data_entry(post_data, "addr_from")
+        if addr_from == "-1":
+            addr_from = None
+
+    plan_id = None
+    if have_data_entry(post_data, "plan_id"):
+        plan_id = bytes.fromhex(get_data_entry(post_data, "plan_id"))
+        ensure(len(plan_id) == PLAN_ID_LENGTH, "Invalid plan_id")
+
+    leg_timeout_seconds = None
+    if have_data_entry(post_data, "plan_leg_timeout"):
+        leg_timeout_seconds = int(get_data_entry(post_data, "plan_leg_timeout")) * 60
+        ensure(
+            leg_timeout_seconds >= MIN_LEG_TIMEOUT_SECONDS,
+            f"plan_leg_timeout must be at least {MIN_LEG_TIMEOUT_SECONDS // 60} minutes",
+        )
+        ensure(
+            leg_timeout_seconds <= MAX_CONFIRM_WAIT_SECONDS,
+            f"plan_leg_timeout must be at most {MAX_CONFIRM_WAIT_SECONDS // 60} minutes",
+        )
+
+    placed, failed, plan_id = placeMultiBid(
+        swap_client,
+        legs,
+        valid_for_seconds=valid_for_seconds,
+        addr_from=addr_from,
+        plan_id=plan_id,
+        leg_timeout_seconds=leg_timeout_seconds,
+    )
+
+    ci_from = swap_client.ci(coin_from)
+    ci_to = swap_client.ci(coin_to)
+    for entry in placed + failed:
+        entry["amount"] = ci_from.format_amount(entry["amount"])
+    for entry in placed:
+        entry["rate"] = ci_to.format_amount(entry["rate"])
+
+    return bytes(
+        json.dumps({"placed": placed, "failed": failed, "plan_id": plan_id.hex()}),
+        "UTF-8",
+    )
 
 
 def js_bids(self, url_split, post_string: str, is_json: bool) -> bytes:
@@ -737,7 +915,7 @@ def js_bids(self, url_split, post_string: str, is_json: bool) -> bytes:
                         post_data, "destination_address"
                     )
                 else:
-                    extra_options["dest_af"] = ci_from.decodeAddress(
+                    extra_options["dest_af"] = ci_from.decodeSwapDest(
                         get_data_entry(post_data, "destination_address")
                     )
             if have_data_entry(post_data, "destination_script"):
@@ -774,6 +952,12 @@ def js_bids(self, url_split, post_string: str, is_json: bool) -> bytes:
 
             rv = {"bid_id": bid_id.hex()}
             return bytes(json.dumps(rv), "UTF-8")
+
+        if url_split[3] == "plan":
+            return js_bids_plan(self, post_string, is_json)
+
+        if url_split[3] == "bulk":
+            return js_bids_bulk(self, post_string, is_json)
 
         bid_id = bytes.fromhex(url_split[3])
         ensure(len(bid_id) == 28, "Invalid bid id size")
@@ -886,10 +1070,10 @@ def js_sentbids(self, url_split, post_string, is_json) -> bytes:
     return formatBids(swap_client, bids, filters)
 
 
-def js_network(self, url_split, post_string, is_json) -> bytes:
+def js_networks(self, url_split, post_string, is_json) -> bytes:
     swap_client = self.server.swap_client
     swap_client.checkSystemStatus()
-    return bytes(json.dumps(swap_client.get_network_info()), "UTF-8")
+    return bytes(json.dumps(swap_client.getNetworksInfo()), "UTF-8")
 
 
 def js_revokeoffer(self, url_split, post_string, is_json) -> bytes:
@@ -1038,19 +1222,16 @@ def js_offer_fee_estimate(self, url_split, post_string, is_json) -> bytes:
             coin_from, conf_target
         )
         fee_rate_int = ci_from.make_int(from_fee_override, r=1)
-        lock_spend_tx_vsize = (
-            ci_from.xmr_swap_b_lock_spend_tx_vsize()
+        lock_spend_tx_fee: int = (
+            ci_from.feeForVSize(fee_rate_int, ci_from.xmr_swap_b_lock_spend_tx_vsize())
             if reverse_bid
-            else ci_from.xmr_swap_a_lock_spend_tx_vsize()
+            else ci_from.estLockSpendFee(fee_rate_int)
         )
-        lock_spend_tx_fee = ci_from.make_int(
-            fee_rate_int * lock_spend_tx_vsize / 1000, r=1
-        )
-        rv["fee"] = ci_from.format_amount(lock_spend_tx_fee // ci_from.COIN())
+        rv["fee"] = ci_from.format_amount(lock_spend_tx_fee)
         rv["fee_rate"] = ci_from.format_amount(fee_rate_int)
         rv["fee_src"] = fee_src
     except Exception as e:
-        if swap_client.debug:
+        if swap_client.debug_logs:
             swap_client.log.warning(f"offer_fee_estimate failed: {e}")
         rv["error"] = "Fee estimate unavailable"
     return bytes(json.dumps(rv), "UTF-8")
@@ -1529,6 +1710,20 @@ def js_lock(self, url_split, post_string, is_json) -> bytes:
     return bytes(json.dumps({"success": True}), "UTF-8")
 
 
+def js_logging(self, url_split, post_string, is_json) -> bytes:
+    swap_client = self.server.swap_client
+    if post_string:
+        post_data = getFormData(post_string, is_json)
+        names = []
+        for key in ("include", "exclude"):
+            value = get_data_entry_or(post_data, key, [])
+            if isinstance(value, str):
+                value = [name for name in value.split(",") if name != ""]
+            names.append(value)
+        swap_client.setLogCategories(*names)
+    return bytes(json.dumps(swap_client.logCategories()), "UTF-8")
+
+
 def js_404(self, url_split, post_string, is_json) -> bytes:
     return bytes(json.dumps({"Error": "path unknown"}), "UTF-8")
 
@@ -1636,9 +1831,7 @@ def js_coinprices(self, url_split, post_string, is_json) -> bytes:
     if have_data_entry(post_data, "currency_to"):
         currency_to = fiatFromTicker(get_data_entry(post_data, "currency_to"))
 
-    rate_source: str = "coingecko.com"
-    if have_data_entry(post_data, "source"):
-        rate_source = get_data_entry(post_data, "source")
+    rate_source = get_data_entry_or(post_data, "source", None)
 
     match_input_key: bool = toBool(
         get_data_entry_or(post_data, "match_input_key", "true")
@@ -1677,7 +1870,13 @@ def js_coinprices(self, url_split, post_string, is_json) -> bytes:
         else:
             rv[int(k)] = v
     return bytes(
-        json.dumps({"currency": currency_to.name, "source": rate_source, "rates": rv}),
+        json.dumps(
+            {
+                "currency": currency_to.name,
+                "source": rate_source or "oracle",
+                "rates": rv,
+            }
+        ),
         "UTF-8",
     )
 
@@ -1688,9 +1887,7 @@ def js_coinvolume(self, url_split, post_string, is_json) -> bytes:
     if not have_data_entry(post_data, "coins"):
         raise ValueError("Requires coins list.")
 
-    rate_source: str = "coingecko.com"
-    if have_data_entry(post_data, "source"):
-        rate_source = get_data_entry(post_data, "source")
+    rate_source = get_data_entry_or(post_data, "source", None)
 
     match_input_key: bool = toBool(
         get_data_entry_or(post_data, "match_input_key", "true")
@@ -1729,7 +1926,7 @@ def js_coinvolume(self, url_split, post_string, is_json) -> bytes:
         else:
             rv[int(k)] = v
     return bytes(
-        json.dumps({"source": rate_source, "data": rv}),
+        json.dumps({"source": rate_source or "oracle", "data": rv}),
         "UTF-8",
     )
 
@@ -1956,11 +2153,9 @@ def js_modeswitchinfo(self, url_split, post_string, is_json) -> bytes:
     try:
         fee_rate, rate_src = ci.get_fee_rate(ci._conf_target)
         est_vsize = 180
-        if isinstance(fee_rate, int):
-            fee_per_vbyte = max(1, fee_rate // 1000)
-        else:
-            fee_per_vbyte = max(1, int(fee_rate * 100000))
-        estimated_fee_sats = est_vsize * fee_per_vbyte
+        if not isinstance(fee_rate, int):
+            fee_rate = ci.make_int(fee_rate, r=1)
+        estimated_fee_sats = max(est_vsize, ci.feeForVSize(fee_rate, est_vsize))
     except Exception:
         estimated_fee_sats = 180
         rate_src = "default"
@@ -2124,6 +2319,11 @@ def js_electrum_discover(self, url_split, post_string, is_json) -> bytes:
                 "UTF-8",
             )
 
+    from .interface.electrumx import is_valid_peer_host
+
+    discovered_servers = [
+        s for s in discovered_servers if is_valid_peer_host(s.get("host"))
+    ]
     onion_servers = [s for s in discovered_servers if s.get("is_onion")]
     clearnet_servers = [s for s in discovered_servers if not s.get("is_onion")]
 
@@ -2139,6 +2339,132 @@ def js_electrum_discover(self, url_split, post_string, is_json) -> bytes:
         ),
         "UTF-8",
     )
+
+
+def js_testxmrdaemon(self, url_split, post_string, is_json) -> bytes:
+    swap_client = self.server.swap_client
+    post_data = {} if post_string == "" else getFormData(post_string, is_json)
+
+    coin_str = get_data_entry(post_data, "coin")
+    try:
+        coin_type = Coins(int(coin_str))
+    except (ValueError, TypeError):
+        try:
+            coin_type = getCoinIdFromName(coin_str)
+        except ValueError:
+            coin_type = getCoinType(coin_str)
+
+    if coin_type not in (Coins.XMR, Coins.WOW):
+        return bytes(
+            json.dumps(
+                {
+                    "reachable": False,
+                    "error": "Daemon test is only supported for Monero/Wownero.",
+                }
+            ),
+            "UTF-8",
+        )
+
+    rpchost = get_data_entry(post_data, "rpchost")
+    rpcport = get_data_entry(post_data, "rpcport")
+    try:
+        probe = swap_client.probeXMRDaemon(coin_type, rpchost, rpcport)
+    except Exception as e:
+        return bytes(json.dumps({"reachable": False, "error": str(e)}), "UTF-8")
+
+    rv = {"reachable": probe["reachable"]}
+    if probe["reachable"]:
+        rv["latency_ms"] = probe.get("latency_ms")
+    else:
+        rv["error"] = f"Daemon {rpchost}:{rpcport} is not reachable."
+    return bytes(json.dumps(rv), "UTF-8")
+
+
+def js_setxmrdaemon(self, url_split, post_string, is_json) -> bytes:
+    # Validate reachability, then persist/live-apply via editSettings (set_daemon).
+    swap_client = self.server.swap_client
+    post_data = {} if post_string == "" else getFormData(post_string, is_json)
+
+    coin_str = get_data_entry(post_data, "coin")
+    try:
+        coin_type = Coins(int(coin_str))
+    except (ValueError, TypeError):
+        try:
+            coin_type = getCoinIdFromName(coin_str)
+        except ValueError:
+            coin_type = getCoinType(coin_str)
+
+    if coin_type not in (Coins.XMR, Coins.WOW):
+        return bytes(
+            json.dumps(
+                {
+                    "success": False,
+                    "error": "Only supported for Monero/Wownero.",
+                }
+            ),
+            "UTF-8",
+        )
+
+    rpchost = get_data_entry(post_data, "rpchost")
+    rpcport = get_data_entry(post_data, "rpcport")
+    try:
+        probe = swap_client.probeXMRDaemon(coin_type, rpchost, rpcport)
+        if not probe["reachable"]:
+            return bytes(
+                json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Daemon {rpchost}:{rpcport} is not reachable.",
+                    }
+                ),
+                "UTF-8",
+            )
+        coin_name = swap_client.coin_clients[coin_type]["name"]
+        swap_client.editSettings(
+            coin_name, {"rpchost": rpchost, "rpcport": int(rpcport)}
+        )
+    except Exception as e:
+        return bytes(json.dumps({"success": False, "error": str(e)}), "UTF-8")
+
+    rv = {"success": True, "rpchost": rpchost, "rpcport": int(rpcport)}
+    if probe.get("latency_ms") is not None:
+        rv["latency_ms"] = probe["latency_ms"]
+    return bytes(json.dumps(rv), "UTF-8")
+
+
+def js_savexmrdaemonnodes(self, url_split, post_string, is_json) -> bytes:
+    # Persist the node list live; does not change or re-select the active daemon.
+    swap_client = self.server.swap_client
+    post_data = {} if post_string == "" else getFormData(post_string, is_json)
+
+    coin_str = get_data_entry(post_data, "coin")
+    try:
+        coin_type = Coins(int(coin_str))
+    except (ValueError, TypeError):
+        try:
+            coin_type = getCoinIdFromName(coin_str)
+        except ValueError:
+            coin_type = getCoinType(coin_str)
+
+    if coin_type not in (Coins.XMR, Coins.WOW):
+        return bytes(
+            json.dumps(
+                {
+                    "success": False,
+                    "error": "Only supported for Monero/Wownero.",
+                }
+            ),
+            "UTF-8",
+        )
+
+    nodes = get_data_entry(post_data, "nodes")
+    try:
+        coin_name = swap_client.coin_clients[coin_type]["name"]
+        swap_client.saveRemoteDaemonNodes(coin_name, nodes)
+    except Exception as e:
+        return bytes(json.dumps({"success": False, "error": str(e)}), "UTF-8")
+
+    return bytes(json.dumps({"success": True}), "UTF-8")
 
 
 def js_getsubfeebidtx(self, url_split, post_string, is_json) -> bytes:
@@ -2176,7 +2502,7 @@ endpoints = {
     "sentoffers": js_sentoffers,
     "bids": js_bids,
     "sentbids": js_sentbids,
-    "network": js_network,
+    "networks": js_networks,
     "revokeoffer": js_revokeoffer,
     "smsgaddresses": js_smsgaddresses,
     "rate": js_rate,
@@ -2196,6 +2522,7 @@ endpoints = {
     "unlock": js_unlock,
     "lock": js_lock,
     "help": js_help,
+    "logging": js_logging,
     "readurl": js_readurl,
     "active": js_active,
     "coinprices": js_coinprices,
@@ -2203,6 +2530,9 @@ endpoints = {
     "coinhistory": js_coinhistory,
     "messageroutes": js_messageroutes,
     "electrumdiscover": js_electrum_discover,
+    "testxmrdaemon": js_testxmrdaemon,
+    "setxmrdaemon": js_setxmrdaemon,
+    "savexmrdaemonnodes": js_savexmrdaemonnodes,
     "modeswitchinfo": js_modeswitchinfo,
     "getsubfeebidtx": js_getsubfeebidtx,
 }

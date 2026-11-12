@@ -5,6 +5,7 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 import html
+import json
 
 from .util import (
     getCoinName,
@@ -13,6 +14,7 @@ from .util import (
     get_data_entry_or,
 )
 from basicswap.util import (
+    ensure,
     toBool,
     InactiveCoin,
 )
@@ -33,7 +35,8 @@ def page_settings(self, url_split, post_string):
     messages = []
     err_messages = []
     extra_headers = []
-    active_tab = "default"
+    active_tab = "coins"
+    swap_wallets_prune = None
     form_data = self.checkForm(post_string, "settings", err_messages)
     if form_data:
         try:
@@ -42,6 +45,7 @@ def page_settings(self, url_split, post_string):
                 data = {
                     "debug": toBool(get_data_entry(form_data, "debugmode")),
                     "debug_ui": toBool(get_data_entry(form_data, "debugui")),
+                    "log_level": get_data_entry(form_data, "loglevel"),
                     "expire_unused_offers": toBool(
                         get_data_entry(form_data, "expire_unused_offers")
                     ),
@@ -50,6 +54,39 @@ def page_settings(self, url_split, post_string):
                     ),
                 }
                 swap_client.editGeneralSettings(data)
+            elif have_data_entry(
+                form_data, "preview_swap_wallets_prune"
+            ) or have_data_entry(form_data, "prune_swap_wallets"):
+                active_tab = "general"
+                max_age_days = int(
+                    get_data_entry_or(form_data, "prune_swap_wallets_days", "90")
+                )
+                ensure(max_age_days >= 14, "Age must be at least 14 days")
+                is_preview = have_data_entry(form_data, "preview_swap_wallets_prune")
+                if is_preview:
+                    swap_wallets_prune = {"days": max_age_days, "coins": []}
+                for coin in swap_client.activeCoins():
+                    if coin not in swap_client.xmr_based_coins:
+                        continue
+                    if not swap_client.getChainClientSettings(coin).get(
+                        "manage_wallet_daemon", False
+                    ):
+                        continue
+                    ci = swap_client.ci(coin)
+                    if is_preview:
+                        caches = ci.findUnusedSwapWalletCaches(max_age_days)
+                        swap_wallets_prune["coins"].append(
+                            {
+                                "name": getCoinName(coin),
+                                "count": len(caches),
+                                "mb": sum(size for _, size in caches) / 1048576,
+                            }
+                        )
+                        continue
+                    num_removed, bytes_removed = ci.pruneSwapWalletCaches(max_age_days)
+                    messages.append(
+                        f"{getCoinName(coin)}: removed {num_removed} swap wallet caches ({bytes_removed / 1048576:.1f} MB)."
+                    )
             elif have_data_entry(form_data, "apply_security"):
                 active_tab = "security"
                 data = {
@@ -104,9 +141,18 @@ def page_settings(self, url_split, post_string):
                     "coingecko_api_key": html.unescape(
                         get_data_entry_or(form_data, "coingeckoapikey", "")
                     ),
+                    "coingecko_api_plan": get_data_entry_or(
+                        form_data, "coingeckoapiplan", "demo"
+                    ),
                     "enabled_chart_coins": get_data_entry_or(
                         form_data, "enabledchartcoins", ""
                     ),
+                    "rate_sources": {
+                        rate_source: have_data_entry(
+                            form_data, f"ratesource_{rate_source}"
+                        )
+                        for rate_source, _, _ in swap_client.getRateSources()
+                    },
                 }
                 swap_client.editGeneralSettings(data)
             elif have_data_entry(form_data, "apply_notifications"):
@@ -160,6 +206,104 @@ def page_settings(self, url_split, post_string):
                 raise ValueError(
                     "TODO: If running in docker see doc/tor.md to enable/disable tor."
                 )
+            elif have_data_entry(form_data, "apply_network_nostr"):
+                active_tab = "networks"
+                relays_text = get_data_entry_or(form_data, "nostr_relays", "")
+                relays = [
+                    line.strip()
+                    for line in html.unescape(relays_text).splitlines()
+                    if line.strip()
+                ]
+                data = {
+                    "relays": relays,
+                    "pow_target": int(
+                        get_data_entry_or(form_data, "nostr_pow_target", "0")
+                    ),
+                    "min_incoming_pow": int(
+                        get_data_entry_or(form_data, "nostr_min_incoming_pow", "0")
+                    ),
+                }
+                settings_changed, suggest_reboot = swap_client.editNetworkSettings(
+                    "nostr", data
+                )
+                if settings_changed:
+                    messages.append("Nostr settings applied.")
+                if suggest_reboot:
+                    messages.append("Please restart BasicSwap.")
+            elif have_data_entry(form_data, "regenerate_key_nostr"):
+                active_tab = "networks"
+                settings_changed, suggest_reboot = swap_client.editNetworkSettings(
+                    "nostr", {"regenerate_key": True}
+                )
+                if settings_changed:
+                    messages.append("Nostr key regenerated.")
+                if suggest_reboot:
+                    messages.append("Please restart BasicSwap.")
+            elif have_data_entry(form_data, "add_network_nostr"):
+                active_tab = "networks"
+                settings_changed, suggest_reboot = swap_client.editNetworkSettings(
+                    "nostr", {"add": True}
+                )
+                if settings_changed:
+                    messages.append("Nostr network added.")
+                if suggest_reboot:
+                    messages.append("Please restart BasicSwap.")
+            elif have_data_entry(form_data, "apply_network_simplex"):
+                active_tab = "networks"
+                data = {
+                    "server_address": html.unescape(
+                        get_data_entry_or(form_data, "simplex_server_address", "")
+                    ).strip(),
+                    "ws_port": int(
+                        get_data_entry_or(form_data, "simplex_ws_port", "5225")
+                    ),
+                    "group_link": html.unescape(
+                        get_data_entry_or(form_data, "simplex_group_link", "")
+                    ).strip(),
+                }
+                settings_changed, suggest_reboot = swap_client.editNetworkSettings(
+                    "simplex", data
+                )
+                if settings_changed:
+                    messages.append("SimpleX settings applied.")
+                if suggest_reboot:
+                    messages.append("Please restart BasicSwap.")
+            elif have_data_entry(form_data, "apply_networks_bridge"):
+                active_tab = "networks"
+                enable_bridge: bool = toBool(
+                    get_data_entry_or(form_data, "bridge_networks", "false")
+                )
+                settings_changed, suggest_reboot = (
+                    swap_client.editBridgeNetworksSetting(enable_bridge)
+                )
+                if settings_changed:
+                    messages.append(
+                        "Network bridging {}.".format(
+                            "enabled" if enable_bridge else "disabled"
+                        )
+                    )
+                if suggest_reboot:
+                    messages.append("Please restart BasicSwap.")
+
+            for network_type in ("smsg", "simplex", "nostr"):
+                if have_data_entry(form_data, "enable_network_" + network_type):
+                    active_tab = "networks"
+                    settings_changed, _ = swap_client.editNetworkSettings(
+                        network_type, {"enabled": True}
+                    )
+                    if settings_changed:
+                        messages.append(
+                            f"Network {network_type} enabled, please restart BasicSwap."
+                        )
+                elif have_data_entry(form_data, "disable_network_" + network_type):
+                    active_tab = "networks"
+                    settings_changed, _ = swap_client.editNetworkSettings(
+                        network_type, {"enabled": False}
+                    )
+                    if settings_changed:
+                        messages.append(
+                            f"Network {network_type} disabled, please restart BasicSwap."
+                        )
 
             electrum_supported_coins = (
                 "bitcoin",
@@ -167,6 +311,7 @@ def page_settings(self, url_split, post_string):
             )
             for name, c in swap_client.settings["chainclients"].items():
                 if have_data_entry(form_data, "apply_" + name):
+                    active_tab = "coins"
                     data = {"lookups": get_data_entry(form_data, "lookups_" + name)}
                     if name in ("monero", "wownero"):
                         data["fee_priority"] = int(
@@ -182,9 +327,18 @@ def page_settings(self, url_split, post_string):
                         data["rpcport"] = int(
                             get_data_entry(form_data, "rpcport_" + name)
                         )
-                        data["remotedaemonurls"] = get_data_entry_or(
-                            form_data, "remotedaemonurls_" + name, ""
-                        )
+                        # Node list posted as JSON by the page JS; "" = cleared,
+                        # malformed = ignored (don't wipe the saved list).
+                        nodes_json = get_data_entry_or(
+                            form_data, "remotedaemonnodes_" + name, ""
+                        ).strip()
+                        if nodes_json == "":
+                            data["remote_daemon_nodes"] = []
+                        else:
+                            try:
+                                data["remote_daemon_nodes"] = json.loads(nodes_json)
+                            except ValueError:
+                                pass
                         data["automatically_select_daemon"] = (
                             True
                             if get_data_entry(form_data, "autosetdaemon_" + name)
@@ -237,6 +391,23 @@ def page_settings(self, url_split, post_string):
                                 form_data, "electrum_onion_" + name, ""
                             ).strip()
                             data["electrum_onion_servers"] = onion_servers
+                            max_servers_str = get_data_entry_or(
+                                form_data, "max_electrum_servers_" + name, ""
+                            ).strip()
+                            if max_servers_str == "":
+                                data["max_electrum_servers"] = None
+                            elif (
+                                max_servers_str.isdecimal()
+                                and int(max_servers_str) >= 1
+                            ):
+                                data["max_electrum_servers"] = int(max_servers_str)
+                            else:
+                                display_name = getCoinName(
+                                    swap_client.getCoinIdFromName(name)
+                                )
+                                err_messages.append(
+                                    f"Servers kept connected for {display_name} must be a whole number, at least 1."
+                                )
                             auto_transfer_now = have_data_entry(
                                 form_data, "auto_transfer_now_" + name
                             )
@@ -268,16 +439,19 @@ def page_settings(self, url_split, post_string):
                     if suggest_reboot is True:
                         messages.append("Please restart BasicSwap.")
                 elif have_data_entry(form_data, "enable_" + name):
+                    active_tab = "coins"
                     swap_client.enableCoin(name)
                     display_name = getCoinName(swap_client.getCoinIdFromName(name))
                     messages.append(display_name + " enabled, shutting down.")
                     swap_client.stopRunning()
                 elif have_data_entry(form_data, "disable_" + name):
+                    active_tab = "coins"
                     swap_client.disableCoin(name)
                     display_name = getCoinName(swap_client.getCoinIdFromName(name))
                     messages.append(display_name + " disabled, shutting down.")
                     swap_client.stopRunning()
                 elif have_data_entry(form_data, "force_sweep_" + name):
+                    active_tab = "coins"
                     coin_id = swap_client.getCoinIdFromName(name)
                     display_name = getCoinName(coin_id)
                     try:
@@ -313,6 +487,7 @@ def page_settings(self, url_split, post_string):
     sorted_names = sorted(swap_client.settings["chainclients"].keys())
     from basicswap.interface.electrumx import (
         DEFAULT_ELECTRUM_SERVERS,
+        DEFAULT_MAX_ELECTRUM_SERVERS,
         DEFAULT_ONION_SERVERS,
     )
 
@@ -353,6 +528,10 @@ def page_settings(self, url_split, post_string):
                 "clearnet_servers_text": clearnet_text,
                 "onion_servers_text": onion_text,
                 "address_gap_limit": c.get("address_gap_limit", 50),
+                "max_electrum_servers": c.get("max_electrum_servers", ""),
+                "max_electrum_servers_default": swap_client.settings.get(
+                    "max_electrum_servers", DEFAULT_MAX_ELECTRUM_SERVERS
+                ),
             }
         )
         if name in ("monero", "wownero"):
@@ -362,8 +541,9 @@ def page_settings(self, url_split, post_string):
             )
             chains_formatted[-1]["rpchost"] = c.get("rpchost", "localhost")
             chains_formatted[-1]["rpcport"] = int(c.get("rpcport", 18081))
-            chains_formatted[-1]["remotedaemonurls"] = "\n".join(
-                c.get("remote_daemon_urls", [])
+            # Normalised {url, failover} list (legacy "host:port" strings => failover-on).
+            chains_formatted[-1]["remote_daemon_nodes"] = (
+                swap_client.normaliseRemoteDaemonUrls(c.get("remote_daemon_urls", []))
             )
             chains_formatted[-1]["autosetdaemon"] = c.get(
                 "automatically_select_daemon", False
@@ -401,6 +581,7 @@ def page_settings(self, url_split, post_string):
     general_settings = {
         "debug": swap_client.debug,
         "debug_ui": swap_client.debug_ui,
+        "log_level": "debug" if swap_client.debug_logs else "info",
         "expire_unused_offers": swap_client._expire_unused_offers,
         "expire_db_records": swap_client._expire_db_records,
         "check_updates": swap_client.settings.get("check_updates", True),
@@ -413,7 +594,9 @@ def page_settings(self, url_split, post_string):
     chart_settings = {
         "show_chart": swap_client.settings.get("show_chart", True),
         "coingecko_api_key": coingecko_api_key,
+        "coingecko_api_plan": swap_client.settings.get("coingecko_api_plan", "demo"),
         "enabled_chart_coins": swap_client.settings.get("enabled_chart_coins", ""),
+        "rate_sources": swap_client.getRateSources(),
     }
 
     security_settings = {
@@ -462,6 +645,40 @@ def page_settings(self, url_split, post_string):
         "control_port": swap_client.tor_control_port,
     }
 
+    networks_formatted = []
+    network_display_names = {
+        "smsg": "SMSG",
+        "simplex": "SimpleX",
+        "nostr": "Nostr",
+    }
+    for network in swap_client.getNetworksInfo():
+        network["display_name"] = network_display_names.get(
+            network["type"], network["type"]
+        )
+        if network["type"] == "nostr":
+            network["relays_text"] = "\n".join(network.get("relays", []))
+            network["plaintext_relays"] = (
+                [r for r in network.get("relays", []) if r.startswith("ws://")]
+                if not swap_client.use_tor_proxy
+                else []
+            )
+            network["uses_tor"] = bool(swap_client.use_tor_proxy)
+        networks_formatted.append(network)
+
+    num_enabled_networks: int = sum(1 for n in networks_formatted if n["enabled"])
+    configured_types = {n["type"] for n in networks_formatted}
+    for network in networks_formatted:
+        network["can_disable"] = network["enabled"] and num_enabled_networks > 1
+    networks_global = {
+        "bridge_networks": swap_client.settings.get("bridge_networks", False),
+        "can_bridge": num_enabled_networks >= 2,
+        "addable": [
+            network_type
+            for network_type in ("nostr", "simplex")
+            if network_type not in configured_types
+        ],
+    }
+
     template = server.env.get_template("settings.html")
     return self.render_template(
         template,
@@ -475,7 +692,10 @@ def page_settings(self, url_split, post_string):
             "security_settings": security_settings,
             "notification_settings": notification_settings,
             "tor_settings": tor_settings,
+            "networks": networks_formatted,
+            "networks_global": networks_global,
             "active_tab": active_tab,
+            "swap_wallets_prune": swap_wallets_prune,
         },
         extra_headers=extra_headers,
     )

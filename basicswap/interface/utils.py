@@ -4,14 +4,15 @@
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
-from math import ceil
+import time
 
+from basicswap.basicswap_util import ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER
 from basicswap.contrib.test_framework.messages import COIN
 from basicswap.db import (
     Concepts,
     strConcepts,
 )
-from basicswap.util import toBool as make_boolean
+from basicswap.util import FEE_RATE_CACHE_SECONDS, toBool as make_boolean
 
 
 class FeeValidator:
@@ -20,6 +21,7 @@ class FeeValidator:
         return COIN // 10
 
     def __init__(self, **kwargs):
+        self._relay_fee = None
         self.updateFeeValidationSettings(kwargs.get("network"))
         super().__init__(**kwargs)
 
@@ -129,12 +131,19 @@ class FeeValidator:
             return chain_client_settings["min_relay_fee"], "min_relay_fee_setting"
 
         if self._connection_type == "rpc":
-            networkinfo = self.rpc("getnetworkinfo")
-            if "relayfee" in networkinfo:
-                return networkinfo["relayfee"], "relayfee_rpc"
+            return self.getRelayFee(), "relayfee_rpc"
         elif self._connection_type == "electrum":
             return 0.00001, "relayfee_electrum_default"
         return None, None
+
+    def getRelayFee(self) -> float:
+        now: float = time.time()
+        cached = self._relay_fee
+        if cached is not None and now - cached[0] < FEE_RATE_CACHE_SECONDS:
+            return cached[1]
+        relay_fee: float = self.rpc("getnetworkinfo")["relayfee"]
+        self._relay_fee = (now, relay_fee)
+        return relay_fee
 
     @staticmethod
     def compareFeeRates(actual: int, expected: int) -> bool:
@@ -142,9 +151,22 @@ class FeeValidator:
             return False
         return actual - expected < 10
 
-    @staticmethod
-    def feeForVSize(fee_rate: int, vsize: int) -> int:
-        return ceil(fee_rate * vsize / 1000)
+    def estLockSpendFee(self, fee_rate: int) -> int:
+        # The lock spend tx pays the lock refund tx's fee plus a buffer
+        return (
+            self.feeForVSize(fee_rate, self.xmr_swap_a_lock_refund_tx_vsize())
+            + ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER
+        )
+
+    def getSplitTxFees(self) -> tuple[int, int, int]:
+        """(fixed, per_output, per_input) fees to split the wallet into outputs."""
+        fee_rate: int = self.make_int(self.get_fee_rate(self._conf_target)[0])
+        base_vsize: int = self.est_split_tx_vsize(0)
+        return (
+            self.feeForVSize(fee_rate, base_vsize),
+            self.feeForVSize(fee_rate, self.est_split_tx_vsize(1) - base_vsize),
+            self.feeForVSize(fee_rate, self.est_tx_input_vsize()),
+        )
 
     def validateFeeRate(
         self, feerate: int, concept_type: int, force_bypass: bool = False

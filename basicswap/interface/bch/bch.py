@@ -73,8 +73,22 @@ class BCHInterface(BTCInterface):
         return Coins.BCH
 
     @staticmethod
+    def est_tx_input_vsize() -> int:
+        # P2PKH
+        return 148
+
+    @staticmethod
     def xmr_swap_a_lock_spend_tx_vsize() -> int:
         return 302
+
+    def estLockSpendFee(self, fee_rate: int) -> int:
+        # The covenant's mining_fee is the offer's fee rate, paid flat
+        return fee_rate
+
+    @staticmethod
+    def supports_add_inputs() -> bool:
+        # BCHN rejects add_inputs; other legs' preselected inputs stay locked.
+        return False
 
     @staticmethod
     def watch_blocks_for_scripts() -> bool:
@@ -117,14 +131,15 @@ class BCHInterface(BTCInterface):
         return unspent_addr
 
     def createWallet(self, wallet_name: str, password: str = ""):
-        self.rpc("createwallet", [wallet_name, False])
+        # wallet_name, disable_private_keys, blank
+        self.rpc("createwallet", [wallet_name, False, True])
         if password != "":
             self.rpc(
                 "encryptwallet",
                 [
                     password,
                 ],
-                override_wallet=wallet_name,
+                wallet_override=wallet_name,
             )
 
     def newKeypool(self) -> None:
@@ -144,6 +159,18 @@ class BCHInterface(BTCInterface):
     # returns pkh
     def decodeAddress(self, address: str) -> bytes:
         return bytes(Address.from_string(address).payload)
+
+    def getDestForAddress(self, address: str) -> bytes:
+        addr = Address.from_string(address)
+        payload = bytes(addr.payload)
+        address_type: str = addr.version.split("-")[0]
+        if address_type == "P2PKH":
+            return self.getScriptForPubkeyHash(payload)
+        if address_type == "P2SH20":
+            return CScript([OP_HASH160, payload, OP_EQUAL])
+        if address_type == "P2SH32":
+            return CScript([OP_HASH256, payload, OP_EQUAL])
+        raise ValueError(f"Unknown address type {addr.version}")
 
     def encodeSegwitAddress(self, script):
         raise ValueError("Segwit not supported")
@@ -173,6 +200,7 @@ class BCHInterface(BTCInterface):
         sub_fee: bool = False,
         lock_unspents: bool = True,
         feerate: int = None,
+        change_addr: str = None,
     ) -> str:
 
         if isinstance(addr_to, bytes):
@@ -198,6 +226,8 @@ class BCHInterface(BTCInterface):
             "lockUnspents": lock_unspents,
             "feeRate": fee_rate,
         }
+        if change_addr:
+            options["changeAddress"] = change_addr
         if sub_fee:
             options["subtractFeeFromOutputs"] = [
                 0,
@@ -207,6 +237,12 @@ class BCHInterface(BTCInterface):
     def getScriptForPubkeyHash(self, pkh: bytes) -> bytearray:
         # Return P2PKH
         return CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, OP_CHECKSIG])
+
+    def supportsTaproot(self) -> bool:
+        return False
+
+    def isValidTxoDest(self, script: bytes) -> bool:
+        return False
 
     def encodeScriptDest(self, script_dest: bytes) -> str:
         # Extract hash from script
@@ -249,7 +285,7 @@ class BCHInterface(BTCInterface):
     def getBLockSpendTxFee(self, tx, fee_rate: int) -> int:
         add_bytes = 107
         size = len(tx.serialize_with_witness()) + add_bytes
-        pay_fee = round(fee_rate * size / 1000)
+        pay_fee = self.feeForVSize(fee_rate, size)
         self._log.info(
             f"BLockSpendTx fee_rate, size, fee: {fee_rate}, {size}, {pay_fee}."
         )
@@ -268,7 +304,7 @@ class BCHInterface(BTCInterface):
     def findConfirmedTxnByHash(self, txid_hex: str):
         # Only works for wallet txns
         try:
-            rv = self.rpc("gettransaction", [txid_hex])
+            rv = self.rpc_wallet("gettransaction", [txid_hex])
         except Exception as e:  # noqa: F841
             self._log.debug(
                 "findConfirmedTxnByHash getrawtransaction failed: {}".format(txid_hex)
@@ -446,6 +482,11 @@ class BCHInterface(BTCInterface):
 
     def getSpendableBalance(self) -> int:
         return self.make_int(self.rpc_wallet("getbalance", ["*", 1, False]))
+
+    def getBalances(self) -> tuple[int, int]:
+        wi = self.rpc_wallet("getwalletinfo")
+        balance = self.make_int(wi["balance"])
+        return balance, balance + self.make_int(wi["unconfirmed_balance"])
 
     def getScriptDest(self, script):
         return self.scriptToP2SH32LockingBytecode(script)
@@ -902,6 +943,11 @@ class BCHInterface(BTCInterface):
         ensure(out_2 == _out_2, "out_2 mismatch")
         ensure(public_key == _public_key, "public_key mismatch")
         ensure(timelock == _timelock, "timelock mismatch")
+        # A longer encoding decodes to the same values but fails when its branch is spent
+        ensure(
+            script_out == self.genScriptLockTxScript(self, Kal, Kaf, **kwargs),
+            "Bad lock script",
+        )
 
         return txid, locked_n
 
@@ -971,6 +1017,11 @@ class BCHInterface(BTCInterface):
         ensure(public_key == _public_key, "public_key mismatch")
         ensure(timelock == _timelock, "timelock mismatch")
         ensure(_timelock == csv_val_expect, "timelock mismatch")
+        # A longer encoding decodes to the same values but fails when its branch is spent
+        ensure(
+            script_out == self.genScriptLockTxScript(self, Kal, Kaf, **kwargs),
+            "Bad lock refund script",
+        )
 
         lock_mining_fee, _, _, _, _ = self.extractScriptLockScriptValues(prevout_script)
         fee_paid = swap_value - locked_coin
@@ -1188,6 +1239,10 @@ class BCHInterface(BTCInterface):
 
     def lockNonSegwitPrevouts(self) -> None:
         pass
+
+    def swipePaysKey(self) -> bool:
+        # The covenant pays the swipe to dest_af, fixed when the swap is set up
+        return False
 
     def prepareMercySpend(self, key: bytes, rescan_from: int) -> None:
         # The swipe paid a key derived for the swap.  Imported here rather than
